@@ -32,6 +32,7 @@
 #include "catalog/indexing.h"
 #include "catalog/pg_trigger.h"
 
+#include "commands/tablecmds.h"
 #include "commands/trigger.h"
 #include "fmgr.h"
 #include "executor/tuptable.h"
@@ -259,6 +260,7 @@ store_metadata(Oid relid, const char *data)
 		bool nulls[Natts_pg_trigger] = {0}, replace[Natts_pg_trigger] = {0};
 		int len = strlen(data) + 1;
 		bytea *args = palloc(VARHDRSZ + len);
+		List *child_relids = NIL;
 
 		SET_VARSIZE(args, VARHDRSZ + len);
 		memcpy(VARDATA(args), data, len);
@@ -272,8 +274,25 @@ store_metadata(Oid relid, const char *data)
 		CatalogTupleUpdate(catalog, &tuple->t_self, tuple);
 		heap_freetuple(tuple);
 		systable_endscan(scan);
+
+		/* Propagate updated tgargs to partition child triggers cloned from trigger */
+		scan = systable_beginscan(catalog, InvalidOid, false, NULL, 0, NULL);
+		while (HeapTupleIsValid(old = systable_getnext(scan)))
+		{
+			Form_pg_trigger row = (Form_pg_trigger) GETSTRUCT(old);
+
+			if (row->tgparentid != trigger)
+				continue;
+			tuple = heap_modify_tuple(old, RelationGetDescr(catalog), values, nulls, replace);
+			CatalogTupleUpdate(catalog, &tuple->t_self, tuple);
+			heap_freetuple(tuple);
+			child_relids = lappend_oid(child_relids, row->tgrelid);
+		}
+		systable_endscan(scan);
 		table_close(catalog, RowExclusiveLock);
 		CacheInvalidateRelcacheByRelid(relid);
+		foreach_oid(crelid, child_relids)
+			CacheInvalidateRelcacheByRelid(crelid);
 		CommandCounterIncrement();
 	}
 	else
@@ -484,13 +503,13 @@ same_names(List *columns, HeapTuple old, HeapTuple new, TupleDesc desc, Oid reli
 	return true;
 }
 
-static void
-check_pending_tuple(Relation rel, HeapTuple new, HeapTuple old)
+static bool
+check_pending_tuple(Relation rel, HeapTuple new, HeapTuple old, bool warn_only)
 {
 	Oid relid = RelationGetRelid(rel);
 	TupleDesc desc = RelationGetDescr(rel);
 
-	if (mys_is_mysql_session() && !mys_foreign_key_checks()) return;
+	if (mys_is_mysql_session() && !mys_foreign_key_checks()) return true;
 	foreach_node(Constraint, c, pending_keys(relid))
 	{
 		int nulls = 0;
@@ -506,24 +525,37 @@ check_pending_tuple(Relation rel, HeapTuple new, HeapTuple old)
 			nulls == list_length(c->fk_attrs) || (old != NULL &&
 			same_names(c->fk_attrs, old, new, desc, relid)))
 			continue;
+		if (warn_only)
+		{
+			mys_add_warning(1452,
+							psprintf("Cannot add or update a child row: foreign key constraint '%s' has no referenced table '%s.%s'",
+									 c->conname, c->pktable->schemaname, c->pktable->relname));
+			return false;
+		}
 		ereport(ERROR, (errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
 						errmsg("Cannot add or update a child row: foreign key constraint '%s' has no referenced table '%s.%s'",
 							   c->conname, c->pktable->schemaname, c->pktable->relname),
 						errtableconstraint(rel, c->conname)));
 	}
+	return true;
 }
 
-/* Parent integration: invoke inside RI_FKey_check_insert's subtransaction,
- * before its built-in RI trigger loop. Its existing 23503 handler turns this
- * into warning 1452 and skips the row for INSERT IGNORE. */
-void
-mys_pending_fk_check_insert(Relation rel, TupleTableSlot *slot)
+/* Zero-subxid pre-check for INSERT/UPDATE IGNORE: check pending FK guards
+ * alongside built-in RI triggers before touching heap/indexes. */
+bool
+mys_pending_fk_check_insert(Relation rel, TupleTableSlot *oldslot,
+							TupleTableSlot *newslot, bool warn_only)
 {
-	bool free_tuple;
-	HeapTuple tuple = ExecFetchSlotHeapTuple(slot, false, &free_tuple);
+	bool free_new = false;
+	bool free_old = false;
+	HeapTuple newtup = ExecFetchSlotHeapTuple(newslot, false, &free_new);
+	HeapTuple oldtup = oldslot ? ExecFetchSlotHeapTuple(oldslot, false, &free_old) : NULL;
+	bool ok;
 
-	check_pending_tuple(rel, tuple, NULL);
-	if (free_tuple) heap_freetuple(tuple);
+	ok = check_pending_tuple(rel, newtup, oldtup, warn_only);
+	if (free_new) heap_freetuple(newtup);
+	if (free_old) heap_freetuple(oldtup);
+	return ok;
 }
 
 PG_FUNCTION_INFO_V1(mys_pending_fk_guard);
@@ -538,8 +570,8 @@ mys_pending_fk_guard(PG_FUNCTION_ARGS)
 	new = TRIGGER_FIRED_BY_UPDATE(trig->tg_event) ? trig->tg_newtuple : trig->tg_trigtuple;
 	/* AFTER lets ON DUPLICATE KEY UPDATE take the UPDATE path before checking
 	 * FK keys. Unchanged orphan keys are allowed, just as native/MySQL RI. */
-	check_pending_tuple(trig->tg_relation, new,
-		TRIGGER_FIRED_BY_UPDATE(trig->tg_event) ? trig->tg_trigtuple : NULL);
+	(void) check_pending_tuple(trig->tg_relation, new,
+		TRIGGER_FIRED_BY_UPDATE(trig->tg_event) ? trig->tg_trigtuple : NULL, false);
 	PG_RETURN_POINTER(new);
 }
 
@@ -579,9 +611,10 @@ owner_can_reference(Oid child, Oid parent, Constraint *c)
 	bool allowed = true;
 
 	table_close(childrel, NoLock);
-	parentrel = table_open(parent, ShareRowExclusiveLock);
+	/* Check ACLs under AccessShareLock first before taking ShareRowExclusiveLock. */
+	parentrel = table_open(parent, AccessShareLock);
 	if (object_aclcheck(NamespaceRelationId, RelationGetNamespace(parentrel), owner,
-							  ACL_USAGE) != ACLCHECK_OK)
+						ACL_USAGE) != ACLCHECK_OK)
 		allowed = false;
 	else if (pg_class_aclcheck(parent, owner, ACL_REFERENCES) != ACLCHECK_OK)
 	{
@@ -619,9 +652,17 @@ owner_can_reference(Oid child, Oid parent, Constraint *c)
 			}
 		}
 	}
+	table_close(parentrel, AccessShareLock);
+	if (!allowed)
+		return false;
 	/* Retain an authorized parent's lock until ALTER has installed the FK. */
-	table_close(parentrel, allowed ? NoLock : ShareRowExclusiveLock);
-	return allowed;
+	LockRelationOid(parent, ShareRowExclusiveLock);
+	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(parent)))
+	{
+		UnlockRelationOid(parent, ShareRowExclusiveLock);
+		return false;
+	}
+	return true;
 }
 
 /* Remove only declarations whose parent is absent. All other constraints go
@@ -643,7 +684,24 @@ extract_missing(List *nodes, const char *column, RangeVar *child, Oid relid,
 		}
 		c = (Constraint *) node;
 		if (c->pktable->schemaname == NULL)
-			c->pktable->schemaname = pstrdup(child->schemaname);
+		{
+			Oid child_nsp = get_namespace_oid(child->schemaname, false);
+
+			if (isTempNamespace(child_nsp) &&
+				strcmp(c->pktable->relname, child->relname) != 0 &&
+				!OidIsValid(get_relname_relid(c->pktable->relname, child_nsp)))
+			{
+				const char *sel = mys_selected_database();
+
+				if (sel == NULL)
+					ereport(ERROR,
+							(errcode(MYS_ERRCODE_NO_DB_ERROR),
+							 errmsg("No database selected")));
+				c->pktable->schemaname = pstrdup(mys_catalog_schema_name(sel));
+			}
+			else
+				c->pktable->schemaname = pstrdup(child->schemaname);
+		}
 		if (OidIsValid(parent_oid(c)) ||
 			(strcmp(child->relname, c->pktable->relname) == 0 &&
 			 strcmp(child->schemaname, c->pktable->schemaname) == 0))
@@ -698,7 +756,9 @@ prepare_create(CreateStmt *s, MysFKUtility *state)
 static void
 prepare_alter(AlterTableStmt *s, MysFKUtility *state, bool checks_off)
 {
-	Oid relid = RangeVarGetRelid(s->relation, AccessExclusiveLock, s->missing_ok);
+	Oid relid = RangeVarGetRelidExtended(s->relation, AccessExclusiveLock,
+										 s->missing_ok ? RVR_MISSING_OK : 0,
+										 RangeVarCallbackOwnsRelation, NULL);
 	List *keys, *cmds = NIL;
 	RangeVar *child;
 	bool removed = false;
@@ -766,13 +826,13 @@ drop_relations(DropStmt *s)
 	{
 		if (s->removeType == OBJECT_TABLE)
 		{
-			Oid relid = RangeVarGetRelid(makeRangeVarFromNameList((List *) name), AccessExclusiveLock, s->missing_ok);
+			Oid relid = RangeVarGetRelidExtended(makeRangeVarFromNameList((List *) name),
+												 AccessExclusiveLock,
+												 s->missing_ok ? RVR_MISSING_OK : 0,
+												 RangeVarCallbackOwnsRelation, NULL);
 
 			if (OidIsValid(relid))
-			{
-				require_owner(relid);
 				result = lappend_oid(result, relid);
-			}
 		}
 		else if (s->removeType == OBJECT_SCHEMA)
 		{
@@ -926,7 +986,9 @@ mys_fk_before_utility(PlannedStmt **pstmt)
 
 		if (s->relation && (s->renameType == OBJECT_TABLE || s->renameType == OBJECT_COLUMN))
 		{
-			state->target = RangeVarGetRelid(s->relation, AccessExclusiveLock, s->missing_ok);
+			state->target = RangeVarGetRelidExtended(s->relation, AccessExclusiveLock,
+													 s->missing_ok ? RVR_MISSING_OK : 0,
+													 RangeVarCallbackOwnsRelation, NULL);
 			if (s->renameType == OBJECT_COLUMN)
 			{
 				state->old_column = s->subname;
@@ -940,8 +1002,10 @@ mys_fk_before_utility(PlannedStmt **pstmt)
 		}
 	}
 	else if (IsA(node, AlterObjectSchemaStmt) && ((AlterObjectSchemaStmt *) node)->objectType == OBJECT_TABLE)
-		state->target = RangeVarGetRelid(((AlterObjectSchemaStmt *) node)->relation,
-			AccessExclusiveLock, ((AlterObjectSchemaStmt *) node)->missing_ok);
+		state->target = RangeVarGetRelidExtended(((AlterObjectSchemaStmt *) node)->relation,
+												 AccessExclusiveLock,
+												 ((AlterObjectSchemaStmt *) node)->missing_ok ? RVR_MISSING_OK : 0,
+												 RangeVarCallbackOwnsRelation, NULL);
 	else if (IsA(node, CreateTrigStmt))
 	{
 		CreateTrigStmt *s = (CreateTrigStmt *) node;
@@ -951,12 +1015,17 @@ mys_fk_before_utility(PlannedStmt **pstmt)
 		if (OidIsValid(guard_function(true)) &&
 			LookupFuncName(s->funcname, 0, NULL, true) == guard_function(true))
 		{
+			Oid relid;
+
 			if (list_length(s->args) != 1 || !s->row || s->timing != TRIGGER_TYPE_AFTER ||
 				s->events != (TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE) || s->whenClause || s->columns)
 				fk_error("guard must check every inserted/updated row");
 			/* Validate the declaration now; binding below checks its owner's
 			 * current ACLs, not the identity of the restoring connection. */
 			(void) parse_label(strVal(linitial(s->args)));
+			relid = RangeVarGetRelid(s->relation, AccessShareLock, false);
+			if (pg_class_aclcheck(relid, GetUserId(), ACL_TRIGGER) != ACLCHECK_OK)
+				aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, s->relation->relname);
 			state->target = RangeVarGetRelid(s->relation, AccessExclusiveLock, false);
 		}
 		else state->rebind = false;

@@ -37,6 +37,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
 #include "commands/defrem.h"
+#include "commands/tablecmds.h"
 #include "commands/trigger.h"
 #include "commands/seclabel.h"
 #include "common/hashfn.h"
@@ -93,6 +94,8 @@ static void detach_generated_readers(Oid relid, AttrNumber attnum, GenAlter *gen
 static void refresh_generated(AlterTableStmt *stmt, Oid relid, GenAlter *gen,
 							  PlannedStmt *pstmt, const char *queryString,
 							  ParamListInfo params, QueryEnvironment *queryEnv);
+static void prune_on_update_trigger(Oid relid, PlannedStmt *pstmt, const char *queryString,
+									ParamListInfo params, QueryEnvironment *queryEnv);
 
 /*
  * Bootstrap SET EXPRESSION for an ordinary column, without dropping its
@@ -530,7 +533,9 @@ mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryStr
 	GenAlter	gen = {NIL, NIL};
 	ListCell   *lc;
 
-	relid = RangeVarGetRelid(stmt->relation, AccessExclusiveLock, stmt->missing_ok);
+	relid = RangeVarGetRelidExtended(stmt->relation, AccessExclusiveLock,
+									 stmt->missing_ok ? RVR_MISSING_OK : 0,
+									 RangeVarCallbackOwnsRelation, NULL);
 	if (!OidIsValid(relid))
 		return;
 
@@ -621,8 +626,30 @@ mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryStr
 
 			case AT_DropForeignKey:
 			case AT_DropCheck:
-				cmds = lappend(cmds, make_cmd(AT_DropConstraint, cmd->name, NULL));
-				break;
+				{
+					char		expected = (int) cmd->subtype == AT_DropForeignKey ?
+						CONSTRAINT_FOREIGN : CONSTRAINT_CHECK;
+					Oid			conoid;
+					HeapTuple	ctup;
+					bool		ok = false;
+
+					flush_cmds(stmt, &cmds, pstmt, queryString, params, queryEnv);
+					conoid = get_relation_constraint_oid(relid, cmd->name, true);
+					ctup = OidIsValid(conoid) ?
+						SearchSysCache1(CONSTROID, ObjectIdGetDatum(conoid)) : NULL;
+					if (HeapTupleIsValid(ctup))
+					{
+						ok = ((Form_pg_constraint) GETSTRUCT(ctup))->contype == expected;
+						ReleaseSysCache(ctup);
+					}
+					if (!ok)
+						ereport(ERROR,
+								(errcode(ERRCODE_UNDEFINED_OBJECT),
+								 errmsg("Can't DROP '%s'; check that column/key exists",
+										cmd->name)));
+					cmds = lappend(cmds, make_cmd(AT_DropConstraint, cmd->name, NULL));
+					break;
+				}
 
 			case AT_TableOption:
 				{
@@ -668,6 +695,7 @@ mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryStr
 	}
 	flush_cmds(stmt, &cmds, pstmt, queryString, params, queryEnv);
 	refresh_generated(stmt, relid, &gen, pstmt, queryString, params, queryEnv);
+	prune_on_update_trigger(relid, pstmt, queryString, params, queryEnv);
 
 	/* a column that just became AUTO_INCREMENT continues after its maximum */
 	if (added_identity)
@@ -687,8 +715,9 @@ static void
 mysql_rename_index(RenameStmt *stmt, PlannedStmt *pstmt, const char *queryString,
 				   ParamListInfo params, QueryEnvironment *queryEnv)
 {
-	Oid			relid = RangeVarGetRelid(stmt->relation, ShareUpdateExclusiveLock,
-										 stmt->missing_ok);
+	Oid			relid = RangeVarGetRelidExtended(stmt->relation, ShareUpdateExclusiveLock,
+												 stmt->missing_ok ? RVR_MISSING_OK : 0,
+												 RangeVarCallbackOwnsRelation, NULL);
 	Oid			indexoid;
 	Oid			other;
 	RenameStmt *rename;
@@ -1394,7 +1423,7 @@ table_generators(Oid relid, List *result)
 	return result;
 }
 
-/* generator functions a DROP TABLE / ALTER TABLE may leave unused */
+/* generator functions a DROP TABLE / ALTER TABLE / RENAME TABLE may leave unused */
 static List *
 statement_generators(Node *stmt)
 {
@@ -1408,6 +1437,11 @@ statement_generators(Node *stmt)
 	}
 	else if (IsA(stmt, AlterTableStmt))
 		result = table_generators(RangeVarGetRelid(((AlterTableStmt *) stmt)->relation,
+												   NoLock, true), result);
+	else if (IsA(stmt, AlterObjectSchemaStmt) &&
+			 ((AlterObjectSchemaStmt *) stmt)->objectType == OBJECT_TABLE &&
+			 ((AlterObjectSchemaStmt *) stmt)->relation != NULL)
+		result = table_generators(RangeVarGetRelid(((AlterObjectSchemaStmt *) stmt)->relation,
 												   NoLock, true), result);
 	return result;
 }
@@ -1888,6 +1922,180 @@ mysql_table_setup(DoStmt *d, PlannedStmt *pstmt, const char *queryString,
 	}
 }
 
+/*
+ * After ALTER TABLE drops columns: prune dropped attnums from ON_UPDATE_TRIGGER
+ * (or drop ON_UPDATE_TRIGGER if no auto-updated columns remain).
+ */
+static void
+prune_on_update_trigger(Oid relid, PlannedStmt *pstmt, const char *queryString,
+						ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	Relation	rel;
+	TupleDesc	desc;
+	int			natts;
+	bool		found = false;
+	bool		changed = false;
+	List	   *args = NIL;
+	char	   *nsp;
+	char	   *relname;
+
+	if (!OidIsValid(relid))
+		return;
+	rel = relation_open(relid, AccessShareLock);
+	desc = RelationGetDescr(rel);
+	natts = desc->natts;
+	if (rel->trigdesc)
+	{
+		for (int i = 0; i < rel->trigdesc->numtriggers; i++)
+		{
+			Trigger    *tg = &rel->trigdesc->triggers[i];
+
+			if (strcmp(tg->tgname, ON_UPDATE_TRIGGER) != 0)
+				continue;
+			found = true;
+			for (int k = 0; k < tg->tgnargs; k++)
+			{
+				int			attnum = atoi(tg->tgargs[k]);
+
+				if (attnum > 0 && attnum <= natts &&
+					!TupleDescAttr(desc, attnum - 1)->attisdropped)
+					args = lappend(args, makeString(psprintf("%d", attnum)));
+				else
+					changed = true;
+			}
+			break;
+		}
+	}
+	nsp = get_namespace_name(RelationGetNamespace(rel));
+	relname = pstrdup(RelationGetRelationName(rel));
+	relation_close(rel, AccessShareLock);
+
+	if (!found || !changed)
+		return;
+	if (args != NIL)
+		create_row_trigger(nsp, relname, ON_UPDATE_TRIGGER, "on_update_current_timestamp",
+						   TRIGGER_TYPE_UPDATE, args, NIL,
+						   pstmt, queryString, params, queryEnv);
+	else
+	{
+		DropStmt   *drop = makeNode(DropStmt);
+
+		drop->removeType = OBJECT_TRIGGER;
+		drop->objects = list_make1(list_make3(makeString(nsp), makeString(relname),
+											  makeString(ON_UPDATE_TRIGGER)));
+		drop->behavior = DROP_RESTRICT;
+		run_utility((Node *) drop, pstmt, queryString, params, queryEnv);
+	}
+}
+
+static bool
+is_use_db_stmt(Node *stmt)
+{
+	DoStmt	   *d = (DoStmt *) stmt;
+
+	return IsA(stmt, DoStmt) && d->args != NIL && IsA(linitial(d->args), DefElem) &&
+		strcmp(linitial_node(DefElem, d->args)->defname, "aux_mysql_use_db") == 0;
+}
+
+static bool
+is_alter_db_stmt(Node *stmt)
+{
+	DoStmt	   *d = (DoStmt *) stmt;
+
+	return IsA(stmt, DoStmt) && d->args != NIL && IsA(linitial(d->args), DefElem) &&
+		strcmp(linitial_node(DefElem, d->args)->defname, "aux_mysql_alter_db") == 0;
+}
+
+static bool
+is_protected_mysql_schema(const char *name)
+{
+	if (name == NULL)
+		return false;
+	return pg_strcasecmp(name, "pg_catalog") == 0 ||
+		pg_strcasecmp(name, "information_schema") == 0 ||
+		pg_strcasecmp(name, "pg_toast") == 0 ||
+		pg_strncasecmp(name, "pg_temp", 7) == 0 ||
+		pg_strncasecmp(name, "pg_toast_temp", 13) == 0 ||
+		pg_strcasecmp(name, "mysql") == 0 ||
+		pg_strcasecmp(name, "mys_informa_schema") == 0 ||
+		pg_strcasecmp(name, "mys_sys") == 0 ||
+		pg_strcasecmp(name, "sys") == 0 ||
+		pg_strcasecmp(name, "performance_schema") == 0;
+}
+
+static void
+mysql_use_db(DoStmt *d, QueryCompletion *qc)
+{
+	const char *dbname = strVal(linitial_node(DefElem, d->args)->arg);
+
+	mys_select_database(dbname, true);
+	if (qc)
+		SetQueryCompletion(qc, CMDTAG_DO, 0);
+}
+
+static void
+mysql_alter_db(DoStmt *d, QueryCompletion *qc)
+{
+	DefElem    *head = linitial_node(DefElem, d->args);
+	const char *dbname = head->arg ? strVal(head->arg) : mys_selected_database();
+	Oid			nspid;
+
+	if (dbname == NULL || dbname[0] == '\0')
+		ereport(ERROR,
+				(errcode(MYS_ERRCODE_NO_DB_ERROR),
+				 errmsg("No database selected")));
+	if (is_protected_mysql_schema(dbname))
+		ereport(ERROR,
+				(errcode(MYS_ERRCODE_DBACCESS_DENIED),
+				 errmsg("Access denied for user '%s' to database '%s'",
+						GetUserNameFromId(GetUserId(), false), dbname)));
+	nspid = get_namespace_oid(mys_catalog_schema_name(dbname), true);
+	if (!OidIsValid(nspid))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_SCHEMA_NAME),
+				 errmsg("Unknown database '%s'", dbname)));
+	if (!object_ownercheck(NamespaceRelationId, nspid, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SCHEMA, dbname);
+
+	for (ListCell *lc = lnext(d->args, list_head(d->args)); lc; lc = lnext(d->args, lc))
+	{
+		DefElem    *opt = lfirst_node(DefElem, lc);
+
+		if (opt->arg == NULL || !IsA(opt->arg, String))
+			continue;
+		if (strcmp(opt->defname, "charset") == 0)
+		{
+			const char *cs = strVal(opt->arg);
+
+			if (pg_strcasecmp(cs, "utf8") != 0 &&
+				pg_strcasecmp(cs, "utf8mb3") != 0 &&
+				pg_strcasecmp(cs, "utf8mb4") != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("character set '%s' is not supported for databases; only utf8/utf8mb4 is supported",
+								cs)));
+		}
+		else if (strcmp(opt->defname, "collate") == 0)
+		{
+			const char *col = strVal(opt->arg);
+
+			if (pg_strncasecmp(col, "utf8", 4) != 0 &&
+				pg_strcasecmp(col, "case_insensitive") != 0 &&
+				pg_strcasecmp(col, "case_sensitive") != 0 &&
+				pg_strcasecmp(col, "ignore_accents") != 0 &&
+				pg_strcasecmp(col, "default") != 0 &&
+				pg_strcasecmp(col, "c") != 0 &&
+				pg_strcasecmp(col, "posix") != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("collation '%s' is not supported for databases; only UTF-8 collations are supported",
+								col)));
+		}
+	}
+	if (qc)
+		SetQueryCompletion(qc, CMDTAG_ALTER_DATABASE, 0);
+}
+
 static bool
 has_mysql_subcommands(AlterTableStmt *stmt)
 {
@@ -1990,6 +2198,153 @@ temp_table_utility(Node *stmt)
 				is_temp_rangevar((RangeVar *) linitial_node(DefElem, ((DoStmt *) stmt)->args)->arg);
 		default:
 			return false;
+	}
+}
+
+static void
+no_db_selected_error(void)
+{
+	ereport(ERROR,
+			(errcode(MYS_ERRCODE_NO_DB_ERROR),
+			 errmsg("No database selected")));
+}
+
+static void
+require_ddl_rangevar_db(RangeVar *rv, bool allow_existing_temp)
+{
+	if (rv == NULL || rv->schemaname != NULL || rv->relpersistence == RELPERSISTENCE_TEMP)
+		return;
+	if (allow_existing_temp && is_temp_rangevar(rv))
+		return;
+	if (mys_selected_database() == NULL)
+		no_db_selected_error();
+}
+
+static void
+check_mysql_ddl_guards(Node *stmt, ProcessUtilityContext context)
+{
+	if (halo_mysql_parser != MYS_PARSER_MYSQL || internal_utility_depth != 0 ||
+		context == PROCESS_UTILITY_SUBCOMMAND || IsAbortedTransactionBlockState())
+		return;
+
+	switch (nodeTag(stmt))
+	{
+		case T_CreateSchemaStmt:
+			{
+				CreateSchemaStmt *cs = (CreateSchemaStmt *) stmt;
+
+				if (cs->schemaname && is_protected_mysql_schema(cs->schemaname))
+					ereport(ERROR,
+							(errcode(MYS_ERRCODE_DBACCESS_DENIED),
+							 errmsg("Access denied for user '%s' to database '%s'",
+									GetUserNameFromId(GetUserId(), false), cs->schemaname)));
+				break;
+			}
+		case T_DropStmt:
+			{
+				DropStmt   *drop = (DropStmt *) stmt;
+
+				if (drop->removeType == OBJECT_SCHEMA)
+				{
+					foreach_ptr(Node, obj, drop->objects)
+					{
+						const char *sname = IsA(obj, String) ? strVal(obj) : NULL;
+
+						if (sname && is_protected_mysql_schema(sname))
+							ereport(ERROR,
+									(errcode(MYS_ERRCODE_DBACCESS_DENIED),
+									 errmsg("Access denied for user '%s' to database '%s'",
+											GetUserNameFromId(GetUserId(), false), sname)));
+					}
+				}
+				else if (drop->removeType == OBJECT_TABLE ||
+						 drop->removeType == OBJECT_VIEW ||
+						 drop->removeType == OBJECT_MATVIEW ||
+						 drop->removeType == OBJECT_INDEX ||
+						 drop->removeType == OBJECT_SEQUENCE ||
+						 drop->removeType == OBJECT_FOREIGN_TABLE)
+				{
+					foreach_node(List, name, drop->objects)
+						require_ddl_rangevar_db(makeRangeVarFromNameList(name), true);
+				}
+				else if (drop->removeType == OBJECT_TRIGGER)
+				{
+					foreach_node(List, name, drop->objects)
+					{
+						List	   *relname = list_truncate(list_copy(name),
+															list_length(name) - 1);
+
+						require_ddl_rangevar_db(makeRangeVarFromNameList(relname), true);
+					}
+				}
+				break;
+			}
+		case T_RenameStmt:
+			{
+				RenameStmt *rn = (RenameStmt *) stmt;
+
+				if (rn->renameType == OBJECT_SCHEMA)
+				{
+					if ((rn->subname && is_protected_mysql_schema(rn->subname)) ||
+						(rn->newname && is_protected_mysql_schema(rn->newname)))
+					{
+						const char *bad = (rn->subname && is_protected_mysql_schema(rn->subname)) ?
+							rn->subname : rn->newname;
+
+						ereport(ERROR,
+								(errcode(MYS_ERRCODE_DBACCESS_DENIED),
+								 errmsg("Access denied for user '%s' to database '%s'",
+										GetUserNameFromId(GetUserId(), false), bad)));
+					}
+				}
+				else if (rn->relation != NULL)
+					require_ddl_rangevar_db(rn->relation, true);
+				break;
+			}
+		case T_AlterObjectSchemaStmt:
+			{
+				AlterObjectSchemaStmt *mv = (AlterObjectSchemaStmt *) stmt;
+
+				if (mv->newschema && is_protected_mysql_schema(mv->newschema))
+					ereport(ERROR,
+							(errcode(MYS_ERRCODE_DBACCESS_DENIED),
+							 errmsg("Access denied for user '%s' to database '%s'",
+									GetUserNameFromId(GetUserId(), false), mv->newschema)));
+				if (mv->relation != NULL)
+					require_ddl_rangevar_db(mv->relation, true);
+				break;
+			}
+		case T_CreateStmt:
+			require_ddl_rangevar_db(((CreateStmt *) stmt)->relation, false);
+			break;
+		case T_CreateTableAsStmt:
+			if (((CreateTableAsStmt *) stmt)->into)
+				require_ddl_rangevar_db(((CreateTableAsStmt *) stmt)->into->rel, false);
+			break;
+		case T_ViewStmt:
+			require_ddl_rangevar_db(((ViewStmt *) stmt)->view, false);
+			break;
+		case T_IndexStmt:
+			require_ddl_rangevar_db(((IndexStmt *) stmt)->relation, true);
+			break;
+		case T_AlterTableStmt:
+			require_ddl_rangevar_db(((AlterTableStmt *) stmt)->relation, true);
+			break;
+		case T_TruncateStmt:
+			foreach_node(RangeVar, rv, ((TruncateStmt *) stmt)->relations)
+				require_ddl_rangevar_db(rv, true);
+			break;
+		case T_CreateTrigStmt:
+			require_ddl_rangevar_db(((CreateTrigStmt *) stmt)->relation, true);
+			break;
+		case T_CreateSeqStmt:
+			require_ddl_rangevar_db(((CreateSeqStmt *) stmt)->sequence, false);
+			break;
+		case T_AlterSeqStmt:
+			require_ddl_rangevar_db(((AlterSeqStmt *) stmt)->sequence, true);
+			break;
+		default:
+			break;
 	}
 }
 
@@ -2099,6 +2454,8 @@ server_read_only_utility(Node *stmt, ProcessUtilityContext context)
 			return ((CopyStmt *) stmt)->is_from &&
 				((CopyStmt *) stmt)->relation != NULL &&
 				!is_temp_rangevar(((CopyStmt *) stmt)->relation);
+		case T_DoStmt:
+			return is_alter_db_stmt(stmt);
 		default:
 			return false;
 	}
@@ -2213,7 +2570,21 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 		collation_provider_registered = true;
 	}
 
-	if (mys_is_mysql_session())
+	if (mys_txn_is_deferred_error(parsetree))
+		mys_txn_raise_deferred_error();
+
+	if (is_use_db_stmt(parsetree))
+	{
+		mysql_use_db((DoStmt *) parsetree, qc);
+		return;
+	}
+	if (is_alter_db_stmt(parsetree))
+	{
+		mysql_alter_db((DoStmt *) parsetree, qc);
+		return;
+	}
+
+	if (mys_is_mysql_session() && !IsAbortedTransactionBlockState())
 	{
 		mys_sync_foreign_key_checks();
 		/* mysqldump issues both DROP TABLE IF EXISTS and DROP VIEW IF EXISTS
@@ -2231,7 +2602,7 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 				foreach_node(List, name, drop->objects)
 				{
 					RangeVar *rv = makeRangeVarFromNameList(name);
-					Oid relid = RangeVarGetRelid(rv, AccessExclusiveLock, true);
+					Oid relid = RangeVarGetRelid(rv, AccessShareLock, true);
 					char kind = OidIsValid(relid) ? get_rel_relkind(relid) : '\0';
 					bool mismatch = drop->removeType == OBJECT_TABLE ?
 						kind == RELKIND_VIEW :
@@ -2239,8 +2610,15 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 						 kind == RELKIND_FOREIGN_TABLE);
 
 					if (mismatch)
+					{
+						if (!object_ownercheck(RelationRelationId, relid, GetUserId()) &&
+							!object_ownercheck(NamespaceRelationId, get_rel_namespace(relid), GetUserId()))
+							aclcheck_error(ACLCHECK_NOT_OWNER,
+										   kind == RELKIND_VIEW ? OBJECT_VIEW : OBJECT_TABLE,
+										   rv->relname);
 						mys_add_warning(1051, psprintf("Unknown table '%s.%s'",
 							get_namespace_name(get_rel_namespace(relid)), rv->relname));
+					}
 					else
 						objects = lappend(objects, name);
 				}
@@ -2259,7 +2637,8 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 	}
 
 	/* keys that ALTER TABLE / CREATE INDEX add get their names now */
-	if (IsA(parsetree, IndexStmt) || IsA(parsetree, AlterTableStmt))
+	if (!IsAbortedTransactionBlockState() &&
+		(IsA(parsetree, IndexStmt) || IsA(parsetree, AlterTableStmt)))
 	{
 		Node	   *named = mys_name_keys(parsetree);
 
@@ -2271,11 +2650,14 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 	}
 
 	/* Resolve ADD/MODIFY defaults at execution, including multi-statement DDL. */
-	if (mys_is_mysql_session() && halo_mysql_parser == MYS_PARSER_MYSQL &&
+	if (mys_is_mysql_session() && !IsAbortedTransactionBlockState() &&
+		halo_mysql_parser == MYS_PARSER_MYSQL &&
 		IsA(parsetree, AlterTableStmt))
 	{
 		AlterTableStmt *alter = copyObject((AlterTableStmt *) parsetree);
-		Oid relid = RangeVarGetRelid(alter->relation, AccessExclusiveLock, alter->missing_ok);
+		Oid relid = RangeVarGetRelidExtended(alter->relation, AccessExclusiveLock,
+											 alter->missing_ok ? RVR_MISSING_OK : 0,
+											 RangeVarCallbackOwnsRelation, NULL);
 		List	   *defs = NIL;
 
 		if (OidIsValid(relid))
@@ -2314,7 +2696,32 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 			/* generated columns other generated columns read stay */
 			foreach_node(AlterTableCmd, cmd, alter->cmds)
 				if (cmd->subtype == AT_DropColumn)
+				{
 					dropped = lappend(dropped, cmd->name);
+					if (internal_utility_depth == 0 && cmd->name != NULL)
+					{
+						HeapTuple	atup = SearchSysCacheAttName(relid, cmd->name);
+
+						if (HeapTupleIsValid(atup))
+						{
+							bool		is_ident = ((Form_pg_attribute) GETSTRUCT(atup))->attidentity != '\0';
+
+							ReleaseSysCache(atup);
+							if (is_ident && OidIsValid(get_trigger_oid(relid, AUTOINC_TRIGGER, true)))
+							{
+								DropStmt   *dt = makeNode(DropStmt);
+
+								dt->removeType = OBJECT_TRIGGER;
+								dt->objects = list_make1(list_make3(
+									makeString(get_namespace_name(get_rel_namespace(relid))),
+									makeString(get_rel_name(relid)),
+									makeString(AUTOINC_TRIGGER)));
+								dt->behavior = DROP_RESTRICT;
+								run_utility((Node *) dt, pstmt, queryString, params, queryEnv);
+							}
+						}
+					}
+				}
 			foreach_node(AlterTableCmd, cmd, alter->cmds)
 				if (cmd->subtype == AT_DropColumn ||
 					((int) cmd->subtype == AT_ChangeColumn && cmd->def &&
@@ -2328,18 +2735,21 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 		pstmt->utilityStmt = parsetree = (Node *) alter;
 	}
 
-	if (mys_is_mysql_session() && IsA(parsetree, RenameStmt) &&
+	if (mys_is_mysql_session() && !IsAbortedTransactionBlockState() &&
+		IsA(parsetree, RenameStmt) &&
 		((RenameStmt *) parsetree)->renameType == OBJECT_COLUMN)
 	{
-		Oid			relid = RangeVarGetRelid(((RenameStmt *) parsetree)->relation,
-											 AccessExclusiveLock, true);
+		Oid			relid = RangeVarGetRelidExtended(((RenameStmt *) parsetree)->relation,
+													 AccessExclusiveLock, RVR_MISSING_OK,
+													 RangeVarCallbackOwnsRelation, NULL);
 
 		if (OidIsValid(relid))
 			check_generated_readers(relid, ((RenameStmt *) parsetree)->subname, false, NIL);
 	}
 
 	/* the same for the generated columns of CREATE TABLE */
-	if (mys_is_mysql_session() && halo_mysql_parser == MYS_PARSER_MYSQL &&
+	if (mys_is_mysql_session() && !IsAbortedTransactionBlockState() &&
+		halo_mysql_parser == MYS_PARSER_MYSQL &&
 		IsA(parsetree, CreateStmt))
 	{
 		CreateStmt *create = (CreateStmt *) parsetree;
@@ -2373,10 +2783,6 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 	if (IsA(parsetree, CreateExtensionStmt) &&
 		strcmp(((CreateExtensionStmt *) parsetree)->extname, "aux_mysql") == 0)
 		halo_mysql_lock_setup();
-
-	/* syntax error of a statement inside a transaction (mys_txn.c) */
-	if (mys_txn_is_deferred_error(parsetree))
-		mys_txn_raise_deferred_error();
 
 	/* SQL PREPARE / EXECUTE / DEALLOCATE PREPARE (mys_stmt.c) */
 	if (mys_sql_ps_utility(parsetree, queryString))
@@ -2414,47 +2820,59 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 	 * takes the snapshot at START, as InnoDB creates its read view then, not
 	 * at the first query: parallel dumpers rely on that.
 	 */
-	if (mys_is_mysql_session() && is_transaction_start(parsetree) &&
-		!FirstSnapshotSet && !IsSubTransaction())
+	if (mys_is_mysql_session() && is_transaction_start(parsetree))
 	{
 		TransactionStmt *start = copyObject((TransactionStmt *) parsetree);
+		List	   *cleaned = NIL;
 		bool		snapshot = false;
 		bool		isolation = false;
 		int			explicit_read_only = -1;
-		bool		read_only;
-		const char *level;
 
 		foreach_node(DefElem, opt, start->options)
 		{
 			if (strcmp(opt->defname, "mysql_consistent_snapshot") == 0)
+			{
 				snapshot = true;
-			else if (strcmp(opt->defname, "transaction_isolation") == 0)
+				continue;
+			}
+			if (strcmp(opt->defname, "transaction_isolation") == 0)
 				isolation = true;
 			else if (strcmp(opt->defname, "transaction_read_only") == 0 &&
 					 IsA(opt->arg, A_Const) && IsA(&((A_Const *) opt->arg)->val, Integer))
 				explicit_read_only = intVal(&((A_Const *) opt->arg)->val) != 0;
+			cleaned = lappend(cleaned, opt);
 		}
-		level = mys_transaction_start(explicit_read_only, &snapshot, &read_only,
-									  info == NULL || !info->txn_control);
-		if (!isolation)
-			start->options = lappend(start->options,
-									 makeDefElem("transaction_isolation",
-												 makeStringConst(pstrdup(level), -1), -1));
-		if (explicit_read_only < 0 && (read_only || !RecoveryInProgress()))
-			start->options = lappend(start->options,
-									 makeDefElem("transaction_read_only",
-												 bool_const(read_only), -1));
-		pstmt = copyObject(pstmt);
-		pstmt->utilityStmt = (Node *) start;
-		if (prev_ProcessUtility)
-			prev_ProcessUtility(pstmt, queryString, readOnlyTree, context,
-								params, queryEnv, dest, qc);
-		else
-			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+		start->options = cleaned;
+
+		if (!FirstSnapshotSet && !IsSubTransaction())
+		{
+			bool		read_only;
+			const char *level;
+
+			level = mys_transaction_start(explicit_read_only, &snapshot, &read_only,
+										  info == NULL || !info->txn_control);
+			if (!isolation)
+				start->options = lappend(start->options,
+										 makeDefElem("transaction_isolation",
+													 makeStringConst(pstrdup(level), -1), -1));
+			if (explicit_read_only < 0 && (read_only || !RecoveryInProgress()))
+				start->options = lappend(start->options,
+										 makeDefElem("transaction_read_only",
+													 bool_const(read_only), -1));
+			pstmt = copyObject(pstmt);
+			pstmt->utilityStmt = (Node *) start;
+			if (prev_ProcessUtility)
+				prev_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 									params, queryEnv, dest, qc);
-		if (snapshot)
-			(void) GetTransactionSnapshot();
-		return;
+			else
+				standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+										params, queryEnv, dest, qc);
+			if (snapshot)
+				(void) GetTransactionSnapshot();
+			return;
+		}
+		pstmt = copyObject(pstmt);
+		pstmt->utilityStmt = parsetree = (Node *) start;
 	}
 
 	if (prev_ProcessUtility)
@@ -2463,6 +2881,50 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 	else
 		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 								params, queryEnv, dest, qc);
+
+	if (mys_is_mysql_session() && !IsAbortedTransactionBlockState())
+	{
+		if (IsA(parsetree, DropStmt) &&
+			((DropStmt *) parsetree)->removeType == OBJECT_SCHEMA)
+		{
+			foreach_ptr(Node, sname, ((DropStmt *) parsetree)->objects)
+				if (IsA(sname, String))
+					mys_clear_selected_database_if_matches(strVal(sname));
+		}
+		else if (internal_utility_depth == 0 && IsA(parsetree, AlterTableStmt))
+		{
+			AlterTableStmt *alter = (AlterTableStmt *) parsetree;
+			bool		dropped_col = false;
+
+			foreach_node(AlterTableCmd, cmd, alter->cmds)
+				if (cmd->subtype == AT_DropColumn)
+					dropped_col = true;
+			if (dropped_col)
+			{
+				Oid			relid = RangeVarGetRelid(alter->relation, NoLock, true);
+
+				if (OidIsValid(relid))
+					prune_on_update_trigger(relid, pstmt, queryString, params, queryEnv);
+			}
+		}
+		else if (internal_utility_depth == 0 && IsA(parsetree, AlterObjectSchemaStmt) &&
+				 ((AlterObjectSchemaStmt *) parsetree)->objectType == OBJECT_TABLE &&
+				 ((AlterObjectSchemaStmt *) parsetree)->relation != NULL)
+		{
+			AlterObjectSchemaStmt *mv = (AlterObjectSchemaStmt *) parsetree;
+			RangeVar   *moved = makeRangeVar(mv->newschema, mv->relation->relname, -1);
+			Oid			relid = RangeVarGetRelid(moved, NoLock, true);
+
+			if (OidIsValid(relid))
+				rehome_generators(relid, pstmt, queryString, params, queryEnv);
+		}
+		else if (IsA(parsetree, TransactionStmt) &&
+				 (((TransactionStmt *) parsetree)->kind == TRANS_STMT_ROLLBACK ||
+				  ((TransactionStmt *) parsetree)->kind == TRANS_STMT_ROLLBACK_TO))
+		{
+			mys_sync_selected_database();
+		}
+	}
 }
 
 /* Pending declarations are maintained inside the read-only utility guard. */
@@ -2472,11 +2934,13 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 				ParamListInfo params, QueryEnvironment *queryEnv,
 				DestReceiver *dest, QueryCompletion *qc)
 {
-	MysFKUtility *fk = mys_fk_before_utility(&pstmt);
+	MysFKUtility *fk = !IsAbortedTransactionBlockState() ?
+		mys_fk_before_utility(&pstmt) : NULL;
 
 	process_utility_impl(pstmt, queryString, fk ? false : readOnlyTree,
 						 context, params, queryEnv, dest, qc);
-	mys_fk_after_utility(fk);
+	if (fk && !IsAbortedTransactionBlockState())
+		mys_fk_after_utility(fk);
 }
 
 /* GLOBAL read_only is a statement restriction, never a GUC override. */
@@ -2488,20 +2952,23 @@ mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 {
 	List	   *generators = NIL;
 
-	if (mys_is_mysql_session())
+	if (mys_is_mysql_session() && !IsAbortedTransactionBlockState())
 	{
 		if (server_read_only_utility(pstmt->utilityStmt, context))
 			ereport(ERROR,
 					(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 					 errmsg("The MySQL server is running with the --read-only option so it cannot execute this statement")));
 
+		check_mysql_ddl_guards(pstmt->utilityStmt, context);
 		generators = statement_generators(pstmt->utilityStmt);
 	}
 	process_utility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
-	if (mys_is_mysql_session() && IsA(pstmt->utilityStmt, CreateStmt) &&
+	if (mys_is_mysql_session() && !IsAbortedTransactionBlockState() &&
+		IsA(pstmt->utilityStmt, CreateStmt) &&
 		((CreateStmt *) pstmt->utilityStmt)->relation->relpersistence == RELPERSISTENCE_TEMP)
 		mys_statement_touched_tables();
-	drop_unused_generators(generators);
+	if (generators != NIL && !IsAbortedTransactionBlockState())
+		drop_unused_generators(generators);
 }
 
 void

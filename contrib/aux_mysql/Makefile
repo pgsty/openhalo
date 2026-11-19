@@ -31,11 +31,9 @@ OBJS = \
 	src/mysm/aggregates.o \
 	src/mysm/bpchar.o \
 	src/mysm/date_func.o \
-	src/mysm/mys_adtext.o \
 	src/mysm/mys_date.o \
 	src/mysm/mys_timestamp.o \
 	src/mysm/mys_uservar.o \
-	src/mysm/mys_varlena.o \
 	src/mysm/operators.o \
 	src/mysm/partListColumns.o \
 	src/mysm/strfuncs.o \
@@ -49,13 +47,7 @@ OBJS = \
 	src/mysm/uuid_short_core.o
 
 EXTENSION = aux_mysql
-# extension script = openHalo aux_mysql SQL layer (tools/port_aux_sql.py)
-#                    + hand-written objects (sql/aux_mysql_additions.sql)
-#                    + binary strings and 1.9 corrections
-# 1.7 -> 1.8 update = generated objects (sql/aux_mysql_update18.sql, tools/port_aux_sql.py)
-#                    + sql/aux_mysql_binary.sql
-DATA_built = sql/aux_mysql--1.9.sql sql/aux_mysql--1.7--1.8.sql sql/aux_mysql--1.8--1.9.sql
-DATA = sql/aux_mysql--1.5--1.6.sql sql/aux_mysql--1.6--1.7.sql
+DATA = sql/aux_mysql--2.0.sql
 PGFILEDESC = "aux_mysql - MySQL compatibility (openHalo)"
 
 # generated grammar / keyword headers live in the build directory
@@ -67,13 +59,6 @@ EXTRA_CLEAN = src/parser/mys_gram.c src/parser/mys_gram.h src/parser/mys_gram.ou
 
 ifdef USE_PGXS
 PG_CONFIG ?= pg_config
-
-# Babelfish's kernel (postgresql_modified_for_babelfish) has its own protocol
-# extension API: build the adapter (needs babelfish-6.2-mysql-delta.patch)
-ifneq ($(shell grep -l listen_add_socket $(shell $(PG_CONFIG) --includedir-server)/postmaster/protocol_extension.h 2>/dev/null),)
-PG_CPPFLAGS += -DHALO_BABELFISH_API
-endif
-
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
@@ -85,18 +70,6 @@ endif
 
 # TLS and RSA key exchange for caching_sha2_password
 SHLIB_LINK += $(filter -lssl -lcrypto, $(LIBS))
-
-sql/aux_mysql--1.9.sql: sql/aux_mysql.sql sql/aux_mysql_additions.sql sql/aux_mysql_binary.sql sql/aux_mysql_fix_binary.sql sql/aux_mysql_fix_indexes.sql sql/aux_mysql_fix_compat.sql
-	@$(MKDIR_P) sql
-	cat $^ > $@
-
-sql/aux_mysql--1.7--1.8.sql: sql/aux_mysql_update18.sql sql/aux_mysql_binary.sql
-	@$(MKDIR_P) sql
-	cat $^ > $@
-
-sql/aux_mysql--1.8--1.9.sql: sql/aux_mysql_update19.sql sql/aux_mysql_fix_generated.sql sql/aux_mysql_fix_fk.sql sql/aux_mysql_fix_show.sql sql/aux_mysql_fix_metadata.sql sql/aux_mysql_fix_binary.sql sql/aux_mysql_fix_indexes.sql sql/aux_mysql_fix_compat.sql
-	@$(MKDIR_P) sql
-	cat $^ > $@
 
 src/parser/mys_gram.c: src/parser/mys_gram.y
 	@$(MKDIR_P) src/parser

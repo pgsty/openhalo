@@ -27,6 +27,7 @@
 #include "libpq/libpq-be.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/protocol_extension.h"
@@ -298,15 +299,22 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 		/* Do what ProcessStartupPacket() does after a valid startup packet */
 		if (status == STATUS_OK)
 		{
+			size_t		dblen;
+			size_t		userlen;
+
 			if (port->database_name == NULL || port->database_name[0] == '\0' ||
 				port->user_name == NULL || port->user_name[0] == '\0')
 				ereport(FATAL,
 						(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						 errmsg("no PostgreSQL user name or database name specified")));
-			if (strlen(port->database_name) >= NAMEDATALEN)
-				port->database_name[NAMEDATALEN - 1] = '\0';
-			if (strlen(port->user_name) >= NAMEDATALEN)
-				port->user_name[NAMEDATALEN - 1] = '\0';
+			dblen = strlen(port->database_name);
+			if (dblen >= NAMEDATALEN)
+				port->database_name[pg_encoding_mbcliplen(PG_UTF8, port->database_name,
+														  (int) dblen, NAMEDATALEN - 1)] = '\0';
+			userlen = strlen(port->user_name);
+			if (userlen >= NAMEDATALEN)
+				port->user_name[pg_encoding_mbcliplen(PG_UTF8, port->user_name,
+													  (int) userlen, NAMEDATALEN - 1)] = '\0';
 			MyBackendType = B_BACKEND;
 		}
 	}

@@ -3,7 +3,6 @@
  * mysm_compat.h
  *	  PG14 -> PG18 API compatibility for code ported from openHalo.
  *
- *
  * Copyright (c) 2026, PGSTY PTE. LTD.
  * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
@@ -17,6 +16,7 @@
 #include "varatt.h"				/* PG16: VARDATA & co. moved out of postgres.h */
 #include "catalog/pg_collation.h"
 #include "datatype/timestamp.h"
+#include "nodes/miscnodes.h"
 #include "utils/builtins.h"
 #include "utils/pg_locale.h"
 #include "utils/timestamp.h"
@@ -30,6 +30,13 @@
 static inline bool
 mysm_scanint8(const char *str, bool errorOK, int64 *result)
 {
+	if (errorOK)
+	{
+		ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+		*result = pg_strtoint64_safe(str, (Node *) &escontext);
+		return !escontext.error_occurred;
+	}
 	*result = pg_strtoint64(str);
 	return true;
 }

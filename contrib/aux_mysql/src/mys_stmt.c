@@ -54,6 +54,7 @@
 #include "parser/analyze.h"
 #include "parser/parse_collate.h"
 #include "parser/parse_expr.h"
+#include "parser/parser.h"
 #include "pgstat.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
@@ -133,6 +134,21 @@ lookup_stmt(uint32 id, const char *where, bool missing_ok)
 }
 
 static void
+clear_stmt_long_data(MysPrepStmt *stmt)
+{
+	for (int i = 0; i < stmt->nparams; i++)
+	{
+		if (stmt->long_data[i])
+		{
+			pfree(stmt->long_data[i]->data);
+			pfree(stmt->long_data[i]);
+			stmt->long_data[i] = NULL;
+		}
+	}
+	stmt->long_data_bytes = 0;
+}
+
+static void
 drop_stmt(MysPrepStmt *stmt)
 {
 	MemoryContext cxt = stmt->cxt;
@@ -156,24 +172,19 @@ mys_stmt_close_all(void)
 {
 	HASH_SEQ_STATUS seq;
 	MysPrepStmt *stmt;
-	List	   *ids = NIL;
-	ListCell   *lc;
 
 	sql_stmt_drop_all();
 	if (stmt_hash == NULL)
 		return;
 	hash_seq_init(&seq, stmt_hash);
 	while ((stmt = hash_seq_search(&seq)) != NULL)
-		ids = lappend_int(ids, (int) stmt->id);
-	foreach(lc, ids)
 	{
-		uint32		id = (uint32) lfirst_int(lc);
+		MemoryContext cxt = stmt->cxt;
+		uint32		id = stmt->id;
 
-		stmt = hash_search(stmt_hash, &id, HASH_FIND, NULL);
-		if (stmt)
-			drop_stmt(stmt);
+		hash_search(stmt_hash, &id, HASH_REMOVE, NULL);
+		MemoryContextDelete(cxt);
 	}
-	list_free(ids);
 }
 
 /* end of a COM_QUERY / COM_STMT_EXECUTE cycle */
@@ -398,6 +409,7 @@ append_param(StringInfo buf, StringInfo pkt, uint16 ptype)
 	bool		is_unsigned = (ptype & 0x8000) != 0;
 	uint64		v;
 	const char *s;
+	int			slen;
 
 	switch (type)
 	{
@@ -455,16 +467,16 @@ append_param(StringInfo buf, StringInfo pkt, uint16 ptype)
 			break;
 		case MYSQL_TYPE_DECIMAL:
 		case MYSQL_TYPE_NEWDECIMAL:
-			if (!get_lenenc_int(pkt, &v) || !get_bytes(pkt, (int) v, &s))
+			if (!get_lenenc_bytes(pkt, &s, &slen))
 				malformed();
-			if (is_decimal_text(s, (int) v))
+			if (is_decimal_text(s, slen))
 			{
 				appendStringInfoChar(buf, '(');
-				appendBinaryStringInfo(buf, s, (int) v);
+				appendBinaryStringInfo(buf, s, slen);
 				appendStringInfoChar(buf, ')');
 			}
 			else
-				append_string_literal(buf, s, (int) v, false);
+				append_string_literal(buf, s, slen, false);
 			break;
 		case MYSQL_TYPE_VARCHAR:
 		case MYSQL_TYPE_VAR_STRING:
@@ -472,9 +484,9 @@ append_param(StringInfo buf, StringInfo pkt, uint16 ptype)
 		case MYSQL_TYPE_ENUM:
 		case MYSQL_TYPE_SET:
 		case MYSQL_TYPE_JSON:
-			if (!get_lenenc_int(pkt, &v) || !get_bytes(pkt, (int) v, &s))
+			if (!get_lenenc_bytes(pkt, &s, &slen))
 				malformed();
-			append_string_literal(buf, s, (int) v, false);
+			append_string_literal(buf, s, slen, false);
 			break;
 		case MYSQL_TYPE_TINY_BLOB:
 		case MYSQL_TYPE_MEDIUM_BLOB:
@@ -483,9 +495,9 @@ append_param(StringInfo buf, StringInfo pkt, uint16 ptype)
 		case MYSQL_TYPE_BIT:
 		case MYSQL_TYPE_GEOMETRY:
 			/* binary character set, as in MySQL */
-			if (!get_lenenc_int(pkt, &v) || !get_bytes(pkt, (int) v, &s))
+			if (!get_lenenc_bytes(pkt, &s, &slen))
 				malformed();
-			append_string_literal(buf, s, (int) v, true);
+			append_string_literal(buf, s, slen, true);
 			break;
 		default:
 			ereport(ERROR,
@@ -529,13 +541,42 @@ prepare_time_error(int sqlerrcode)
 		case ERRCODE_UNDEFINED_COLUMN:
 		case ERRCODE_AMBIGUOUS_COLUMN:
 		case ERRCODE_INVALID_SCHEMA_NAME:
+		case MYS_ERRCODE_NO_DB_ERROR:
 		case ERRCODE_INSUFFICIENT_PRIVILEGE:
 		case ERRCODE_FEATURE_NOT_SUPPORTED:
 		case ERRCODE_INVALID_PSTATEMENT_DEFINITION:
+		case ERRCODE_QUERY_CANCELED:
+		case ERRCODE_LOCK_NOT_AVAILABLE:
+		case ERRCODE_T_R_DEADLOCK_DETECTED:
+		case ERRCODE_OUT_OF_MEMORY:
+		case ERRCODE_ADMIN_SHUTDOWN:
+		case ERRCODE_CRASH_SHUTDOWN:
 			return true;
 		default:
 			return false;
 	}
+}
+
+static List *
+copy_coldef_targetlist(List *src_tlist)
+{
+	List	   *out = NIL;
+	ListCell   *lc;
+
+	foreach(lc, src_tlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		TargetEntry *copy;
+
+		if (tle->resjunk)
+			continue;
+		copy = makeNode(TargetEntry);
+		copy->resorigtbl = tle->resorigtbl;
+		copy->resorigcol = tle->resorigcol;
+		copy->resjunk = false;
+		out = lappend(out, copy);
+	}
+	return out;
 }
 
 /*
@@ -543,7 +584,8 @@ prepare_time_error(int sqlerrcode)
  * result.  Returns false if the statement returns no rows (or the shape
  * cannot be known before the parameter values are).  An error that MySQL
  * would report at PREPARE time is returned in *error; the analysis runs in
- * a subtransaction, so the client's transaction is not affected.
+ * a subtransaction that is ALWAYS rolled back afterwards so PREPARE never
+ * retains table write locks in the caller's transaction.
  */
 static bool
 describe_statement(const char *query, int nparams, const int *locs,
@@ -593,9 +635,19 @@ describe_statement(const char *query, int nparams, const int *locs,
 				   *lc2;
 
 		mys_text_map = &map;
-		raw = mys_rewrite_raw_stmts(mysql_raw_parser(text.data), text.data, &infos);
-		/* EXECUTE rewrites it again and reports them */
-		mys_discard_rewrite_warnings();
+		if (halo_mysql_parser == MYS_PARSER_POSTGRES)
+		{
+			raw = raw_parser(text.data, RAW_PARSE_DEFAULT);
+			infos = NIL;
+			for (int i = 0; i < list_length(raw); i++)
+				infos = lappend(infos, palloc0(sizeof(MysStmtInfo)));
+		}
+		else
+		{
+			raw = mys_rewrite_raw_stmts(mysql_raw_parser(text.data), text.data, &infos);
+			/* EXECUTE rewrites it again and reports them */
+			mys_discard_rewrite_warnings();
+		}
 		forboth(lc, raw, lc2, infos)
 		{
 			MysStmtInfo *info = (MysStmtInfo *) lfirst(lc2);
@@ -620,6 +672,8 @@ describe_statement(const char *query, int nparams, const int *locs,
 			List	   *qlist = pg_analyze_and_rewrite_fixedparams(last, text.data,
 																   NULL, 0, NULL);
 			Query	   *q = NULL;
+			TupleDesc	inner_desc = NULL;
+			List	   *inner_tlist = NIL;
 
 			foreach(lc, qlist)
 			{
@@ -629,28 +683,37 @@ describe_statement(const char *query, int nparams, const int *locs,
 			switch (ChoosePortalStrategy(qlist))
 			{
 				case PORTAL_ONE_SELECT:
-					*tlist = q->targetList;
-					*tupdesc = ExecCleanTypeFromTL(q->targetList);
+					inner_tlist = q->targetList;
+					inner_desc = ExecCleanTypeFromTL(q->targetList);
 					break;
 				case PORTAL_ONE_RETURNING:
 				case PORTAL_ONE_MOD_WITH:
 					/* ON DUPLICATE KEY UPDATE / REPLACE: hidden RETURNING */
 					if (last_info->upsert != MYS_UPSERT_NONE)
 						break;
-					*tlist = q->returningList;
-					*tupdesc = ExecCleanTypeFromTL(q->returningList);
+					inner_tlist = q->returningList;
+					inner_desc = ExecCleanTypeFromTL(q->returningList);
 					break;
 				case PORTAL_UTIL_SELECT:
-					*tupdesc = UtilityTupleDescriptor(q->utilityStmt);
+					inner_desc = UtilityTupleDescriptor(q->utilityStmt);
 					break;
 				case PORTAL_MULTI_QUERY:
 					break;
 			}
-			result = (*tupdesc != NULL);
+			if (inner_desc != NULL)
+			{
+				MemoryContext cxt_save = MemoryContextSwitchTo(oldcxt);
+
+				*tupdesc = CreateTupleDescCopy(inner_desc);
+				*tlist = copy_coldef_targetlist(inner_tlist);
+				MemoryContextSwitchTo(cxt_save);
+				result = true;
+			}
 		}
 		mys_text_map = saved_map;
 
-		ReleaseCurrentSubTransaction();
+		/* Release any locks acquired during analysis */
+		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcxt);
 		CurrentResourceOwner = oldowner;
 	}
@@ -728,16 +791,19 @@ mys_stmt_prepare(StringInfo pkt)
 		return;
 	}
 
+	if (IsAbortedTransactionBlockState())
+	{
+		mys_send_error(ERRCODE_IN_FAILED_SQL_TRANSACTION,
+					   "current transaction is aborted, commands ignored until end of transaction block");
+		return;
+	}
+
 	debug_query_string = query;
 	pgstat_report_activity(STATE_RUNNING, query);
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	/* as exec_simple_query: work in MessageContext, not the transaction */
 	MemoryContextSwitchTo(MessageContext);
-	if (IsAbortedTransactionBlockState())
-		ereport(ERROR,
-				(errcode(ERRCODE_IN_FAILED_SQL_TRANSACTION),
-				 errmsg("current transaction is aborted, commands ignored until end of transaction block")));
 	PushActiveSnapshot(GetTransactionSnapshot());
 
 	/* scanner errors (e.g. unterminated string) are syntax errors */
@@ -748,6 +814,10 @@ mys_stmt_prepare(StringInfo pkt)
 		/* as for COM_QUERY, string literals that are not text become X'hex' */
 		query = mys_normalize_query(pkt->data + 1, pkt->len - 1);
 		nparams = find_markers(query, &found_locs);
+		if (nparams > PG_UINT16_MAX)
+			ereport(ERROR,
+					(errcode(MYS_ERRCODE_PS_MANY_PARAM),
+					 errmsg("Prepared statement contains too many placeholders")));
 		locs = found_locs;
 	}
 	PG_CATCH();
@@ -774,6 +844,7 @@ mys_stmt_prepare(StringInfo pkt)
 		CommitTransactionCommand();
 		debug_query_string = NULL;
 		mys_send_error(error->sqlerrcode, error->message);
+		FreeErrorData(error);
 		return;
 	}
 
@@ -868,52 +939,49 @@ mys_stmt_execute(StringInfo inBuf)
 								 * whole result is sent */
 	(void) need_uint(inBuf, 4); /* iteration count, always 1 */
 
-	if (stmt->nparams > 0)
+	PG_TRY();
 	{
-		if (!get_bytes(inBuf, (stmt->nparams + 7) / 8, &nullmap))
-			malformed();
-		if (need_uint(inBuf, 1))
+		if (stmt->nparams > 0)
 		{
-			for (int i = 0; i < stmt->nparams; i++)
-				stmt->param_types[i] = (uint16) need_uint(inBuf, 2);
-			stmt->types_bound = true;
+			if (!get_bytes(inBuf, (stmt->nparams + 7) / 8, &nullmap))
+				malformed();
+			if (need_uint(inBuf, 1))
+			{
+				for (int i = 0; i < stmt->nparams; i++)
+					stmt->param_types[i] = (uint16) need_uint(inBuf, 2);
+				stmt->types_bound = true;
+			}
+			else if (!stmt->types_bound)
+				malformed();
 		}
-		else if (!stmt->types_bound)
-			malformed();
-	}
 
-	new_loc = palloc(sizeof(int) * Max(stmt->nparams, 1));
-	new_len = palloc(sizeof(int) * Max(stmt->nparams, 1));
-	initStringInfo(&q);
-	for (int i = 0; i < stmt->nparams; i++)
-	{
-		appendBinaryStringInfo(&q, stmt->query + prev, stmt->param_loc[i] - prev);
-		new_loc[i] = q.len;
-		if (stmt->long_data[i])
-			append_string_literal(&q, stmt->long_data[i]->data, stmt->long_data[i]->len,
-								  param_type_is_binary(stmt->param_types[i]));
-		else if (nullmap[i / 8] & (1 << (i % 8)))
-			appendStringInfoString(&q, "NULL");
-		else
-			append_param(&q, inBuf, stmt->param_types[i]);
-		new_len[i] = q.len - new_loc[i];
-		prev = stmt->param_loc[i] + 1;
-	}
-	appendStringInfoString(&q, stmt->query + prev);
-
-	/* long data is consumed by the execution, as in MySQL */
-	for (int i = 0; i < stmt->nparams; i++)
-	{
-		if (stmt->long_data[i])
+		new_loc = palloc(sizeof(int) * Max(stmt->nparams, 1));
+		new_len = palloc(sizeof(int) * Max(stmt->nparams, 1));
+		initStringInfo(&q);
+		for (int i = 0; i < stmt->nparams; i++)
 		{
-			pfree(stmt->long_data[i]->data);
-			pfree(stmt->long_data[i]);
-			stmt->long_data[i] = NULL;
+			appendBinaryStringInfo(&q, stmt->query + prev, stmt->param_loc[i] - prev);
+			new_loc[i] = q.len;
+			if (stmt->long_data[i])
+				append_string_literal(&q, stmt->long_data[i]->data, stmt->long_data[i]->len,
+									  param_type_is_binary(stmt->param_types[i]));
+			else if (nullmap[i / 8] & (1 << (i % 8)))
+				appendStringInfoString(&q, "NULL");
+			else
+				append_param(&q, inBuf, stmt->param_types[i]);
+			new_len[i] = q.len - new_loc[i];
+			prev = stmt->param_loc[i] + 1;
 		}
+		appendStringInfoString(&q, stmt->query + prev);
 	}
+	PG_FINALLY();
+	{
+		/* long data is consumed by each execution attempt, as in MySQL */
+		clear_stmt_long_data(stmt);
+	}
+	PG_END_TRY();
 
 	/* result columns are named after the text with '?' (MySQL's naming) */
-	stmt->long_data_bytes = 0;
 	map = palloc(sizeof(MysTextMap));
 	map->orig = stmt->query;
 	map->nparams = stmt->nparams;
@@ -966,16 +1034,7 @@ mys_stmt_reset(StringInfo pkt)
 								(uint32) id));
 		return;
 	}
-	for (int i = 0; i < stmt->nparams; i++)
-	{
-		if (stmt->long_data[i])
-		{
-			pfree(stmt->long_data[i]->data);
-			pfree(stmt->long_data[i]);
-			stmt->long_data[i] = NULL;
-		}
-	}
-	stmt->long_data_bytes = 0;
+	clear_stmt_long_data(stmt);
 	stmt->long_data_error = false;
 	mys_send_ok(0, 0, false, false);
 }
@@ -986,6 +1045,7 @@ mys_stmt_send_long_data(StringInfo pkt)
 	MysPrepStmt *stmt;
 	uint64		id;
 	uint64		param;
+	Size		chunk_len;
 	MemoryContext oldcxt;
 
 	pkt->cursor = 1;
@@ -995,19 +1055,21 @@ mys_stmt_send_long_data(StringInfo pkt)
 	stmt = lookup_stmt((uint32) id, "mysqld_stmt_send_long_data", true);
 	if (stmt == NULL || param >= (uint64) stmt->nparams)
 		return;
+	chunk_len = (Size) (pkt->len - pkt->cursor);
 	if (stmt->long_data_error ||
-		stmt->long_data_bytes + pkt->len - pkt->cursor > (Size) halo_mysql_max_allowed_packet)
+		chunk_len > (Size) halo_mysql_max_allowed_packet ||
+		stmt->long_data_bytes > (Size) halo_mysql_max_allowed_packet - chunk_len)
 	{
 		stmt->long_data_error = true;
 		return;
 	}
-	stmt->long_data_bytes += pkt->len - pkt->cursor;
+	stmt->long_data_bytes += chunk_len;
 
 	oldcxt = MemoryContextSwitchTo(stmt->cxt);
 	if (stmt->long_data[param] == NULL)
 		stmt->long_data[param] = makeStringInfo();
 	appendBinaryStringInfo(stmt->long_data[param], pkt->data + pkt->cursor,
-						   pkt->len - pkt->cursor);
+						   (int) chunk_len);
 	MemoryContextSwitchTo(oldcxt);
 }
 
@@ -1043,6 +1105,7 @@ sql_stmt_key(const char *name, char *key)
 {
 	int			i;
 
+	memset(key, 0, NAMEDATALEN);
 	for (i = 0; name[i] != '\0' && i < NAMEDATALEN - 1; i++)
 		key[i] = pg_ascii_tolower((unsigned char) name[i]);
 	key[i] = '\0';
@@ -1069,7 +1132,7 @@ sql_stmt_drop(const char *name)
 	if (stmt == NULL)
 		return false;
 	cxt = stmt->cxt;
-	strlcpy(key, stmt->name, NAMEDATALEN);
+	memcpy(key, stmt->name, NAMEDATALEN);
 	hash_search(sql_stmt_hash, key, HASH_REMOVE, NULL);
 	MemoryContextDelete(cxt);
 	return true;
@@ -1238,6 +1301,10 @@ sql_prepare(DoStmt *d)
 
 	query = mys_normalize_query(text, len);
 	nparams = find_markers(query, &locs);
+	if (nparams > PG_UINT16_MAX)
+		ereport(ERROR,
+				(errcode(MYS_ERRCODE_PS_MANY_PARAM),
+				 errmsg("Prepared statement contains too many placeholders")));
 	(void) describe_statement(query, nparams, locs, &tupdesc, &tlist, &error);
 	if (error)
 		ReThrowError(error);
@@ -1320,7 +1387,7 @@ append_using_value(StringInfo buf, Node *arg, ParseState *pstate)
 	}
 	else if (type == BPCHAROID)
 	{
-		bytea *b = mys_bpchar_bytes(value);
+		bytea	   *b = mys_bpchar_bytes(value);
 
 		append_string_literal(buf, VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), false);
 	}

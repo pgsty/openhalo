@@ -20,9 +20,6 @@
 
 extern char *halo_mysql_version;
 extern bool halo_mysql_explicit_defaults_for_timestamp;
-extern bool halo_mysql_auto_rollback_tx_on_error;
-extern int	moreResultsFlag;
-extern int	warnings;
 extern unsigned long foundRows;
 extern long long affectedRows;
 extern unsigned long lastInsertID;

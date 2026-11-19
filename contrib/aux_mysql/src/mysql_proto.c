@@ -34,10 +34,11 @@
 #include "access/printtup.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/discard.h"
-#include "funcapi.h"
 #include "common/string.h"
+#include "funcapi.h"
 #include "libpq/auth.h"
 #include "libpq/crypt.h"
 #include "libpq/hba.h"
@@ -53,6 +54,7 @@
 #include "tcop/dest.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
@@ -80,21 +82,25 @@ static uint8 mys_seq = 0;			/* next sequence id to send */
 uint32		mys_client_caps = 0;
 static char scramble[MYS_SCRAMBLE_LEN + 1];
 static char *initial_db = NULL;		/* database from HandshakeResponse */
+static char *selected_db = NULL;	/* active MySQL database (TopMemoryContext) */
 static char *client_plugin = NULL;
 static char *client_auth_resp = NULL;
 static int	client_auth_resp_len = 0;
 static bool handshake_done = false;
 static bool resultset_active = false;
+static uint64 last_rows_sent = 0;
 uint16		mys_warning_count = 0;
 
 #define MYS_MAX_DIAGNOSTICS 64
+#define MYS_OUTBUF_SHRINK_THRESHOLD (1024 * 1024)
+
 static struct
 {
-	bool error;
-	uint16 code;
-	char *message;
+	bool		error;
+	uint16		code;
+	char	   *message;
 } diagnostics[MYS_MAX_DIAGNOSTICS];
-static int ndiagnostics = 0;
+static int	ndiagnostics = 0;
 static MemoryContext diagnostics_context = NULL;
 static bool diagnostics_pending = false;
 
@@ -115,7 +121,7 @@ mys_record_diagnostic(bool error, uint16 code, const char *message)
 		mys_clear_diagnostics();
 	if (!diagnostics_context)
 		diagnostics_context = AllocSetContextCreate(TopMemoryContext,
-												   "MySQL diagnostics", ALLOCSET_SMALL_SIZES);
+													"MySQL diagnostics", ALLOCSET_SMALL_SIZES);
 	if (mys_warning_count < PG_UINT16_MAX)
 		mys_warning_count++;
 	if (ndiagnostics < MYS_MAX_DIAGNOSTICS)
@@ -131,14 +137,14 @@ PG_FUNCTION_INFO_V1(mys_show_diagnostics);
 Datum
 mys_show_diagnostics(PG_FUNCTION_ARGS)
 {
-	bool errors_only = PG_GETARG_BOOL(0);
+	bool		errors_only = PG_GETARG_BOOL(0);
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 	for (int i = 0; i < ndiagnostics; i++)
 	{
-		Datum values[3];
-		bool nulls[3] = {false, false, false};
+		Datum		values[3];
+		bool		nulls[3] = {false, false, false};
 
 		if (errors_only && !diagnostics[i].error)
 			continue;
@@ -150,15 +156,12 @@ mys_show_diagnostics(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
-#ifdef HALO_BABELFISH_API
-static List *bf_receivers = NIL;	/* result receiver state (MysDR) */
-#endif
-
 /* statements of the current COM_QUERY (see mys_rewrite.c) */
 static List *stmt_infos = NIL;
 static int	stmt_index = 0;
 static uint64 cur_insert_id = 0;	/* last_insert_id for the next OK packet */
 static bool com_query = false;		/* the command is COM_QUERY */
+static bool running_queued_query = false;
 static bool trailing_comment_ok = false;	/* an OK follows the last statement */
 static bool trailing_ok_deferred = false;	/* ... of the last queued part */
 static bool last_queued_part = false;	/* running the last queued query */
@@ -316,6 +319,13 @@ mys_flush(void)
 	char	   *p = outbuf.data;
 	int			left = outbuf.len;
 
+	if (p == NULL || left <= 0)
+	{
+		if (p != NULL)
+			resetStringInfo(&outbuf);
+		return;
+	}
+
 	while (left > 0)
 	{
 		ssize_t		r = secure_write(MyProcPort, p, left);
@@ -336,6 +346,19 @@ mys_flush(void)
 		left -= r;
 	}
 	resetStringInfo(&outbuf);
+}
+
+static void
+mys_maybe_shrink_outbuf(void)
+{
+	if (outbuf.data != NULL && outbuf.maxlen > MYS_OUTBUF_SHRINK_THRESHOLD)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+
+		pfree(outbuf.data);
+		initStringInfo(&outbuf);
+		MemoryContextSwitchTo(oldcxt);
+	}
 }
 
 /* Append one logical packet (payload) to the output buffer */
@@ -362,10 +385,9 @@ mys_send_packet(const char *payload, int len)
 			hdr[3] = mys_seq++;
 			appendBinaryStringInfo(&outbuf, hdr, 4);
 		}
+		if (outbuf.len >= 65536)
+			mys_flush();
 	} while (len > 0);
-
-	if (outbuf.len > 65536)
-		mys_flush();
 }
 
 /* Read one logical packet into buf.  Returns 0, or EOF on disconnect. */
@@ -374,23 +396,35 @@ mys_read_packet(StringInfo buf)
 {
 	unsigned char hdr[4];
 	int			len;
+	Size		max_pkt = handshake_done ?
+		(Size) halo_mysql_max_allowed_packet :
+		Min((Size) halo_mysql_max_allowed_packet, (Size) MYS_MAX_PREAUTH_PACKET);
 
 	resetStringInfo(buf);
 	pq_startmsgread();
 	for (;;)
 	{
 		if (pq_getbytes((char *) hdr, 4) == EOF)
+		{
+			pq_endmsgread();
 			return EOF;
+		}
 		len = hdr[0] | (hdr[1] << 8) | (hdr[2] << 16);
 		mys_seq = hdr[3] + 1;
-		if ((Size) buf->len + len > (Size) halo_mysql_max_allowed_packet ||
-			(Size) buf->len + len >= MaxAllocSize - 1)
+		if ((Size) buf->len + (Size) len > max_pkt ||
+			(Size) buf->len + (Size) len >= MaxAllocSize - 1)
+		{
+			pq_endmsgread();
 			ereport(FATAL,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("MySQL packet exceeds mysql.max_allowed_packet")));
+					(errcode(MYS_ERRCODE_PACKET_TOO_LARGE),
+					 errmsg("Got a packet bigger than 'max_allowed_packet' bytes")));
+		}
 		enlargeStringInfo(buf, len);
 		if (len > 0 && pq_getbytes(buf->data + buf->len, len) == EOF)
+		{
+			pq_endmsgread();
 			return EOF;
+		}
 		buf->len += len;
 		buf->data[buf->len] = '\0';
 		if (len < MYS_MAX_PACKET)
@@ -477,7 +511,7 @@ mys_send_err(uint16 code, const char *sqlstate, const char *msg)
 	initStringInfo(&b);
 	put_int1(&b, 0xff);
 	put_int2(&b, code);
-	if (mys_client_caps & CLIENT_PROTOCOL_41 || !handshake_done)
+	if ((mys_client_caps & CLIENT_PROTOCOL_41) || !handshake_done)
 	{
 		put_int1(&b, '#');
 		appendBinaryStringInfo(&b, sqlstate, 5);
@@ -597,6 +631,12 @@ mys_sqlstate(int sqlerrcode)
 			return "42000";
 		case ERRCODE_MYS_USER_LOCK_DEADLOCK:
 			return "40001";
+		case MYS_ERRCODE_NO_DB_ERROR:
+			return "3D000";
+		case MYS_ERRCODE_PACKET_TOO_LARGE:
+			return "08S01";
+		case MYS_ERRCODE_PS_MANY_PARAM:
+			return "HY000";
 		case MYS_ERRCODE_TXN_CHARACTERISTICS:
 			return "25001";
 		default:
@@ -613,10 +653,6 @@ mys_send_error(int sqlerrcode, const char *msg)
 {
 	mys_send_err(mys_errno(sqlerrcode), mys_sqlstate(sqlerrcode), msg);
 }
-
-#ifdef HALO_BABELFISH_API
-static int	mys_bf_listen(const char *host, unsigned short port);
-#endif
 
 /* ----------------------------------------------------------------
  * Postmaster: listen sockets
@@ -650,15 +686,10 @@ mysql_listen_init(void)
 		char	   *host = (char *) lfirst(lc);
 		int			status;
 
-#ifdef HALO_BABELFISH_API
-		status = mys_bf_listen(strcmp(host, "*") == 0 ? NULL : host,
-							   (unsigned short) halo_mysql_port);
-#else
 		status = ListenServerPortForProtocol(halo_mysql_protocol_id, AF_UNSPEC,
 											 strcmp(host, "*") == 0 ? NULL : host,
 											 (unsigned short) halo_mysql_port,
 											 NULL);
-#endif
 		if (status == STATUS_OK)
 			success++;
 		else
@@ -743,12 +774,18 @@ mys_send_greeting(Port *port)
 static char *
 get_cstring(StringInfo b)
 {
-	char	   *s = b->data + b->cursor;
-	int			n = strnlen(s, b->len - b->cursor);
+	char	   *s;
+	int			avail;
+	int			n;
 
-	if (b->cursor + n >= b->len && b->data[b->len] != '\0')
+	if (b->cursor < 0 || b->cursor > b->len)
 		return NULL;
-	b->cursor += Min(n + 1, b->len - b->cursor);
+	s = b->data + b->cursor;
+	avail = b->len - b->cursor;
+	n = strnlen(s, avail);
+	if (n >= avail && b->data[b->len] != '\0')
+		return NULL;
+	b->cursor += Min(n + 1, avail);
 	return pnstrdup(s, n);
 }
 
@@ -756,20 +793,22 @@ static void
 mys_parse_connect_attrs(StringInfo b, Port *port)
 {
 	uint64		total;
+	uint64		avail;
 	int			end;
 
-	if (!get_lenenc_int(b, &total))
+	if (!get_lenenc_int(b, &total) || b->cursor < 0 || b->cursor > b->len)
 		return;
-	end = Min(b->cursor + (int) total, b->len);
+	avail = (uint64) (b->len - b->cursor);
+	end = b->cursor + (int) Min(total, avail);
 	while (b->cursor < end)
 	{
-		uint64		klen,
+		int			klen,
 					vlen;
 		const char *k,
 				   *v;
 
-		if (!get_lenenc_int(b, &klen) || !get_bytes(b, (int) klen, &k) ||
-			!get_lenenc_int(b, &vlen) || !get_bytes(b, (int) vlen, &v))
+		if (!get_lenenc_bytes(b, &k, &klen) ||
+			!get_lenenc_bytes(b, &v, &vlen))
 			break;
 		if (klen == 12 && strncmp(k, "program_name", 12) == 0)
 		{
@@ -788,6 +827,7 @@ mys_start(Port *port)
 	StringInfoData pkt;
 	uint64		v;
 	const char *dummy;
+	int			auth_len = 0;
 	char	   *user;
 
 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
@@ -802,6 +842,7 @@ mys_start(Port *port)
 	initStringInfo(&pkt);
 	if (mys_read_packet(&pkt) == EOF)
 	{
+		pfree(pkt.data);
 		MemoryContextSwitchTo(oldcxt);
 		return STATUS_ERROR;	/* client went away, e.g. port probe */
 	}
@@ -815,6 +856,7 @@ mys_start(Port *port)
 		mys_send_err(1251, "08004",
 					 "Client does not support authentication protocol requested by server; consider upgrading MySQL client");
 		mys_flush();
+		pfree(pkt.data);
 		MemoryContextSwitchTo(oldcxt);
 		return STATUS_ERROR;
 	}
@@ -830,6 +872,7 @@ mys_start(Port *port)
 			goto bad_packet;
 		if (secure_open_server(port) != 0)
 		{
+			pfree(pkt.data);
 			MemoryContextSwitchTo(oldcxt);
 			return STATUS_ERROR;	/* TLS alert already sent */
 		}
@@ -837,10 +880,13 @@ mys_start(Port *port)
 		/* the real HandshakeResponse41 follows, encrypted */
 		if (mys_read_packet(&pkt) == EOF || !get_uint(&pkt, 4, &v))
 		{
+			pfree(pkt.data);
 			MemoryContextSwitchTo(oldcxt);
 			return STATUS_ERROR;
 		}
 		mys_client_caps = (uint32) v;
+		if (!(mys_client_caps & CLIENT_PROTOCOL_41))
+			goto bad_packet;
 	}
 
 	/* max packet size(4), charset(1), filler(23) */
@@ -853,13 +899,14 @@ mys_start(Port *port)
 	/* auth response */
 	if (mys_client_caps & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA)
 	{
-		if (!get_lenenc_int(&pkt, &v) || !get_bytes(&pkt, (int) v, &dummy))
+		if (!get_lenenc_bytes(&pkt, &dummy, &auth_len))
 			goto bad_packet;
 	}
 	else if (mys_client_caps & CLIENT_SECURE_CONNECTION)
 	{
 		if (!get_uint(&pkt, 1, &v) || !get_bytes(&pkt, (int) v, &dummy))
 			goto bad_packet;
+		auth_len = (int) v;
 	}
 	else
 	{
@@ -867,13 +914,13 @@ mys_start(Port *port)
 
 		if (s == NULL)
 			goto bad_packet;
-		v = strlen(s);
+		auth_len = (int) strlen(s);
 		dummy = s;
 	}
-	client_auth_resp = palloc(v + 1);
-	memcpy(client_auth_resp, dummy, v);
-	client_auth_resp[v] = '\0';
-	client_auth_resp_len = (int) v;
+	client_auth_resp = palloc((Size) auth_len + 1);
+	memcpy(client_auth_resp, dummy, auth_len);
+	client_auth_resp[auth_len] = '\0';
+	client_auth_resp_len = auth_len;
 
 	if ((mys_client_caps & CLIENT_CONNECT_WITH_DB) && pkt.cursor < pkt.len)
 		initial_db = get_cstring(&pkt);
@@ -881,6 +928,8 @@ mys_start(Port *port)
 		client_plugin = get_cstring(&pkt);
 	if ((mys_client_caps & CLIENT_CONNECT_ATTRS) && pkt.cursor < pkt.len)
 		mys_parse_connect_attrs(&pkt, port);
+
+	pfree(pkt.data);
 
 	if (user[0] == '\0')
 	{
@@ -903,6 +952,7 @@ mys_start(Port *port)
 	return STATUS_OK;
 
 bad_packet:
+	pfree(pkt.data);
 	mys_send_err(1043, "08S01", "Bad handshake");
 	mys_flush();
 	MemoryContextSwitchTo(oldcxt);
@@ -961,12 +1011,16 @@ mys_auth_switch(const char *plugin)
 
 	initStringInfo(&resp);
 	mys_read_auth_packet(&resp);
+	if (client_plugin)
+		pfree(client_plugin);
+	if (client_auth_resp)
+		pfree(client_auth_resp);
 	client_plugin = pstrdup(plugin);
 	client_auth_resp = resp.data;
 	client_auth_resp_len = resp.len;
 }
 
-static void
+static pg_noreturn void
 mys_auth_failed(Port *port, bool with_password, const char *logdetail)
 {
 	ereport(FATAL,
@@ -992,7 +1046,12 @@ mys_sha2_full_auth(Port *port)
 	mys_read_auth_packet(&pkt);
 
 	if (port->ssl_in_use)
-		return pnstrdup(pkt.data, strnlen(pkt.data, pkt.len));
+	{
+		passwd = pnstrdup(pkt.data, strnlen(pkt.data, pkt.len));
+		explicit_bzero(pkt.data, pkt.len);
+		pfree(pkt.data);
+		return passwd;
+	}
 
 	if (pkt.len == 1 && (uint8) pkt.data[0] == SHA2_REQUEST_PUBLIC_KEY)
 	{
@@ -1000,16 +1059,20 @@ mys_sha2_full_auth(Port *port)
 		const char *pem = mys_rsa_public_key(&len);
 
 		if (pem == NULL)
+		{
+			pfree(pkt.data);
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("Authentication requires secure connection."),
 					 errdetail_log("No RSA key pair is available (mysql.rsa_private_key_file) and the connection does not use TLS.")));
+		}
 		mys_send_auth_more_data(pem, len);
 		mys_read_auth_packet(&pkt);
 	}
 
 	passwd = mys_rsa_decrypt_password((uint8 *) pkt.data, pkt.len,
 									  scramble, MYS_SCRAMBLE_LEN);
+	pfree(pkt.data);
 	if (passwd == NULL)
 		mys_auth_failed(port, true, "could not decrypt the RSA encrypted password");
 	return passwd;
@@ -1023,6 +1086,10 @@ mys_sha2_full_auth(Port *port)
 static void
 mys_password_auth(Port *port)
 {
+	static const char dummy_scram[] =
+		"SCRAM-SHA-256$4096:AAAAAAAAAAAAAAAAAAAAAA==$"
+		"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=:"
+		"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=";
 	const char *logdetail = NULL;
 	char	   *shadow_pass;
 	char	   *passwd;
@@ -1076,14 +1143,31 @@ mys_password_auth(Port *port)
 	}
 
 	if (passwd[0] == '\0')
+	{
+		pfree(passwd);
 		mys_auth_failed(port, false, logdetail);
-	if (shadow_pass == NULL ||
-		plain_crypt_verify(port->user_name, shadow_pass, passwd,
-						   &logdetail) != STATUS_OK)
+	}
+	if (shadow_pass == NULL)
+	{
+		const char *dummy_detail = NULL;
+
+		/* Equalize PBKDF2-HMAC-SHA256 work for unknown roles */
+		(void) plain_crypt_verify(port->user_name, dummy_scram, passwd, &dummy_detail);
+		explicit_bzero(passwd, strlen(passwd));
+		pfree(passwd);
 		mys_auth_failed(port, true, logdetail);
+	}
+	if (plain_crypt_verify(port->user_name, shadow_pass, passwd,
+						   &logdetail) != STATUS_OK)
+	{
+		explicit_bzero(passwd, strlen(passwd));
+		pfree(passwd);
+		mys_auth_failed(port, true, logdetail);
+	}
 
 	mys_sha2_cache_store(port->user_name, shadow_pass, passwd);
 	explicit_bzero(passwd, strlen(passwd));
+	pfree(passwd);
 }
 
 static void
@@ -1125,22 +1209,164 @@ mys_authenticate(Port *port)
  * Database (= schema) selection
  * ----------------------------------------------------------------
  */
-static bool
-mys_use_database(const char *db, bool raise)
+const char *
+mys_catalog_schema_name(const char *db)
 {
-	bool		found;
-	StringInfoData path;
+	if (db == NULL)
+		return NULL;
+	if (pg_strcasecmp(db, "information_schema") == 0)
+		return "mys_informa_schema";
+	if (pg_strcasecmp(db, "sys") == 0)
+		return "mys_sys";
+	return db;
+}
 
-	StartTransactionCommand();
-	found = OidIsValid(get_namespace_oid(db, true));
-	CommitTransactionCommand();
+static void
+mys_set_selected_db_name(const char *db)
+{
+	if (selected_db != NULL)
+	{
+		pfree(selected_db);
+		selected_db = NULL;
+	}
+	if (db != NULL && db[0] != '\0')
+	{
+		if (pg_strcasecmp(db, "information_schema") == 0)
+			selected_db = MemoryContextStrdup(TopMemoryContext, "information_schema");
+		else if (pg_strcasecmp(db, "sys") == 0)
+			selected_db = MemoryContextStrdup(TopMemoryContext, "sys");
+		else
+			selected_db = MemoryContextStrdup(TopMemoryContext, db);
+	}
+}
 
-	if (!found)
+static void
+mys_apply_selected_search_path(void)
+{
+	if (selected_db != NULL)
+	{
+		StringInfoData path;
+		const char *cat_db = mys_catalog_schema_name(selected_db);
+
+		initStringInfo(&path);
+		appendStringInfo(&path, "%s, mysql, pg_catalog, \"$user\", public",
+						 quote_identifier(cat_db));
+		SetConfigOption("search_path", path.data, PGC_USERSET, PGC_S_SESSION);
+		pfree(path.data);
+	}
+	else
+	{
+		SetConfigOption("search_path", "mysql, pg_catalog",
+						PGC_USERSET, PGC_S_SESSION);
+	}
+}
+
+const char *
+mys_selected_database(void)
+{
+	if (selected_db != NULL &&
+		IsTransactionState() && !IsAbortedTransactionBlockState())
+	{
+		const char *cat_db = mys_catalog_schema_name(selected_db);
+
+		if (!OidIsValid(get_namespace_oid(cat_db, true)))
+		{
+			mys_set_selected_db_name(NULL);
+			mys_apply_selected_search_path();
+		}
+	}
+	return selected_db;
+}
+
+void
+mys_clear_selected_database_if_matches(const char *db)
+{
+	if (selected_db != NULL && db != NULL &&
+		(strcmp(selected_db, db) == 0 ||
+		 strcmp(mys_catalog_schema_name(selected_db), db) == 0))
+	{
+		mys_set_selected_db_name(NULL);
+		mys_apply_selected_search_path();
+	}
+}
+
+static bool
+mys_select_database_impl(const char *db, bool raise, int *err_code, char **err_msg)
+{
+	const char *cat_db;
+	Oid			nspid = InvalidOid;
+	bool		allowed = false;
+
+	if (err_code)
+		*err_code = 0;
+	if (err_msg)
+		*err_msg = NULL;
+
+	if (db == NULL || db[0] == '\0')
+	{
+		if (raise)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_SCHEMA_NAME),
+					 errmsg("Incorrect database name ''")));
+		if (err_code)
+			*err_code = ERRCODE_INVALID_SCHEMA_NAME;
+		if (err_msg)
+			*err_msg = pstrdup("Incorrect database name ''");
+		return false;
+	}
+
+	if (IsAbortedTransactionBlockState())
+	{
+		if (raise)
+			ereport(ERROR,
+					(errcode(ERRCODE_IN_FAILED_SQL_TRANSACTION),
+					 errmsg("current transaction is aborted, commands ignored until end of transaction block")));
+		if (err_code)
+			*err_code = ERRCODE_IN_FAILED_SQL_TRANSACTION;
+		if (err_msg)
+			*err_msg = pstrdup("current transaction is aborted, commands ignored until end of transaction block");
+		return false;
+	}
+
+	cat_db = mys_catalog_schema_name(db);
+	if (IsTransactionState())
+	{
+		nspid = get_namespace_oid(cat_db, true);
+		if (OidIsValid(nspid))
+			allowed = (object_aclcheck(NamespaceRelationId, nspid, GetUserId(), ACL_USAGE) == ACLCHECK_OK);
+	}
+	else
+	{
+		StartTransactionCommand();
+		nspid = get_namespace_oid(cat_db, true);
+		if (OidIsValid(nspid))
+			allowed = (object_aclcheck(NamespaceRelationId, nspid, GetUserId(), ACL_USAGE) == ACLCHECK_OK);
+		CommitTransactionCommand();
+	}
+
+	if (!OidIsValid(nspid))
 	{
 		if (raise)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_SCHEMA_NAME),
 					 errmsg("Unknown database '%s'", db)));
+		if (err_code)
+			*err_code = ERRCODE_INVALID_SCHEMA_NAME;
+		if (err_msg)
+			*err_msg = psprintf("Unknown database '%s'", db);
+		return false;
+	}
+
+	if (!allowed)
+	{
+		if (raise)
+			ereport(ERROR,
+					(errcode(MYS_ERRCODE_DBACCESS_DENIED),
+					 errmsg("Access denied for user to database '%s'", db)));
+		if (err_code)
+			*err_code = MYS_ERRCODE_DBACCESS_DENIED;
+		if (err_msg)
+			*err_msg = psprintf("Access denied for user to database '%s'", db);
 		return false;
 	}
 
@@ -1148,11 +1374,46 @@ mys_use_database(const char *db, bool raise)
 	 * Same order as openHalo: MySQL-semantics functions and operators in
 	 * schema "mysql" must win over the pg_catalog built-ins.
 	 */
-	initStringInfo(&path);
-	appendStringInfo(&path, "%s, mysql, pg_catalog, \"$user\", public", quote_identifier(db));
-	SetConfigOption("search_path", path.data, PGC_USERSET, PGC_S_SESSION);
-	pfree(path.data);
+	mys_set_selected_db_name(db);
+	mys_apply_selected_search_path();
 	return true;
+}
+
+bool
+mys_select_database(const char *db, bool raise)
+{
+	return mys_select_database_impl(db, raise, NULL, NULL);
+}
+
+void
+mys_sync_selected_database(void)
+{
+	if (halo_mysql_parser != MYS_PARSER_MYSQL || IsAbortedTransactionBlockState())
+		return;
+	if (selected_db != NULL)
+	{
+		const char *cat_db = mys_catalog_schema_name(selected_db);
+		const char *cur;
+		const char *quoted;
+
+		if (IsTransactionState())
+		{
+			Oid			nspid = get_namespace_oid(cat_db, true);
+
+			if (!OidIsValid(nspid) ||
+				object_aclcheck(NamespaceRelationId, nspid, GetUserId(), ACL_USAGE) != ACLCHECK_OK)
+			{
+				mys_set_selected_db_name(NULL);
+				mys_apply_selected_search_path();
+				return;
+			}
+		}
+		cur = GetConfigOption("search_path", true, false);
+		quoted = quote_identifier(cat_db);
+		if (cur == NULL || strncmp(cur, quoted, strlen(quoted)) != 0 ||
+			cur[strlen(quoted)] != ',')
+			mys_apply_selected_search_path();
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -1179,7 +1440,7 @@ mys_send_ready_for_query(CommandDest dest)
 		}
 		PG_CATCH();
 		{
-			ErrorData *edata;
+			ErrorData  *edata;
 
 			MemoryContextSwitchTo(TopMemoryContext);
 			edata = CopyErrorData();
@@ -1192,20 +1453,22 @@ mys_send_ready_for_query(CommandDest dest)
 		handshake_done = true;
 		if (initial_db && initial_db[0] != '\0')
 		{
-			if (!mys_use_database(initial_db, false))
-			{
-				StringInfoData msg;
+			int			err_code = 0;
+			char	   *err_msg = NULL;
 
-				initStringInfo(&msg);
-				appendStringInfo(&msg, "Unknown database '%s'", initial_db);
-				mys_send_err(1049, "42000", msg.data);
+			if (!mys_select_database_impl(initial_db, false, &err_code, &err_msg))
+			{
+				mys_send_error(err_code ? err_code : ERRCODE_INVALID_SCHEMA_NAME,
+							   err_msg ? err_msg : psprintf("Unknown database '%s'", initial_db));
 				mys_flush();
 				proc_exit(0);
 			}
 		}
 		else
-			SetConfigOption("search_path", "mysql, pg_catalog, \"$user\", public",
-							PGC_USERSET, PGC_S_SESSION);
+		{
+			mys_set_selected_db_name(NULL);
+			mys_apply_selected_search_path();
+		}
 		mys_send_ok(0, 0, false, false);
 	}
 	resultset_active = false;
@@ -1214,6 +1477,7 @@ mys_send_ready_for_query(CommandDest dest)
 	trailing_comment_ok = false;
 	mys_stmt_query_done();
 	mys_flush();
+	mys_maybe_shrink_outbuf();
 }
 
 /*
@@ -1228,7 +1492,11 @@ mys_read_command(StringInfo inBuf)
 {
 	uint8		cmd;
 
-	deferred_error = NULL;
+	if (deferred_error != NULL)
+	{
+		FreeErrorData(deferred_error);
+		deferred_error = NULL;
+	}
 	if (queued_queries != NIL)
 	{
 		/* the next part of the current command (see mys_queue_query) */
@@ -1242,11 +1510,13 @@ mys_read_command(StringInfo inBuf)
 		if (queued_queries == NIL)
 			MemoryContextReset(queue_context);
 		last_queued_part = queued_queries == NIL;
+		running_queued_query = true;
 		diagnostics_pending = true;
 		stmt_infos = NIL;
 		stmt_index = 0;
 		return PqMsg_Query;
 	}
+	running_queued_query = false;
 	if (mys_read_packet(inBuf) == EOF)
 		return EOF;
 
@@ -1280,7 +1550,7 @@ mys_read_command(StringInfo inBuf)
 						mys_stmt_execute(inBuf);
 					else
 					{
-						char *query = mys_normalize_query(inBuf->data + 1, inBuf->len - 1);
+						char	   *query = mys_normalize_query(inBuf->data + 1, inBuf->len - 1);
 
 						resetStringInfo(inBuf);
 						appendBinaryStringInfo(inBuf, query, strlen(query) + 1);
@@ -1318,12 +1588,14 @@ mys_process_command(int firstchar, StringInfo inBuf)
 		case COM_INIT_DB:
 			{
 				char	   *db = pnstrdup(inBuf->data + 1, inBuf->len - 1);
+				int			err_code = 0;
+				char	   *err_msg = NULL;
 
-				if (mys_use_database(db, false))
+				if (mys_select_database_impl(db, false, &err_code, &err_msg))
 					mys_send_ok(0, 0, false, false);
 				else
-					mys_send_error(ERRCODE_INVALID_SCHEMA_NAME,
-								   psprintf("Unknown database '%s'", db));
+					mys_send_error(err_code ? err_code : ERRCODE_INVALID_SCHEMA_NAME,
+								   err_msg ? err_msg : psprintf("Unknown database '%s'", db));
 				break;
 			}
 		case COM_PING:
@@ -1333,12 +1605,11 @@ mys_process_command(int firstchar, StringInfo inBuf)
 			{
 				DiscardStmt discard = {0};
 				MemoryContext cxt = CurrentMemoryContext;
-				/* USE is a search_path assignment, including SQL USE statements. */
-				char *path = pstrdup(GetConfigOption("search_path", false, false));
 
 				AbortOutOfAnyTransaction();
 				MemoryContextSwitchTo(cxt);
 				mys_txn_recover();
+				mys_txn_reset_deferred_error();
 				mys_stmt_close_all();
 				mys_stmt_query_done();
 				clearUserVars();
@@ -1352,11 +1623,14 @@ mys_process_command(int firstchar, StringInfo inBuf)
 				resetSessionSystemVariables();
 				PopActiveSnapshot();
 				CommitTransactionCommand();
-				SetConfigOption("search_path", path, PGC_USERSET, PGC_S_SESSION);
+				mys_apply_selected_search_path();
 				affectedRows = 0;
+				foundRows = 0;
+				last_rows_sent = 0;
 				lastInsertID = cur_insert_id = 0;
 				mys_clear_diagnostics();
 				mys_send_ok(0, 0, false, false);
+				mys_maybe_shrink_outbuf();
 				break;
 			}
 		case COM_STMT_PREPARE:
@@ -1379,6 +1653,7 @@ mys_process_command(int firstchar, StringInfo inBuf)
 		case MYS_DEFERRED_ERROR:
 			/* COM_STMT_EXECUTE could not be decoded: nothing ran */
 			mys_send_error(deferred_error->sqlerrcode, deferred_error->message);
+			FreeErrorData(deferred_error);
 			deferred_error = NULL;
 			break;
 		case COM_FIELD_LIST:
@@ -1386,8 +1661,29 @@ mys_process_command(int firstchar, StringInfo inBuf)
 			mys_send_resultset_end(false);
 			break;
 		case COM_SET_OPTION:
-			mys_send_eof(false);
-			break;
+			{
+				uint64		opt = 0;
+
+				inBuf->cursor = 1;
+				if (!get_uint(inBuf, 2, &opt))
+				{
+					mys_send_error(ERRCODE_PROTOCOL_VIOLATION,
+								   "Malformed communication packet.");
+					break;
+				}
+				if (opt == MYSQL_OPTION_MULTI_STATEMENTS_ON)
+					mys_client_caps |= CLIENT_MULTI_STATEMENTS;
+				else if (opt == MYSQL_OPTION_MULTI_STATEMENTS_OFF)
+					mys_client_caps &= ~((uint32) CLIENT_MULTI_STATEMENTS);
+				else
+				{
+					mys_send_error(ERRCODE_PROTOCOL_VIOLATION,
+								   "Unknown option to COM_SET_OPTION.");
+					break;
+				}
+				mys_send_eof(false);
+				break;
+			}
 		case COM_STATISTICS:
 			{
 				const char *s = "Uptime: 1  Threads: 1  Questions: 0  Slow queries: 0  Opens: 0  Flush tables: 0  Open tables: 0";
@@ -1407,6 +1703,17 @@ mys_process_command(int firstchar, StringInfo inBuf)
 	return true;
 }
 
+static void
+check_multi_statement_allowed(List *raw_stmts)
+{
+	if (com_query && !running_queued_query &&
+		!(mys_client_caps & CLIENT_MULTI_STATEMENTS) &&
+		list_length(raw_stmts) > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use")));
+}
+
 static List *
 mys_parse_query(const char *query_string)
 {
@@ -1414,11 +1721,15 @@ mys_parse_query(const char *query_string)
 
 	/* session variables carried by GUCs; SET TRANSACTION; GLOBAL read_only */
 	if (!IsAbortedTransactionBlockState())
+	{
 		mys_sync_session_state();
+		mys_sync_selected_database();
+	}
 
 	if (halo_mysql_parser == MYS_PARSER_POSTGRES)
 	{
 		stmts = raw_parser(query_string, RAW_PARSE_DEFAULT);
+		check_multi_statement_allowed(stmts);
 		mys_discard_rewrite_warnings();
 		stmt_infos = NIL;
 		for (int i = 0; i < list_length(stmts); i++)
@@ -1443,6 +1754,7 @@ mys_parse_query(const char *query_string)
 			PG_TRY();
 			{
 				raw = mysql_raw_parser(query_string);
+				check_multi_statement_allowed(raw);
 			}
 			PG_CATCH();
 			{
@@ -1459,6 +1771,7 @@ mys_parse_query(const char *query_string)
 		else
 		{
 			raw = mysql_raw_parser(query_string);
+			check_multi_statement_allowed(raw);
 			trailing_comment_ok = has_trailing_comment(raw, query_string);
 		}
 		/* the trailing comment of a packet an EXECUTE split (mys_end_command) */
@@ -1498,12 +1811,14 @@ mys_parse_query(const char *query_string)
 	return stmts;
 }
 
-/* Count at execution time: RETURNING can be buffered before its receiver
- * is started.  Only scalar counts live across that boundary. */
+/*
+ * Count at execution time: RETURNING can be buffered before its receiver
+ * is started.  Only scalar counts live across that boundary.
+ */
 static void
 mys_record_upsert_row(TupleTableSlot *oldslot, TupleTableSlot *newslot, uint64 deleted)
 {
-	uint64 row;
+	uint64		row;
 
 	if (current_stmt_info()->upsert == MYS_UPSERT_NONE)
 		return;
@@ -1590,6 +1905,7 @@ end_statement(const QueryCompletion *qc)
 	{
 		mys_send_resultset_end(more);
 		resultset_active = false;
+		foundRows = (unsigned long) last_rows_sent;
 		affectedRows = -1;
 	}
 	else if (info->silent)
@@ -1655,17 +1971,17 @@ mys_end_command(const QueryCompletion *qc, CommandDest dest)
 	}
 }
 
-#ifndef HALO_BABELFISH_API
 static void
 mys_null_command(CommandDest dest)
 {
 	mys_send_ok(0, 0, false, false);
 }
-#endif
 
-/* NO ACTION uses the same PostgreSQL SQLSTATE on either side of an FK.
+/*
+ * NO ACTION uses the same PostgreSQL SQLSTATE on either side of an FK.
  * message_id is the untranslated primary template, so lc_messages does not
- * affect the distinction between a missing parent and a referenced parent. */
+ * affect the distinction between a missing parent and a referenced parent.
+ */
 static uint16
 mys_error_number(ErrorData *edata)
 {
@@ -1716,11 +2032,7 @@ mys_comm_reset(void)
 	upsert_deleted = 0;
 	resultset_active = false;
 	discard_queued_queries();
-#ifdef HALO_BABELFISH_API
-	/* receivers of aborted portals are gone */
-	list_free_deep(bf_receivers);
-	bf_receivers = NIL;
-#endif
+	mys_txn_reset_deferred_error();
 }
 
 /* ----------------------------------------------------------------
@@ -1748,61 +2060,9 @@ typedef struct
 	MysColumn  *cols;
 	StringInfoData row;
 	MemoryContext tmpcontext;
-	DestReceiver *owner;		/* Babelfish: the DR_printtup it belongs to */
 } MysDR;
 
-#ifdef HALO_BABELFISH_API
-/*
- * Babelfish allocates its own DR_printtup and only swaps in our callbacks,
- * so the per-receiver state lives in a side list.  Like DR_printtup, both
- * start with {DestReceiver, Portal}: SetRemoteDestReceiverParams() fills in
- * the portal before the startup callback runs.
- */
-typedef struct
-{
-	DestReceiver pub;
-	Portal		portal;
-} MysDRHead;
-
-static MysDR *
-mys_dr(DestReceiver *self)
-{
-	MysDR	   *dr;
-
-	foreach_ptr(MysDR, d, bf_receivers)
-	{
-		if (d->owner == self)
-			return d;
-	}
-	dr = MemoryContextAllocZero(TopMemoryContext, sizeof(MysDR));
-	dr->owner = self;
-	dr->portal = ((MysDRHead *) self)->portal;
-	dr->pub = *self;
-	{
-		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
-
-		bf_receivers = lappend(bf_receivers, dr);
-		MemoryContextSwitchTo(old);
-	}
-	return dr;
-}
-
-static void
-mys_dr_forget(DestReceiver *self)
-{
-	foreach_ptr(MysDR, d, bf_receivers)
-	{
-		if (d->owner == self)
-		{
-			bf_receivers = list_delete_ptr(bf_receivers, d);
-			pfree(d);
-			return;
-		}
-	}
-}
-#else
 #define mys_dr(self)	((MysDR *) (self))
-#endif
 
 void
 mys_type_info(Oid typid, int32 typmod, uint8 *mtype, uint32 *len,
@@ -1946,7 +2206,8 @@ mys_send_coldef(Form_pg_attribute attr, TargetEntry *tle)
 
 	if (tle && OidIsValid(tle->resorigtbl))
 	{
-		char	   *s = get_namespace_name(get_rel_namespace(tle->resorigtbl));
+		Oid			relnsp = get_rel_namespace(tle->resorigtbl);
+		char	   *s = OidIsValid(relnsp) ? get_namespace_name(relnsp) : NULL;
 		char	   *t = get_rel_name(tle->resorigtbl);
 
 		if (s)
@@ -2009,7 +2270,6 @@ mys_dr_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 		dr->capture = info->capture_insert_id;
 		dr->captured = false;
 		dr->upsert = info->upsert != MYS_UPSERT_NONE;
-
 	}
 
 	if (dr->portal && !dr->discard)
@@ -2018,6 +2278,7 @@ mys_dr_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	/* column count */
 	if (!dr->discard)
 	{
+		last_rows_sent = 0;
 		initStringInfo(&b);
 		put_lenenc_int(&b, dr->natts);
 		mys_send_packet(b.data, b.len);
@@ -2082,9 +2343,9 @@ mys_append_value(StringInfo row, MysColumn *col, Datum value)
 			}
 		case BPCHAROID:
 			{
-				BpChar *b = DatumGetBpCharPP(value);
-				int len = VARSIZE_ANY_EXHDR(b);
-				char *s;
+				BpChar	   *b = DatumGetBpCharPP(value);
+				int			len = VARSIZE_ANY_EXHDR(b);
+				char	   *s;
 
 				if (!(mys_sqlMode & MYS_MODE_PAD_CHAR_TO_FULL_LENGTH))
 					len = bpchartruelen(VARDATA_ANY(b), len);
@@ -2151,7 +2412,7 @@ static void
 put_binary_time(StringInfo row, TimeADT t)
 {
 	bool		neg = t < 0;
-	uint64		us = neg ? -t : t;
+	uint64		us = neg ? -(uint64) t : (uint64) t;
 	uint32		micro = us % USECS_PER_SEC;
 	uint64		secs = us / USECS_PER_SEC;
 	int			len = micro ? 12 : secs ? 8 : 0;
@@ -2279,10 +2540,10 @@ mys_dr_receive(TupleTableSlot *slot, DestReceiver *self)
 			lastInsertID = (unsigned long) cur_insert_id;
 			dr->captured = true;
 		}
-
 		return true;
 	}
 
+	last_rows_sent++;
 	oldcxt = MemoryContextSwitchTo(dr->tmpcontext);
 	resetStringInfo(&dr->row);
 
@@ -2337,13 +2598,9 @@ mys_dr_shutdown(DestReceiver *self)
 static void
 mys_dr_destroy(DestReceiver *self)
 {
-#ifdef HALO_BABELFISH_API
-	mys_dr_forget(self);
-#endif
 	pfree(self);
 }
 
-#ifndef HALO_BABELFISH_API
 static DestReceiver *
 mys_create_dest_receiver(CommandDest dest)
 {
@@ -2356,14 +2613,11 @@ mys_create_dest_receiver(CommandDest dest)
 	dr->pub.mydest = dest;
 	return (DestReceiver *) dr;
 }
-#endif
 
 /* ----------------------------------------------------------------
  * Registration
  * ----------------------------------------------------------------
  */
-#ifndef HALO_BABELFISH_API
-
 const ProtocolExtensionConfig mysql_protocol_config = {
 	.name = "mysql",
 	.listen_init = mysql_listen_init,
@@ -2390,229 +2644,3 @@ mys_is_mysql_session(void)
 {
 	return MyProtocolExtension == &mysql_protocol_config;
 }
-
-#else							/* HALO_BABELFISH_API */
-
-/* ----------------------------------------------------------------
- * Adapter for Babelfish's protocol extension API
- *
- * postgresql_modified_for_babelfish has its own ProtocolExtensionConfig
- * (libpq-be.h): sockets are added with listen_add_socket() from
- * listen_init_hook, every backend hook goes through
- * MyProcPort->protocol_config.  With patches/babelfish-6.2-mysql-delta.patch
- * it also has fn_parse_query and lets fn_process_command hand a message
- * back to the regular main loop.
- * ----------------------------------------------------------------
- */
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-
-#include "common/ip.h"
-#include "postmaster/postmaster.h"
-#include "tcop/backend_startup.h"
-#include "utils/ps_status.h"
-#include "utils/timeout.h"
-
-static ProtocolExtensionConfig mys_bf_config;
-static listen_init_hook_type prev_listen_init_hook = NULL;
-static StringInfo bf_inbuf = NULL;
-static int	bf_firstchar = 0;
-
-bool
-mys_is_mysql_session(void)
-{
-	return MyProcPort != NULL && MyProcPort->protocol_config == &mys_bf_config;
-}
-
-/*
- * Babelfish's ListenServerPort() registers every socket it opens with the
- * default (libpq) protocol, so a protocol extension opens its own sockets,
- * as babelfishpg_tds does.  Same options as ListenServerPort().
- */
-static int
-mys_bf_listen(const char *host, unsigned short port)
-{
-	struct addrinfo hint;
-	struct addrinfo *addrs = NULL;
-	char		service[32];
-	int			added = 0;
-	int			ret;
-
-	MemSet(&hint, 0, sizeof(hint));
-	hint.ai_family = AF_UNSPEC;
-	hint.ai_flags = AI_PASSIVE;
-	hint.ai_socktype = SOCK_STREAM;
-	snprintf(service, sizeof(service), "%d", port);
-	ret = pg_getaddrinfo_all(host, service, &hint, &addrs);
-	if (ret || addrs == NULL)
-	{
-		ereport(LOG,
-				(errmsg("aux_mysql: could not translate host name \"%s\", service \"%s\" to address: %s",
-						host ? host : "*", service, gai_strerror(ret))));
-		if (addrs)
-			pg_freeaddrinfo_all(hint.ai_family, addrs);
-		return STATUS_ERROR;
-	}
-
-	for (struct addrinfo *ai = addrs; ai; ai = ai->ai_next)
-	{
-		pgsocket	fd;
-		int			one = 1;
-		int			backlog = MaxConnections * 2;	/* as ListenServerPort() */
-
-		if (ai->ai_family != AF_INET && ai->ai_family != AF_INET6)
-			continue;
-		if (!listen_have_free_slot())
-			break;
-		fd = socket(ai->ai_family, SOCK_STREAM, 0);
-		if (fd == PGINVALID_SOCKET)
-		{
-			ereport(LOG, (errcode_for_socket_access(),
-						  errmsg("aux_mysql: could not create socket: %m")));
-			continue;
-		}
-		(void) setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char *) &one, sizeof(one));
-		if (ai->ai_family == AF_INET6)
-			(void) setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (char *) &one, sizeof(one));
-		if (bind(fd, ai->ai_addr, ai->ai_addrlen) < 0 || listen(fd, backlog) < 0)
-		{
-			ereport(LOG, (errcode_for_socket_access(),
-						  errmsg("aux_mysql: could not listen on port %d: %m", port)));
-			closesocket(fd);
-			continue;
-		}
-		ereport(LOG,
-				(errmsg("aux_mysql: listening on %s address, port %d",
-						ai->ai_family == AF_INET6 ? "IPv6" : "IPv4", port)));
-		listen_add_socket(fd, &mys_bf_config);
-		added++;
-	}
-	pg_freeaddrinfo_all(hint.ai_family, addrs);
-	return added > 0 ? STATUS_OK : STATUS_ERROR;
-}
-
-static void
-mys_bf_listen_init(void)
-{
-	if (prev_listen_init_hook)
-		prev_listen_init_hook();
-	mysql_listen_init();
-}
-
-/* what the kernel patch does after the handshake */
-static int
-mys_bf_start(Port *port)
-{
-	int			status = mys_start(port);
-
-	if (status != STATUS_OK)
-		return status;
-	if (port->database_name == NULL || port->database_name[0] == '\0' ||
-		port->user_name == NULL || port->user_name[0] == '\0')
-		ereport(FATAL,
-				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-				 errmsg("no PostgreSQL user name or database name specified")));
-	if (strlen(port->database_name) >= NAMEDATALEN)
-		port->database_name[NAMEDATALEN - 1] = '\0';
-	if (strlen(port->user_name) >= NAMEDATALEN)
-		port->user_name[NAMEDATALEN - 1] = '\0';
-	/* ProcessStartupPacket() would have set this */
-	MyBackendType = B_BACKEND;
-	return STATUS_OK;
-}
-
-/* Babelfish calls this instead of PerformAuthentication(): do its part too */
-static void
-mys_bf_authenticate(Port *port, const char **username)
-{
-	ClientAuthInProgress = true;
-	enable_timeout_after(STATEMENT_TIMEOUT, AuthenticationTimeout * 1000);
-	set_ps_display("authentication");
-
-	mys_authenticate(port);
-
-	disable_timeout(STATEMENT_TIMEOUT, false);
-	if (log_connections & LOG_CONNECTION_AUTHORIZATION)
-		ereport(LOG,
-				(errmsg("connection authorized: user=%s database=%s (MySQL protocol%s)",
-						port->user_name, port->database_name,
-						port->ssl_in_use ? ", SSL" : "")));
-	set_ps_display("startup");
-	ClientAuthInProgress = false;
-}
-
-static int
-mys_bf_read_command(StringInfo inBuf)
-{
-	bf_inbuf = inBuf;
-	bf_firstchar = mys_read_command(inBuf);
-	return bf_firstchar;
-}
-
-/* MySQL commands are ours; COM_QUERY etc. go back to the main loop */
-static int
-mys_bf_process_command(void)
-{
-	if (bf_firstchar < MYS_MSG_BASE)
-		return PROTOCOL_EXTENSION_FALLTHROUGH;
-	mys_process_command(bf_firstchar, bf_inbuf);
-	return 0;
-}
-
-static void
-mys_bf_end_command(QueryCompletion *qc, CommandDest dest)
-{
-	mys_end_command(qc, dest);
-}
-
-/* no NullCommand hook in Babelfish: answer an empty query as MySQL does */
-static List *
-mys_bf_parse_query(const char *query_string)
-{
-	List	   *stmts = mys_parse_query(query_string);
-
-	if (stmts == NIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("Query was empty")));
-	return stmts;
-}
-
-/* the MySQL protocol negotiates TLS after its greeting */
-static int
-mys_bf_direct_ssl_handshake(Port *port)
-{
-	return STATUS_OK;
-}
-
-void
-mysql_babelfish_register(void)
-{
-	mys_bf_config.fn_accept = libpq_accept;
-	mys_bf_config.fn_close = libpq_close;
-	mys_bf_config.fn_init = libpq_init;
-	mys_bf_config.fn_start = mys_bf_start;
-	mys_bf_config.fn_authenticate = mys_bf_authenticate;
-	mys_bf_config.fn_mainfunc = libpq_mainfunc;
-	mys_bf_config.fn_send_message = mys_send_message;
-	mys_bf_config.fn_send_cancel_key = NULL;
-	mys_bf_config.fn_comm_reset = mys_comm_reset;
-	mys_bf_config.fn_is_reading_msg = libpq_is_reading_msg;
-	mys_bf_config.fn_send_ready_for_query = mys_send_ready_for_query;
-	mys_bf_config.fn_read_command = mys_bf_read_command;
-	mys_bf_config.fn_end_command = mys_bf_end_command;
-	mys_bf_config.fn_printtup = mys_dr_receive;
-	mys_bf_config.fn_printtup_startup = mys_dr_startup;
-	mys_bf_config.fn_printtup_shutdown = mys_dr_shutdown;
-	mys_bf_config.fn_printtup_destroy = mys_dr_destroy;
-	mys_bf_config.fn_process_command = mys_bf_process_command;
-	mys_bf_config.fn_report_param_status = NULL;
-	mys_bf_config.fn_direct_ssl_handshake = mys_bf_direct_ssl_handshake;
-	mys_bf_config.fn_parse_query = mys_bf_parse_query;
-
-	prev_listen_init_hook = listen_init_hook;
-	listen_init_hook = mys_bf_listen_init;
-}
-
-#endif							/* HALO_BABELFISH_API */

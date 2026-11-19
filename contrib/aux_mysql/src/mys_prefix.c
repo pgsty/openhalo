@@ -158,6 +158,38 @@ general_weight(uint32 ch)
 		mys_general_weights[lo].weight : ch;
 }
 
+/* ASCII weights, filled from mys_general_weights by mys_prefix_init(). */
+static uint16 general_ascii[128];
+
+static inline uint32
+general_next(const unsigned char **p, const unsigned char *end)
+{
+	const unsigned char *s = *p;
+	int			w;
+
+	if (*s < 0x80)
+	{
+		(*p)++;
+		return general_ascii[*s];
+	}
+	if (GetDatabaseEncoding() == PG_UTF8)
+	{
+		w = pg_encoding_verifymbchar(PG_UTF8, (const char *) s, end - s);
+		if (w > 0)
+		{
+			*p += w;
+			return general_weight(utf8_to_unicode(s));
+		}
+		(*p)++;
+		return 0xfffd;
+	}
+	w = pg_encoding_verifymbchar(GetDatabaseEncoding(), (const char *) s, end - s);
+	if (w <= 0)
+		w = 1;
+	*p += w;
+	return *s;
+}
+
 /* Fixed-width big-endian weights preserve MySQL's simple character order.
  * Truncate characters BEFORE applying PAD SPACE, including CHAR(n) values. */
 static bytea *
@@ -171,10 +203,9 @@ general_key(const char *s, int len, int characters, bool pad)
 
 	while (p < end && (characters <= 0 || n < characters))
 	{
-		uint32 weight = general_weight(utf8_to_unicode(p));
+		uint32 weight = general_next(&p, end);
 		*dst++ = weight >> 8;
 		*dst++ = weight & 255;
-		p += pg_utf_mblen(p);
 		n++;
 	}
 	if (pad)
@@ -213,23 +244,6 @@ pad_compare(const char *a, int alen, const char *b, int blen, int unit)
 	return 0;
 }
 
-/* ASCII weights, filled from mys_general_weights by mys_prefix_init(). */
-static uint16 general_ascii[128];
-
-static inline uint32
-general_next(const unsigned char **p)
-{
-	const unsigned char *s = *p;
-
-	if (*s < 0x80)
-	{
-		(*p)++;
-		return general_ascii[*s];
-	}
-	*p += pg_utf_mblen(s);
-	return general_weight(utf8_to_unicode(s));
-}
-
 /* The order of general_key() + pad_compare(), without building either key:
  * the first differing weight decides, so stop there.  Equal ASCII bytes have
  * equal weights.  PAD SPACE: the shorter operand continues with spaces. */
@@ -254,8 +268,8 @@ general_strncoll(const char *a, ssize_t alen, const char *b, ssize_t blen,
 			q++;
 			continue;
 		}
-		wa = general_next(&p);
-		wb = general_next(&q);
+		wa = general_next(&p, pend);
+		wb = general_next(&q, qend);
 		if (wa != wb)
 			return wa < wb ? -1 : 1;
 	}
@@ -264,7 +278,7 @@ general_strncoll(const char *a, ssize_t alen, const char *b, ssize_t blen,
 	tend = p < pend ? pend : qend;
 	while (tail < tend)
 	{
-		uint32 weight = general_next(&tail);
+		uint32 weight = general_next(&tail, tend);
 
 		if (weight != ' ')
 			return weight < ' ' ? -sign : sign;
@@ -289,7 +303,7 @@ general_strnxfrm_prefix(char *dest, size_t size, const char *src, ssize_t len,
 
 	while (p < end && n < size)
 	{
-		uint32 weight = general_next(&p);
+		uint32 weight = general_next(&p, end);
 
 		if (weight < 0x80)
 			out[n++] = weight;
@@ -584,6 +598,9 @@ string_key(Relation index, int col, Datum value, bool physical, bool pattern)
 		size_t needed;
 		if (n > 0)
 			len = prefix_charcliplen(data, len, n);
+		if (!pattern && getBaseType(index->rd_opcintype[col]) == BPCHAROID)
+			while (len > 0 && data[len - 1] == ' ')
+				len--;
 		if (locale->collate_is_c || locale->deterministic)
 		{
 			key = palloc(VARHDRSZ + len);
@@ -809,45 +826,51 @@ exact_candidate(IndexScanDesc scan)
 		state->fetch = table_index_fetch_begin(scan->heapRelation);
 	}
 	table_index_fetch_reset(state->fetch);
-	if (!table_index_fetch_tuple(state->fetch, &tid, scan->xs_snapshot,
-								state->slot, &again, &dead))
-		return false;
-	ctx = GetPerTupleExprContext(state->estate);
-	ResetExprContext(ctx);
-	ctx->ecxt_scantuple = state->slot;
-	FormIndexDatum(state->info, state->slot, state->estate, values, nulls);
-	for (int i = 0; i < state->nkeys && match; i++)
+	while (table_index_fetch_tuple(state->fetch, &tid, scan->xs_snapshot,
+								   state->slot, &again, &dead))
 	{
-		ScanKey key = &state->original[i];
-		int col = key->sk_attno - 1;
-		if (key->sk_flags & SK_SEARCHNULL)
-			match = nulls[col];
-		else if (key->sk_flags & SK_SEARCHNOTNULL)
-			match = !nulls[col];
-		else if (nulls[col] || (key->sk_flags & SK_ISNULL))
-			match = false;
-		else if (string_part(scan->indexRelation, col))
+		match = true;
+		ctx = GetPerTupleExprContext(state->estate);
+		ResetExprContext(ctx);
+		ctx->ecxt_scantuple = state->slot;
+		FormIndexDatum(state->info, state->slot, state->estate, values, nulls);
+		for (int i = 0; i < state->nkeys && match; i++)
 		{
-			bytea *a = string_key(scan->indexRelation, col, values[col], false, false);
-			bytea *b = string_key(scan->indexRelation, col, key->sk_argument, false, false);
-			int cmp = bytes_compare(a, b);
-			switch (key->sk_strategy)
+			ScanKey key = &state->original[i];
+			int col = key->sk_attno - 1;
+			if (key->sk_flags & SK_SEARCHNULL)
+				match = nulls[col];
+			else if (key->sk_flags & SK_SEARCHNOTNULL)
+				match = !nulls[col];
+			else if (nulls[col] || (key->sk_flags & SK_ISNULL))
+				match = false;
+			else if (string_part(scan->indexRelation, col))
 			{
-				case 1: match = cmp < 0; break;
-				case 2: match = cmp <= 0; break;
-				case 3: match = cmp == 0; break;
-				case 4: match = cmp >= 0; break;
-				case 5: match = cmp > 0; break;
-				default: elog(ERROR, "invalid conflict scan strategy");
+				bytea *a = string_key(scan->indexRelation, col, values[col], false, false);
+				bytea *b = string_key(scan->indexRelation, col, key->sk_argument, false, false);
+				int cmp = bytes_compare(a, b);
+				switch (key->sk_strategy)
+				{
+					case 1: match = cmp < 0; break;
+					case 2: match = cmp <= 0; break;
+					case 3: match = cmp == 0; break;
+					case 4: match = cmp >= 0; break;
+					case 5: match = cmp > 0; break;
+					default: elog(ERROR, "invalid conflict scan strategy");
+				}
+				pfree(a); pfree(b);
 			}
-			pfree(a); pfree(b);
+			else
+				match = DatumGetBool(FunctionCall2Coll(&key->sk_func, key->sk_collation,
+													   values[col], key->sk_argument));
 		}
-		else
-			match = DatumGetBool(FunctionCall2Coll(&key->sk_func, key->sk_collation,
-												   values[col], key->sk_argument));
+		ExecClearTuple(state->slot);
+		if (match)
+			return true;
+		if (!again)
+			break;
 	}
-	ExecClearTuple(state->slot);
-	return match;
+	return false;
 }
 
 static bool

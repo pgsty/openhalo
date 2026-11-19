@@ -26,6 +26,7 @@
 
 #include "access/htup_details.h"
 #include "access/transam.h"
+#include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "fmgr.h"
@@ -133,6 +134,8 @@ mys_binary_session_init(void)
 		binary_types_callback_registered = true;
 	}
 	if (!binary_types_dirty)
+		return;
+	if (!IsTransactionState() || IsAbortedTransactionBlockState())
 		return;
 	nsp = get_namespace_oid("mysql", true);
 	mys_hexlit_available = OidIsValid(nsp) &&
@@ -545,9 +548,13 @@ numeric_uint64(Numeric num)
 																NumericGetDatum(num),
 																Int32GetDatum(0))));
 	if (s[0] == '-')
+	{
+		pfree(s);
 		return PG_UINT64_MAX;
+	}
 	errno = 0;
 	u = strtoull(s, NULL, 10);
+	pfree(s);
 	if (errno == ERANGE)
 		return PG_UINT64_MAX;
 	return (uint64) u;

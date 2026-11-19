@@ -5,6 +5,8 @@
  *
  * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, PGSTY PTE. LTD.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
  *
  * IDENTIFICATION
  *	  src/backend/executor/execPartition.c
@@ -544,7 +546,8 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 		leaf_part_rri->ri_IndexRelationDescs == NULL)
 		ExecOpenIndices(leaf_part_rri,
 						(node != NULL &&
-						 node->onConflictAction != ONCONFLICT_NONE));
+						 (node->onConflictAction != ONCONFLICT_NONE ||
+						  node->onConflictIgnore)));
 
 	/*
 	 * Build WITH CHECK OPTION constraints for the partition.  Note that we

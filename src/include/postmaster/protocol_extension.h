@@ -105,8 +105,10 @@ typedef struct ProtocolExtensionConfig
 
 	/* Optional SQL dialect semantics; native sessions never use these. */
 	bool		(*foreign_key_checks) (void);
-	void		(*foreign_key_insert) (struct RelationData *relation,
-								  struct TupleTableSlot *slot);
+	bool		(*foreign_key_insert) (struct RelationData *relation,
+									   struct TupleTableSlot *oldslot,
+									   struct TupleTableSlot *newslot,
+									   bool warn_only);
 	void		(*sequence_write) (struct RelationData *sequence);
 	void		(*on_conflict_row) (struct TupleTableSlot *oldslot,
 								struct TupleTableSlot *newslot, uint64 deleted);

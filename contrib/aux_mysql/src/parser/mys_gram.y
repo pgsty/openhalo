@@ -54,6 +54,7 @@
 #include <limits.h>
 
 #include "access/tableam.h"
+#include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
@@ -78,13 +79,12 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "mys_binary.h"
+#include "halo_mysql.h"
+#include "mys_proto.h"
 #include "miscadmin.h"
 
 /* PG18 exports a makeStringConst() of its own; keep the grammar's copy private */
 #define makeStringConst mys_makeStringConst
-
-/* openHalo kept this flag in the core executor; it is only parsed here */
-static bool isIgnoreStmt = false;
 
 /* provided by aux_mysql (mys_compat.c) */
 extern bool isSystemVariable(char *varName);
@@ -257,6 +257,10 @@ static ResTarget *createResTargetWithInt(char *name, int val);
 //static ResTarget *createResTargetWithNULL(char *name);
 static ResTarget *createResTargetWithFunc2Args(char *name, char *funcShemaName, char *funcName, char *arg1, char *arg2);
 static RangeVar *createRangeVar(char *schemaName, char *tableName);
+static char *currentMysqlDatabaseForParse(core_yyscan_t yyscanner);
+static void validateMysqlDbOptions(List *options);
+static bool isMysqlAlterDbOptions(List *options);
+static Node *makeMysqlAlterDbStmt(char *dbname, List *options, int location);
 static void checkJoinOn(JoinExpr *joinExpr, bool *hasNotOn);
 static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 
@@ -692,6 +696,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 %type <range> show_from_table_clause
 %type <range> show_from_db_clause
 %type <str> col_name_wild_for_desc
+%type <boolean> delete_options update_options
 
 /*
  * Non-keyword token types.  These are hard-wired into the "flex" lexer.
@@ -830,7 +835,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
  * as NOT, at least with respect to their left-hand subexpression.
  * NULLS_LA and WITH_LA are needed to make the grammar LALR(1).
  */
-%token		NOT_LA NULLS_LA WITH_LA BINARY_LA
+%token		NOT_LA NULLS_LA WITH_LA BINARY_LA VALUES_LA
 
 /*
  * The grammar likewise thinks these tokens are keywords, but they are never
@@ -1514,6 +1519,7 @@ CreateSchemaStmt:
 			CREATE SCHEMA ColId character_set_collates
 			    {
 					CreateSchemaStmt *n = makeNode(CreateSchemaStmt);
+					validateMysqlDbOptions($4);
 					/* ...but not both */
 					n->schemaname = $3;
 					n->authrole = NULL;
@@ -1524,6 +1530,7 @@ CreateSchemaStmt:
 			| CREATE SCHEMA IF_P NOT EXISTS ColId character_set_collates
 				{
 					CreateSchemaStmt *n = makeNode(CreateSchemaStmt);
+					validateMysqlDbOptions($7);
 					/* ...but not here */
 					n->schemaname = $6;
 					n->authrole = NULL;
@@ -1536,7 +1543,7 @@ CreateSchemaStmt:
 character_set_collates:
             character_set_collates opt_comma character_set_collate
                 {
-                    $$ = NIL;
+                    $$ = $3 ? lappend($1, $3) : $1;
                 }
             | /* empty */
                 {
@@ -1547,11 +1554,11 @@ character_set_collates:
 character_set_collate:
             opt_default character_set opt_equal charset_name
                 {
-                    $$ = NULL;
+                    $$ = (Node *) makeDefElem("charset", (Node *) makeString($4), @1);
                 }
             | opt_default COLLATE opt_equal any_name
                 {
-                    $$ = NULL;
+                    $$ = (Node *) makeDefElem("collate", (Node *) makeString(strVal(llast($4))), @1);
                 }
         ;
 
@@ -2905,7 +2912,7 @@ DBTableInfoShowStmt:
                         snprintf(tableNameAlias, 
                                  1024, 
                                  "Tables_in_%s", 
-                                 get_namespace_name(getCurrentNamespaceOid()));
+                                 currentMysqlDatabaseForParse(yyscanner));
                     }
 
 					selectStmtTables = makeNode(SelectStmt);
@@ -2927,7 +2934,7 @@ DBTableInfoShowStmt:
                                 (Node *)makeSimpleA_Expr(AEXPR_OP, 
                                                          "=", 
                                                          (Node *)makeColumnRef("table_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst(get_namespace_name(getCurrentNamespaceOid()), -1), 
+                                                         (Node *)makeStringConst(currentMysqlDatabaseForParse(yyscanner), -1), 
                                                          -1); 
                     }
                     if ($4 != NULL)
@@ -2968,7 +2975,7 @@ DBTableInfoShowStmt:
                                 (Node *)makeSimpleA_Expr(AEXPR_OP, 
                                                          "=", 
                                                          (Node *)makeColumnRef("table_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst(get_namespace_name(getCurrentNamespaceOid()), -1), 
+                                                         (Node *)makeStringConst(currentMysqlDatabaseForParse(yyscanner), -1), 
                                                          -1); 
                     }
                     if ($4 != NULL)
@@ -2986,7 +2993,7 @@ DBTableInfoShowStmt:
                     {
                         selectStmtViews->whereClause = 
                                 makeAndExpr(selectStmtViews->whereClause, 
-                                            $5, 
+                                            copyObject($5), 
                                             -1);
                     }
 
@@ -3037,7 +3044,7 @@ DBTableInfoShowStmt:
                         snprintf(tableNameAlias, 
                                  1024, 
                                  "Tables_in_%s", 
-                                 get_namespace_name(getCurrentNamespaceOid()));
+                                 currentMysqlDatabaseForParse(yyscanner));
                     }
 
 					selectStmtTables = makeNode(SelectStmt);
@@ -3060,7 +3067,7 @@ DBTableInfoShowStmt:
                                 (Node *)makeSimpleA_Expr(AEXPR_OP, 
                                                          "=", 
                                                          (Node *)makeColumnRef("table_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst(get_namespace_name(getCurrentNamespaceOid()), -1), 
+                                                         (Node *)makeStringConst(currentMysqlDatabaseForParse(yyscanner), -1), 
                                                          -1); 
                     }
                     if ($5 != NULL)
@@ -3102,7 +3109,7 @@ DBTableInfoShowStmt:
                                 (Node *)makeSimpleA_Expr(AEXPR_OP, 
                                                          "=", 
                                                          (Node *)makeColumnRef("table_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst(get_namespace_name(getCurrentNamespaceOid()), -1), 
+                                                         (Node *)makeStringConst(currentMysqlDatabaseForParse(yyscanner), -1), 
                                                          -1); 
                     }
                     if ($5 != NULL)
@@ -3120,7 +3127,7 @@ DBTableInfoShowStmt:
                     {
                         selectStmtViews->whereClause = 
                                 makeAndExpr(selectStmtViews->whereClause, 
-                                            $6, 
+                                            copyObject($6), 
                                             -1);
                     }
 
@@ -3204,7 +3211,7 @@ DBTableInfoShowStmt:
                                 (Node *)makeSimpleA_Expr(AEXPR_OP, 
                                                          "=", 
                                                          (Node *)makeColumnRef("table_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst(get_namespace_name(getCurrentNamespaceOid()), -1), 
+                                                         (Node *)makeStringConst(currentMysqlDatabaseForParse(yyscanner), -1), 
                                                          -1); 
                     }
                     if ($5 != NULL)
@@ -3262,7 +3269,7 @@ DBTableInfoShowStmt:
                                 (Node *)makeSimpleA_Expr(AEXPR_OP, 
                                                          "=", 
                                                          (Node *)makeColumnRef("table_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst(get_namespace_name(getCurrentNamespaceOid()), -1), 
+                                                         (Node *)makeStringConst(currentMysqlDatabaseForParse(yyscanner), -1), 
                                                          -1); 
                     }
                     if ($5 != NULL)
@@ -3280,7 +3287,7 @@ DBTableInfoShowStmt:
                     {
                         selectStmtViews->whereClause = 
                                 makeAndExpr(selectStmtViews->whereClause, 
-                                            $6, 
+                                            copyObject($6), 
                                             -1);
                     }
 
@@ -3690,7 +3697,7 @@ DBTableInfoShowStmt:
                     {
                         funcCall = makeFuncCall(list_make2(makeString(pstrdup("mysql")), 
                                                            makeString(pstrdup("show_create_function"))),
-                                                list_make2(makeStringConst(get_namespace_name(getCurrentNamespaceOid()), -1), 
+                                                list_make2(makeStringConst(currentMysqlDatabaseForParse(yyscanner), -1), 
                                                            makeStringConst(pstrdup($4->relname), -1)),
                                                 COERCE_EXPLICIT_CALL, 
                                                 -1);
@@ -3784,7 +3791,7 @@ DBTableInfoShowStmt:
                     {
                         funcCall = makeFuncCall(list_make2(makeString(pstrdup("mysql")), 
                                                            makeString(pstrdup("show_create_procedure"))),
-                                                list_make2(makeStringConst(get_namespace_name(getCurrentNamespaceOid()), -1), 
+                                                list_make2(makeStringConst(currentMysqlDatabaseForParse(yyscanner), -1), 
                                                            makeStringConst(pstrdup($4->relname), -1)),
                                                 COERCE_EXPLICIT_CALL, 
                                                 -1);
@@ -3901,7 +3908,7 @@ DBTableInfoShowStmt:
                                 (Node *)makeSimpleA_Expr(AEXPR_OP, 
                                                          "=", 
                                                          (Node *)makeColumnRef("trigger_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst(get_namespace_name(getCurrentNamespaceOid()), -1), 
+                                                         (Node *)makeStringConst(currentMysqlDatabaseForParse(yyscanner), -1), 
                                                          -1); 
                     }
 					if ($4 != NULL)
@@ -3943,7 +3950,7 @@ DBTableInfoShowStmt:
 
 					if ($4->schemaname == NULL)
 					{
-						$4->schemaname = get_namespace_name(getCurrentNamespaceOid());
+						$4->schemaname = currentMysqlDatabaseForParse(yyscanner);
 					}
 
 					funcCall = makeFuncCall(list_make2(makeString("mysql"), makeString("show_create_trigger")),
@@ -3989,11 +3996,11 @@ show_from_table_clause:
 show_from_db_clause:
             FROM ColId
 				{
-					if (memcmp($2, "information_schema", 18) == 0)
+					if (pg_strcasecmp($2, "information_schema") == 0)
 					{
 						$$ = makeRangeVar(NULL, pstrdup("mys_informa_schema"), @2);
 					}
-					else if ((memcmp($2, "sys", 3) == 0) && (strlen($2) == 3))
+					else if (pg_strcasecmp($2, "sys") == 0)
 					{
 						$$ = makeRangeVar(NULL, pstrdup("mys_sys"), @2);
 					}
@@ -4004,11 +4011,11 @@ show_from_db_clause:
 				}
 			| IN_P ColId
 				{
-					if (memcmp($2, "information_schema", 18) == 0)
+					if (pg_strcasecmp($2, "information_schema") == 0)
 					{
 						$$ = makeRangeVar(NULL, pstrdup("mys_informa_schema"), @2);
 					}
-					else if ((memcmp($2, "sys", 3) == 0) && (strlen($2) == 3))
+					else if (pg_strcasecmp($2, "sys") == 0)
 					{
 						$$ = makeRangeVar(NULL, pstrdup("mys_sys"), @2);
 					}
@@ -13887,6 +13894,7 @@ CreatedbStmt:
 			CREATE DATABASE name opt_with createdb_opt_list
                 {
 					CreateSchemaStmt *n = makeNode(CreateSchemaStmt);
+					validateMysqlDbOptions($5);
 					/* ...but not here */
 					n->schemaname = $3;
 					n->authrole = NULL;
@@ -13897,6 +13905,7 @@ CreatedbStmt:
 			| CREATE DATABASE IF_P NOT EXISTS name opt_with createdb_opt_list
 				{
 					CreateSchemaStmt *n = makeNode(CreateSchemaStmt);
+					validateMysqlDbOptions($8);
 					/* ...but not here */
 					n->schemaname = $6;
 					n->authrole = NULL;
@@ -13919,7 +13928,7 @@ createdb_opt_items:
 
 createdb_opt_item:
 			character_set_collate
-				{ $$ = makeDefElem("mysql_database_option", NULL, @1); }
+				{ $$ = (DefElem *) $1; }
 			| createdb_opt_name opt_equal SignedIconst
 				{
 					$$ = makeDefElem($1, (Node *)makeInteger($3), @1);
@@ -13980,10 +13989,49 @@ AlterDatabaseStmt:
 				 }
 			| ALTER DATABASE name createdb_opt_list
 				 {
-					AlterDatabaseStmt *n = makeNode(AlterDatabaseStmt);
-					n->dbname = $3;
-					n->options = $4;
-					$$ = (Node *)n;
+					if (isMysqlAlterDbOptions($4))
+						$$ = makeMysqlAlterDbStmt($3, $4, @1);
+					else
+					{
+						AlterDatabaseStmt *n = makeNode(AlterDatabaseStmt);
+						n->dbname = $3;
+						n->options = $4;
+						$$ = (Node *)n;
+					}
+				 }
+			| ALTER DATABASE DEFAULT character_set opt_equal charset_name character_set_collates
+				 {
+					Node *first = (Node *) makeDefElem("charset", (Node *) makeString($6), @3);
+					$$ = makeMysqlAlterDbStmt(NULL, lcons(first, $7), @1);
+				 }
+			| ALTER DATABASE DEFAULT COLLATE opt_equal any_name character_set_collates
+				 {
+					Node *first = (Node *) makeDefElem("collate", (Node *) makeString(strVal(llast($6))), @3);
+					$$ = makeMysqlAlterDbStmt(NULL, lcons(first, $7), @1);
+				 }
+			| ALTER DATABASE COLLATE opt_equal any_name character_set_collates
+				 {
+					Node *first = (Node *) makeDefElem("collate", (Node *) makeString(strVal(llast($5))), @3);
+					$$ = makeMysqlAlterDbStmt(NULL, lcons(first, $6), @1);
+				 }
+			| ALTER SCHEMA name character_set_collate character_set_collates
+				 {
+					$$ = makeMysqlAlterDbStmt($3, lcons($4, $5), @1);
+				 }
+			| ALTER SCHEMA DEFAULT character_set opt_equal charset_name character_set_collates
+				 {
+					Node *first = (Node *) makeDefElem("charset", (Node *) makeString($6), @3);
+					$$ = makeMysqlAlterDbStmt(NULL, lcons(first, $7), @1);
+				 }
+			| ALTER SCHEMA DEFAULT COLLATE opt_equal any_name character_set_collates
+				 {
+					Node *first = (Node *) makeDefElem("collate", (Node *) makeString(strVal(llast($6))), @3);
+					$$ = makeMysqlAlterDbStmt(NULL, lcons(first, $7), @1);
+				 }
+			| ALTER SCHEMA COLLATE opt_equal any_name character_set_collates
+				 {
+					Node *first = (Node *) makeDefElem("collate", (Node *) makeString(strVal(llast($5))), @3);
+					$$ = makeMysqlAlterDbStmt(NULL, lcons(first, $6), @1);
 				 }
 			| ALTER DATABASE name SET TABLESPACE name
 				 {
@@ -14694,62 +14742,6 @@ MysInsertStmt:
 			INSERT insert_low_priority_delayed INTO insert_target insert_rest opt_on_conflict
 				{
 					$5->relation = $4;
-                    if ($6 != NULL)
-                    {
-                        ListCell *lc;
-                        foreach (lc, $6->targetList)
-                        {
-                            Node *node = lfirst(lc);
-                            if (node->type == T_ResTarget)
-                            {
-                                ResTarget *resTarget = (ResTarget *)node;
-                                if (resTarget->val->type == T_A_Expr)
-                                {
-                                    char *tableName;
-                                    RangeVar *rangeVar;
-                                    Node *lexpr;
-                                    Node *rexpr;
-
-                                    rangeVar = (RangeVar *)$4;
-                                    tableName = rangeVar->relname;
-                                    lexpr = ((A_Expr *)(resTarget->val))->lexpr;
-                                    rexpr = ((A_Expr *)(resTarget->val))->rexpr;
-                                    if (lexpr->type == T_ColumnRef)
-                                    {
-                                        ColumnRef *columnRef = (ColumnRef *)lexpr;
-                                        if (list_length(columnRef->fields) == 1)
-                                        {
-                                            ListCell *subLc;
-                                            foreach (subLc, columnRef->fields)
-                                            {
-												Node *val = (Node *)lfirst(subLc);
-												Node *colNode = (Node *)makeString(strVal(val));
-                                                List *indi = list_make1(colNode);
-                                                ((A_Expr *)(resTarget->val))->lexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if (rexpr->type == T_ColumnRef)
-                                    {
-                                        ColumnRef *columnRef = (ColumnRef *)rexpr;
-                                        if (list_length(columnRef->fields) == 1)
-                                        {
-                                            ListCell *subLc;
-                                            foreach (subLc, columnRef->fields)
-                                            {
-												Node *val = (Node *)lfirst(subLc);
-												Node *colNode = (Node *)makeString(strVal(val));
-                                                List *indi = list_make1(colNode);
-                                                ((A_Expr *)(resTarget->val))->rexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
 					$5->onConflictClause = $6;
 					$5->returningClause = makeReturningClauseFromList(NIL);
 					$5->withClause = NULL;
@@ -14800,62 +14792,6 @@ MysInsertStmt:
                     insertRest->cols = insertColumnList;
                     insertRest->selectStmt = (Node*)insertValueClause;
 					insertRest->relation = $4;
-                    if ($7 != NULL)
-                    {
-                        ListCell *lc;
-                        foreach (lc, $7->targetList)
-                        {
-                            Node *node = lfirst(lc);
-                            if (node->type == T_ResTarget)
-                            {
-                                ResTarget *resTarget = (ResTarget *)node;
-                                if (resTarget->val->type == T_A_Expr)
-                                {
-                                    char *tableName;
-                                    RangeVar *rangeVar;
-                                    Node *lexpr;
-                                    Node *rexpr;
-
-                                    rangeVar = (RangeVar *)$4;
-                                    tableName = rangeVar->relname;
-                                    lexpr = ((A_Expr *)(resTarget->val))->lexpr;
-                                    rexpr = ((A_Expr *)(resTarget->val))->rexpr;
-                                    if (lexpr->type == T_ColumnRef)
-                                    {
-                                        ColumnRef *columnRef = (ColumnRef *)lexpr;
-                                        if (list_length(columnRef->fields) == 1)
-                                        {
-                                            ListCell *subLc;
-                                            foreach (subLc, columnRef->fields)
-                                            {
-												Node *val = (Node *)lfirst(subLc);
-												Node *colNode = (Node *)makeString(strVal(val));
-                                                List *indi = list_make1(colNode);
-                                                ((A_Expr *)(resTarget->val))->lexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if (rexpr->type == T_ColumnRef)
-                                    {
-                                        ColumnRef *columnRef = (ColumnRef *)rexpr;
-                                        if (list_length(columnRef->fields) == 1)
-                                        {
-                                            ListCell *subLc;
-                                            foreach (subLc, columnRef->fields)
-                                            {
-												Node *val = (Node *)lfirst(subLc);
-												Node *colNode = (Node *)makeString(strVal(val));
-                                                List *indi = list_make1(colNode);
-                                                ((A_Expr *)(resTarget->val))->rexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
 					insertRest->onConflictClause = $7;
 					insertRest->returningClause = makeReturningClauseFromList(NIL);
 					insertRest->withClause = NULL;
@@ -14864,62 +14800,6 @@ MysInsertStmt:
         |   INSERT insert_low_priority_delayed insert_target insert_rest opt_on_conflict
 				{
 					$4->relation = $3;
-                    if ($5 != NULL)
-                    {
-                        ListCell *lc;
-                        foreach (lc, $5->targetList)
-                        {
-                            Node *node = lfirst(lc);
-                            if (node->type == T_ResTarget)
-                            {
-                                ResTarget *resTarget = (ResTarget *)node;
-                                if (resTarget->val->type == T_A_Expr)
-                                {
-                                    char *tableName;
-                                    RangeVar *rangeVar;
-                                    Node *lexpr;
-                                    Node *rexpr;
-
-                                    rangeVar = (RangeVar *)$3;
-                                    tableName = rangeVar->relname;
-                                    lexpr = ((A_Expr *)(resTarget->val))->lexpr;
-                                    rexpr = ((A_Expr *)(resTarget->val))->rexpr;
-                                    if (lexpr->type == T_ColumnRef)
-                                    {
-                                        ColumnRef *columnRef = (ColumnRef *)lexpr;
-                                        if (list_length(columnRef->fields) == 1)
-                                        {
-                                            ListCell *subLc;
-                                            foreach (subLc, columnRef->fields)
-                                            {
-												Node *val = (Node *)lfirst(subLc);
-												Node *colNode = (Node *)makeString(strVal(val));
-                                                List *indi = list_make1(colNode);
-                                                ((A_Expr *)(resTarget->val))->lexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if (rexpr->type == T_ColumnRef)
-                                    {
-                                        ColumnRef *columnRef = (ColumnRef *)rexpr;
-                                        if (list_length(columnRef->fields) == 1)
-                                        {
-                                            ListCell *subLc;
-                                            foreach (subLc, columnRef->fields)
-                                            {
-												Node *val = (Node *)lfirst(subLc);
-												Node *colNode = (Node *)makeString(strVal(val));
-                                                List *indi = list_make1(colNode);
-                                                ((A_Expr *)(resTarget->val))->rexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
 					$4->onConflictClause = $5;
 					$4->returningClause = makeReturningClauseFromList(NIL);
 					$4->withClause = NULL;
@@ -14971,62 +14851,6 @@ MysInsertStmt:
                     insertRest->cols = insertColumnList;
                     insertRest->selectStmt = (Node*)insertValueClause;
 					insertRest->relation = $3;
-                    if ($6 != NULL)
-                    {
-                        ListCell *lc;
-                        foreach (lc, $6->targetList)
-                        {
-                            Node *node = lfirst(lc);
-                            if (node->type == T_ResTarget)
-                            {
-                                ResTarget *resTarget = (ResTarget *)node;
-                                if (resTarget->val->type == T_A_Expr)
-                                {
-                                    char *tableName;
-                                    RangeVar *rangeVar;
-                                    Node *lexpr;
-                                    Node *rexpr;
-
-                                    rangeVar = (RangeVar *)$3;
-                                    tableName = rangeVar->relname;
-                                    lexpr = ((A_Expr *)(resTarget->val))->lexpr;
-                                    rexpr = ((A_Expr *)(resTarget->val))->rexpr;
-                                    if (lexpr->type == T_ColumnRef)
-                                    {
-                                        ColumnRef *columnRef = (ColumnRef *)lexpr;
-                                        if (list_length(columnRef->fields) == 1)
-                                        {
-                                            ListCell *subLc;
-                                            foreach (subLc, columnRef->fields)
-                                            {
-												Node *val = (Node *)lfirst(subLc);
-												Node *colNode = (Node *)makeString(strVal(val));
-                                                List *indi = list_make1(colNode);
-                                                ((A_Expr *)(resTarget->val))->lexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if (rexpr->type == T_ColumnRef)
-                                    {
-                                        ColumnRef *columnRef = (ColumnRef *)rexpr;
-                                        if (list_length(columnRef->fields) == 1)
-                                        {
-                                            ListCell *subLc;
-                                            foreach (subLc, columnRef->fields)
-                                            {
-												Node *val = (Node *)lfirst(subLc);
-												Node *colNode = (Node *)makeString(strVal(val));
-                                                List *indi = list_make1(colNode);
-                                                ((A_Expr *)(resTarget->val))->rexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
 					insertRest->onConflictClause = $6;
 					insertRest->returningClause = makeReturningClauseFromList(NIL);
 					insertRest->withClause = NULL;
@@ -15599,8 +15423,17 @@ DeleteStmt: with_clause DELETE_P delete_options FROM relation_expr_opt_alias usi
 					n->relation = $5;
 					n->usingClause = $6;
 					n->whereClause = $7;
+					n->ignoreFailure = $3;
 					if ($8 != NIL || $9 != NULL)
+					{
+						if (n->usingClause != NIL)
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("Incorrect usage of DELETE and %s",
+											$8 != NIL ? "ORDER BY" : "LIMIT"),
+									 parser_errposition(@1)));
 						n->whereClause = makeLimitedModifyQual(n->relation, n->whereClause, $8, $9, @1);
+					}
 					n->returningClause = makeReturningClauseFromList($10);
 					n->withClause = $1;
 					makeMysqlDeleteUsing(n, @1);
@@ -15613,8 +15446,17 @@ DeleteStmt: with_clause DELETE_P delete_options FROM relation_expr_opt_alias usi
 					n->relation = $4;
 					n->usingClause = $5;
 					n->whereClause = $6;
+					n->ignoreFailure = $2;
 					if ($7 != NIL || $8 != NULL)
+					{
+						if (n->usingClause != NIL)
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("Incorrect usage of DELETE and %s",
+											$7 != NIL ? "ORDER BY" : "LIMIT"),
+									 parser_errposition(@1)));
 						n->whereClause = makeLimitedModifyQual(n->relation, n->whereClause, $7, $8, @1);
+					}
 					n->returningClause = makeReturningClauseFromList($9);
 					n->withClause = NULL;
 					makeMysqlDeleteUsing(n, @1);
@@ -15623,20 +15465,20 @@ DeleteStmt: with_clause DELETE_P delete_options FROM relation_expr_opt_alias usi
 		;
 
 delete_options:
-            /* empty */                 { isIgnoreStmt = false; }
-            | ColId                     { isIgnoreStmt = false; }
-            | IGNORE                    { isIgnoreStmt = true; }
-            | LOW_PRIORITY              { isIgnoreStmt = false; }
-            | ColId IGNORE              { isIgnoreStmt = true; }
-            | LOW_PRIORITY IGNORE       { isIgnoreStmt = true; }
-            | IGNORE ColId              { isIgnoreStmt = true; }
-            | IGNORE LOW_PRIORITY       { isIgnoreStmt = true; }
-            | LOW_PRIORITY ColId        { isIgnoreStmt = false; }
-            | ColId ColId               { isIgnoreStmt = false; }
-            | LOW_PRIORITY IGNORE ColId { isIgnoreStmt = true; }
-            | IGNORE LOW_PRIORITY ColId { isIgnoreStmt = true; }
-            | IGNORE ColId ColId        { isIgnoreStmt = true; }
-            | ColId IGNORE ColId        { isIgnoreStmt = true; }
+            /* empty */                 { $$ = false; }
+            | ColId                     { $$ = false; }
+            | IGNORE                    { $$ = true; }
+            | LOW_PRIORITY              { $$ = false; }
+            | ColId IGNORE              { $$ = true; }
+            | LOW_PRIORITY IGNORE       { $$ = true; }
+            | IGNORE ColId              { $$ = true; }
+            | IGNORE LOW_PRIORITY       { $$ = true; }
+            | LOW_PRIORITY ColId        { $$ = false; }
+            | ColId ColId               { $$ = false; }
+            | LOW_PRIORITY IGNORE ColId { $$ = true; }
+            | IGNORE LOW_PRIORITY ColId { $$ = true; }
+            | IGNORE ColId ColId        { $$ = true; }
+            | ColId IGNORE ColId        { $$ = true; }
         ;
 
 using_clause:
@@ -15857,8 +15699,17 @@ MysUpdateStmt:
                         }
                     }
                     n->whereClause = $7;
+					n->ignoreFailure = $2;
 					if ($8 != NIL || $9 != NULL)
+					{
+						if (n->fromClause != NIL)
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("Incorrect usage of UPDATE and %s",
+											$8 != NIL ? "ORDER BY" : "LIMIT"),
+									 parser_errposition(@1)));
 						n->whereClause = makeLimitedModifyQual(n->relation, n->whereClause, $8, $9, @1);
+					}
 					n->returningClause = makeReturningClauseFromList($10);
                     n->withClause = NULL;
 
@@ -15872,6 +15723,7 @@ MysUpdateStmt:
                     // 暂时只考虑一个join的情况
                     // TODO: 还要考虑多个join的情况
 					UpdateStmt *n = makeNode(UpdateStmt);
+					n->ignoreFailure = $2;
                     //int i;
                     //ListCell* lc;
                     //int len;
@@ -16012,8 +15864,11 @@ MysUpdateStmt:
         ;
 
 update_options:
-            /* empty */ { isIgnoreStmt = false; }
-            | IGNORE    { isIgnoreStmt = true; }
+            /* empty */             { $$ = false; }
+            | IGNORE                { $$ = true; }
+            | LOW_PRIORITY          { $$ = false; }
+            | LOW_PRIORITY IGNORE   { $$ = true; }
+            | IGNORE LOW_PRIORITY   { $$ = true; }
         ;
 
 update_join_type:
@@ -16034,60 +15889,6 @@ set_clause:
 				{
 					$1->val = (Node *) $3;
 					$$ = list_make1($1);
-				}
-            | set_target '=' VALUES '(' a_expr ')'
-				{
-                    /* from "name=values(name)"  */
-                    /* to:  "name=excluded.name" */
-                    if (IsA($5, ColumnRef))
-                    {
-                        ColumnRef *columnRef = (ColumnRef *) $5;
-                        if (list_length(columnRef->fields) == 1)
-                        {
-                            char *columnName;
-                            ListCell *subLc;
-                            columnName = NULL;
-                            foreach (subLc, columnRef->fields)
-                            {
-                                columnName = strVal(lfirst(subLc));
-                            }
-                            if (columnName != NULL)
-                            {
-                                Node *newColumnRef;
-                                List *indi;
-                                Node *colNode;
-                                colNode = (Node *)makeString(columnName);
-                                indi = list_make1(colNode);
-                                newColumnRef = makeColumnRef("excluded", indi, -1, 0);
-                                $1->val = newColumnRef;
-                                $$ = list_make1($1);
-                            }
-                            else
-                            {
-                                ereport(ERROR,
-                                        (errcode(ERRCODE_SYNTAX_ERROR),
-                                         errmsg("syntax is not supported in duplicate"),
-                                         errhint("syntax is not supported in duplicate"),
-                                         parser_errposition(@1)));
-                            }
-                        }
-                        else
-                        {
-                            ereport(ERROR,
-                                    (errcode(ERRCODE_SYNTAX_ERROR),
-                                     errmsg("syntax is not supported in duplicate"),
-                                     errhint("syntax is not supported in duplicate"),
-                                     parser_errposition(@1)));
-                        }
-                    }
-                    else
-                    {
-                        ereport(ERROR,
-                                (errcode(ERRCODE_SYNTAX_ERROR),
-                                 errmsg("syntax is not supported in duplicate"),
-                                 errhint("syntax is not supported in duplicate"),
-                                 parser_errposition(@1)));
-                    }
 				}
 			| '(' set_target_list ')' '=' a_expr
 				{
@@ -16200,15 +16001,12 @@ set_target_list:
  *****************************************************************************/
  UsedbStmt: USE name
                 {
-                    VariableSetStmt *n = makeNode(VariableSetStmt);
-					n->kind = VAR_SET_VALUE;
-					n->name = pstrdup("search_path");
-					n->args = list_make4(makeStringConst($2, @2),
-                                         makeStringConst(pstrdup("mysql"), -1),
-                                         makeStringConst(pstrdup("pg_catalog"), -1),
-                                         makeStringConst(pstrdup("public"), -1));
-                    n->is_local = false;
-					$$ = (Node *)n;
+					DoStmt *d = makeNode(DoStmt);
+
+					mys_yyget_extra(yyscanner)->pending_use_db = $2;
+					d->args = list_make1(makeDefElem("aux_mysql_use_db",
+													 (Node *) makeString($2), @2));
+					$$ = (Node *) d;
                 }
             ;
 
@@ -20525,6 +20323,22 @@ func_expr_common_subexpr:
 											   COERCE_EXPLICIT_CALL,
 											   @1);
                 }
+			| VALUES_LA '(' columnref ')'
+				{
+					ColumnRef  *cr = (ColumnRef *) $3;
+					char	   *col = NULL;
+
+					if (list_length(cr->fields) == 1 && IsA(linitial(cr->fields), String))
+						col = strVal(linitial(cr->fields));
+					else if (list_length(cr->fields) == 2 && IsA(lsecond(cr->fields), String))
+						col = strVal(lsecond(cr->fields));
+					if (col == NULL)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("VALUES() requires a column name"),
+								 parser_errposition(@3)));
+					$$ = makeColumnRef("excluded", list_make1(makeString(col)), @1, yyscanner);
+				}
 			| COALESCE '(' expr_list ')'
 				{
 					CoalesceExpr *c = makeNode(CoalesceExpr);
@@ -21485,27 +21299,27 @@ qualified_name:
 						case 1:
 							$$->catalogname = NULL;
 							$$->schemaname = $1;
-                            if (memcmp($$->schemaname, "information_schema", 18) == 0)
-                            {
-                                $$->schemaname = pstrdup("mys_informa_schema");
-                            }
-                            else if ((memcmp($$->schemaname, "sys", 3) == 0) && (strlen($$->schemaname) == 3))
-                            {
-                                $$->schemaname = pstrdup("mys_sys");
-                            }
+							if (pg_strcasecmp($$->schemaname, "information_schema") == 0)
+							{
+								$$->schemaname = pstrdup("mys_informa_schema");
+							}
+							else if (pg_strcasecmp($$->schemaname, "sys") == 0)
+							{
+								$$->schemaname = pstrdup("mys_sys");
+							}
 							$$->relname = strVal(linitial($2));
 							break;
 						case 2:
 							$$->catalogname = $1;
 							$$->schemaname = strVal(linitial($2));
-                            if (memcmp($$->schemaname, "information_schema", 18) == 0)
-                            {
-                                $$->schemaname = pstrdup("mys_informa_schema");
-                            }
-                            else if ((memcmp($$->schemaname, "sys", 3) == 0) && (strlen($$->schemaname) == 3))
-                            {
-                                $$->schemaname = pstrdup("mys_sys");
-                            }
+							if (pg_strcasecmp($$->schemaname, "information_schema") == 0)
+							{
+								$$->schemaname = pstrdup("mys_informa_schema");
+							}
+							else if (pg_strcasecmp($$->schemaname, "sys") == 0)
+							{
+								$$->schemaname = pstrdup("mys_sys");
+							}
 							$$->relname = strVal(lsecond($2));
 							break;
 						default:
@@ -24212,6 +24026,105 @@ createResTargetWithFunc2Args(char *name, char *funcShemaName, char *funcName,
     return resTarget;
 }
 
+static char *
+currentMysqlDatabaseForParse(core_yyscan_t yyscanner)
+{
+	mys_yy_extra_type *yyextra = mys_yyget_extra(yyscanner);
+	char	   *nspname;
+
+	if (yyextra->pending_use_db != NULL)
+		return pstrdup(mys_catalog_schema_name(yyextra->pending_use_db));
+	if (mys_is_mysql_session())
+	{
+		const char *sel = mys_selected_database();
+
+		if (sel == NULL)
+			ereport(ERROR,
+					(errcode(MYS_ERRCODE_NO_DB_ERROR),
+					 errmsg("No database selected")));
+		return pstrdup(mys_catalog_schema_name(sel));
+	}
+	if (IsAbortedTransactionBlockState())
+		return pstrdup("");
+	nspname = get_namespace_name(getCurrentNamespaceOid());
+	if (nspname == NULL)
+		ereport(ERROR,
+				(errcode(MYS_ERRCODE_NO_DB_ERROR),
+				 errmsg("No database selected")));
+	return nspname;
+}
+
+static void
+validateMysqlDbOptions(List *options)
+{
+	ListCell   *lc;
+
+	foreach(lc, options)
+	{
+		DefElem    *opt = (DefElem *) lfirst(lc);
+
+		if (opt == NULL || !IsA(opt, DefElem) || opt->arg == NULL || !IsA(opt->arg, String))
+			continue;
+		if (strcmp(opt->defname, "charset") == 0)
+		{
+			const char *cs = strVal(opt->arg);
+
+			if (pg_strcasecmp(cs, "utf8") != 0 &&
+				pg_strcasecmp(cs, "utf8mb3") != 0 &&
+				pg_strcasecmp(cs, "utf8mb4") != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("character set '%s' is not supported for databases; only utf8/utf8mb4 is supported",
+								cs)));
+		}
+		else if (strcmp(opt->defname, "collate") == 0)
+		{
+			const char *col = strVal(opt->arg);
+
+			if (pg_strncasecmp(col, "utf8", 4) != 0 &&
+				pg_strcasecmp(col, "case_insensitive") != 0 &&
+				pg_strcasecmp(col, "case_sensitive") != 0 &&
+				pg_strcasecmp(col, "default") != 0 &&
+				pg_strcasecmp(col, "c") != 0 &&
+				pg_strcasecmp(col, "posix") != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("collation '%s' is not supported for databases; only UTF-8 collations are supported",
+								col)));
+		}
+	}
+}
+
+static bool
+isMysqlAlterDbOptions(List *options)
+{
+	ListCell   *lc;
+
+	if (options == NIL)
+		return false;
+	foreach(lc, options)
+	{
+		DefElem    *opt = (DefElem *) lfirst(lc);
+
+		if (opt == NULL || !IsA(opt, DefElem))
+			return false;
+		if (strcmp(opt->defname, "charset") != 0 &&
+			strcmp(opt->defname, "collate") != 0)
+			return false;
+	}
+	return true;
+}
+
+static Node *
+makeMysqlAlterDbStmt(char *dbname, List *options, int location)
+{
+	DoStmt	   *d = makeNode(DoStmt);
+	Node	   *arg = dbname ? (Node *) makeString(dbname) : NULL;
+
+	d->args = lcons(makeDefElem("aux_mysql_alter_db", arg, location), options);
+	return (Node *) d;
+}
+
 static RangeVar *
 createRangeVar(char *schemaName, char *tableName)
 {
@@ -24386,10 +24299,11 @@ makeLimitedModifyQual(RangeVar *relation, Node *whereClause,
 	ColumnRef  *c2 = makeNode(ColumnRef);
 	ResTarget  *t1 = makeNode(ResTarget);
 	ResTarget  *t2 = makeNode(ResTarget);
+	const char *refname = relation->alias ? relation->alias->aliasname : relation->relname;
 
-	c1->fields = list_make1(makeString("tableoid"));
+	c1->fields = list_make2(makeString(pstrdup(refname)), makeString("tableoid"));
 	c1->location = -1;
-	c2->fields = list_make1(makeString("ctid"));
+	c2->fields = list_make2(makeString(pstrdup(refname)), makeString("ctid"));
 	c2->location = -1;
 	t1->val = (Node *) copyObject(c1);
 	t1->location = -1;

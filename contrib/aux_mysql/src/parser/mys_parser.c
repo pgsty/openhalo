@@ -1,51 +1,15 @@
-
 /*-------------------------------------------------------------------------
  *
  * mys_parser.c
- *	  Main entry point/driver for MySQL COMPATIBLE grammar
+ *	  Main entry point/driver for MySQL-compatible SQL grammar
  *
- * 
- * 版权所有 (c) 2019-2025, 易景科技保留所有权利。
- * Copyright (c) 2019-2025, Halo Tech Co.,Ltd. All rights reserved.
- * 版权所有 (c) 2026, PGSTY PTE. LTD. 保留所有权利。
- * Copyright (c) 2026, PGSTY PTE. LTD. All rights reserved.
+ * Portions Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
- * 
- * 易景科技是Halo Database、Halo Database Management System、羲和数据
- * 库、羲和数据库管理系统（后面简称 Halo ）、openHalo软件的发明人同时也为
- * 知识产权权利人。Halo 软件的知识产权，以及与本软件相关的所有信息内容（包括
- * 但不限于文字、图片、音频、视频、图表、界面设计、版面框架、有关数据或电子文
- * 档等）均受中华人民共和国法律法规和相应的国际条约保护，易景科技享有上述知识
- * 产权，但相关权利人依照法律规定应享有的权利除外。未免疑义，本条所指的“知识
- * 产权”是指任何及所有基于 Halo 软件产生的：（a）版权、商标、商号、域名、与
- * 商标和商号相关的商誉、设计和专利；与创新、技术诀窍、商业秘密、保密技术、非
- * 技术信息相关的权利；（b）人身权、掩模作品权、署名权和发表权；以及（c）在
- * 本协议生效之前已存在或此后出现在世界任何地方的其他工业产权、专有权、与“知
- * 识产权”相关的权利，以及上述权利的所有续期和延长，无论此类权利是否已在相
- * 关法域内的相关机构注册。
- *
- * This software and related documentation are provided under a license
- * agreement containing restrictions on use and disclosure and are 
- * protected by intellectual property laws. Except as expressly permitted
- * in your license agreement or allowed by law, you may not use, copy, 
- * reproduce, translate, broadcast, modify, license, transmit, distribute,
- * exhibit, perform, publish, or display any part, in any form, or by any
- * means. Reverse engineering, disassembly, or decompilation of this 
- * software, unless required by law for interoperability, is prohibited.
- * 
- * This software is developed for general use in a variety of
- * information management applications. It is not developed or intended
- * for use in any inherently dangerous applications, including applications
- * that may create a risk of personal injury. If you use this software or
- * in dangerous applications, then you shall be responsible to take all
- * appropriate fail-safe, backup, redundancy, and other measures to ensure
- * its safe use. Halo Corporation and its affiliates disclaim any 
- * liability for any damages caused by use of this software in dangerous
- * applications.
- * 
  *
  * IDENTIFICATION
- *	  src/backend/parser/mysql/mys_parser.c
+ *	  contrib/aux_mysql/src/parser/mys_parser.c
  *
  *-------------------------------------------------------------------------
  */
@@ -65,8 +29,27 @@ static void check_unicode_value(pg_wchar c);
 static char *str_udeescape(const char *str, char escape,
 						   int position, core_yyscan_t yyscanner);
 
-/* save previous token */
-static int prev_token;
+static void
+update_on_dup_state(mys_yy_extra_type *yyextra, int tok)
+{
+	if (tok == ';')
+	{
+		yyextra->on_dup_state = 0;
+		return;
+	}
+	if (yyextra->on_dup_state == 4)
+		return;
+	if (tok == ON)
+		yyextra->on_dup_state = 1;
+	else if (yyextra->on_dup_state == 1 && tok == DUPLICATE)
+		yyextra->on_dup_state = 2;
+	else if (yyextra->on_dup_state == 2 && tok == KEY)
+		yyextra->on_dup_state = 3;
+	else if (yyextra->on_dup_state == 3 && tok == UPDATE)
+		yyextra->on_dup_state = 4;
+	else
+		yyextra->on_dup_state = 0;
+}
 
 int
 mys_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
@@ -90,8 +73,11 @@ mys_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 	else
 		cur_token = mys_core_yylex(&(lvalp->core_yystype), llocp, yyscanner);
 
-    /*
-     * If this token isn't one that requires lookahead, just return it.  If it
+	if (cur_token != UNDERSCORE_BINARY)
+		yyextra->saw_underscore_binary = false;
+
+	/*
+	 * If this token isn't one that requires lookahead, just return it.  If it
 	 * does, determine the token length.  (We could get that via strlen(), but
 	 * since we have such a small set of possibilities, hardwiring seems
 	 * feasible and more efficient --- at least for the fixed-length cases.)
@@ -112,18 +98,29 @@ mys_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 			cur_token_length = strlen(yyextra->core_yy_extra.scanbuf + *llocp);
 			break;
 		case BINARY:
-		    cur_token_length = 6;
+			cur_token_length = 6;
+			break;
+		case VALUES:
+			if (yyextra->on_dup_state != 4)
+			{
+				update_on_dup_state(yyextra, cur_token);
+				yyextra->prev_token = cur_token;
+				return cur_token;
+			}
+			cur_token_length = 6;
 			break;
 
 		default:
-			prev_token = cur_token;
+			update_on_dup_state(yyextra, cur_token);
+			yyextra->prev_token = cur_token;
 			return cur_token;
 	}
 
 	/*
-	 * Identify end+1 of current token.  mys_core_yylex() has temporarily stored a
-	 * '\0' here, and will undo that when we call it again.  We need to redo
-	 * it to fully revert the lookahead call for error reporting purposes.
+	 * Identify end+1 of current token.  mys_core_yylex() has temporarily
+	 * stored a '\0' here, and will undo that when we call it again.  We need
+	 * to redo it to fully revert the lookahead call for error reporting
+	 * purposes.
 	 */
 	yyextra->lookahead_end = yyextra->core_yy_extra.scanbuf +
 		*llocp + cur_token_length;
@@ -131,10 +128,10 @@ mys_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 
 	/*
 	 * Save and restore *llocp around the call.  It might look like we could
-	 * avoid this by just passing &lookahead_yylloc to mys_core_yylex(), but that
-	 * does not work because flex actually holds onto the last-passed pointer
-	 * internally, and will use that for error reporting.  We need any error
-	 * reports to point to the current token, not the next one.
+	 * avoid this by just passing &lookahead_yylloc to mys_core_yylex(), but
+	 * that does not work because flex actually holds onto the last-passed
+	 * pointer internally, and will use that for error reporting.  We need
+	 * any error reports to point to the current token, not the next one.
 	 */
 	cur_yylloc = *llocp;
 
@@ -180,7 +177,7 @@ mys_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 			break;
 
 		case WITH:
-			/* Replace WITH by WITH_LA if it's followed by TIME or ORDINALITY or ROLLUP */
+			/* Replace WITH by WITH_LA if it's followed by TIME/ORDINALITY/ROLLUP */
 			switch (next_token)
 			{
 				case TIME:
@@ -207,17 +204,17 @@ mys_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 
 				/* Get third token */
 				next_token = mys_core_yylex(&(yyextra->lookahead_yylval),
-										llocp, yyscanner);
+											llocp, yyscanner);
 
 				/* If we throw error here, it will point to third token */
 				if (next_token != SCONST)
-					scanner_yyerror("UESCAPE must be followed by a simple string literal",
-									yyscanner);
+					mys_scanner_yyerror("UESCAPE must be followed by a simple string literal",
+										yyscanner);
 
 				escstr = yyextra->lookahead_yylval.str;
 				if (strlen(escstr) != 1 || !check_uescapechar(escstr[0]))
-					scanner_yyerror("invalid Unicode escape character",
-									yyscanner);
+					mys_scanner_yyerror("invalid Unicode escape character",
+										yyscanner);
 
 				/* Now restore *llocp; errors will point to first token */
 				*llocp = cur_yylloc;
@@ -259,14 +256,24 @@ mys_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 				cur_token = SCONST;
 			}
 			break;
-		
+
 		case BINARY:
-			if (prev_token == REGEXP)
+			if (yyextra->prev_token == REGEXP)
 				cur_token = BINARY_LA;
+			break;
+
+		case VALUES:
+			if (next_token == '(')
+				cur_token = VALUES_LA;
 			break;
 	}
 
-	prev_token = cur_token;
+	if (cur_token != UNDERSCORE_BINARY &&
+		!(yyextra->have_lookahead && yyextra->lookahead_token == UNDERSCORE_BINARY))
+		yyextra->saw_underscore_binary = false;
+
+	update_on_dup_state(yyextra, cur_token);
+	yyextra->prev_token = cur_token;
 	return cur_token;
 }
 
@@ -276,15 +283,18 @@ mys_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 List *
 mys_raw_parser(const char *str)
 {
-    core_yyscan_t yyscanner;
+	core_yyscan_t yyscanner;
 	mys_yy_extra_type yyextra;
 	int			yyresult;
 
 	/* initialize the flex scanner */
 	yyscanner = mys_scanner_init(str, &yyextra.core_yy_extra,
-							 &MysScanKeywords, MysScanKeywordTokens);
+								 &MysScanKeywords, MysScanKeywordTokens);
 
 	yyextra.have_lookahead = false;
+	yyextra.prev_token = 0;
+	yyextra.on_dup_state = 0;
+	yyextra.pending_use_db = NULL;
 
 	/* initialize the bison parser */
 	mys_parser_init(&yyextra);
@@ -374,8 +384,8 @@ str_udeescape(const char *str, char escape,
 			 * Any errors reported while processing this escape sequence will
 			 * have an error cursor pointing at the escape.
 			 */
-			setup_scanner_errposition_callback(&scbstate, yyscanner,
-											   in - str + position + 3);	/* 3 for U&" */
+			mys_setup_scanner_errposition_callback(&scbstate, yyscanner,
+												   in - str + position + 3);	/* 3 for U&" */
 			if (in[1] == escape)
 			{
 				if (pair_first)
@@ -462,7 +472,7 @@ str_udeescape(const char *str, char escape,
 						 errmsg("invalid Unicode escape"),
 						 errhint("Unicode escapes must be \\XXXX or \\+XXXXXX.")));
 
-			cancel_scanner_errposition_callback(&scbstate);
+			mys_cancel_scanner_errposition_callback(&scbstate);
 		}
 		else
 		{
@@ -482,15 +492,14 @@ str_udeescape(const char *str, char escape,
 
 	/*
 	 * We might get here with the error callback active, or not.  Call
-	 * scanner_errposition to make sure an error cursor appears; if the
+	 * mys_scanner_errposition to make sure an error cursor appears; if the
 	 * callback is active, this is duplicative but harmless.
 	 */
 invalid_pair:
 	ereport(ERROR,
 			(errcode(ERRCODE_SYNTAX_ERROR),
 			 errmsg("invalid Unicode surrogate pair"),
-			 scanner_errposition(in - str + position + 3,	/* 3 for U&" */
-								 yyscanner)));
+			 mys_scanner_errposition(in - str + position + 3,	/* 3 for U&" */
+									 yyscanner)));
 	return NULL;				/* keep compiler quiet */
 }
-

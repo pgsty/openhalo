@@ -62,6 +62,9 @@
 #define COM_SET_OPTION			0x1b
 #define COM_RESET_CONNECTION	0x1f
 
+#define MYSQL_OPTION_MULTI_STATEMENTS_ON	0
+#define MYSQL_OPTION_MULTI_STATEMENTS_OFF	1
+
 /* firstchar values handed to PostgresMain for non-query commands */
 #define MYS_MSG_BASE			0x100
 
@@ -95,6 +98,7 @@
 #define MYS_CHARSET_BINARY		63
 
 #define MYS_MAX_PACKET			0xffffff
+#define MYS_MAX_PREAUTH_PACKET	65536
 #define MYS_SCRAMBLE_LEN		20
 
 #define AUTH_NATIVE				"mysql_native_password"
@@ -204,11 +208,11 @@ put_lenenc_str(StringInfo b, const char *s, int len)
  * Payload readers
  * ----------------------------------------------------------------
  */
-/* Read helpers over a StringInfo with bounds checking */
+/* Read helpers over a StringInfo with overflow-safe bounds checking */
 static inline bool
 get_bytes(StringInfo b, int n, const char **out)
 {
-	if (b->cursor + n > b->len)
+	if (n < 0 || b->cursor < 0 || b->cursor > b->len || n > b->len - b->cursor)
 		return false;
 	*out = b->data + b->cursor;
 	b->cursor += n;
@@ -247,6 +251,18 @@ get_lenenc_int(StringInfo b, uint64 *v)
 	if (first == 0xfe)
 		return get_uint(b, 8, v);
 	return false;
+}
+
+static inline bool
+get_lenenc_bytes(StringInfo b, const char **out, int *out_len)
+{
+	uint64		v;
+
+	if (!get_lenenc_int(b, &v) || b->cursor < 0 || b->cursor > b->len ||
+		v > (uint64) (b->len - b->cursor))
+		return false;
+	*out_len = (int) v;
+	return get_bytes(b, (int) v, out);
 }
 
 /* mysql_proto.c */

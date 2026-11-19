@@ -32,6 +32,7 @@
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
@@ -2189,192 +2190,23 @@ name_in_list(List *names, const char *name)
 }
 
 /*
- * Tables that statements earlier in the batch being rewritten create: a
- * later INSERT ... ON DUPLICATE KEY UPDATE / REPLACE of the batch runs
- * against them, but the catalog does not show them yet (or still shows the
- * table that the batch drops and creates again).
- */
-typedef struct BatchTable
-{
-	RangeVar   *relation;
-	List	   *columns;		/* names of the columns REPLACE assigns */
-	List	   *primary;		/* IndexElems of the PRIMARY KEY, or NIL */
-	List	   *uniques;		/* IndexElem lists of the UNIQUE keys */
-	Oid			like;			/* CREATE TABLE ... LIKE: the keys of this table */
-	bool		known;			/* false: columns and keys unknown */
-} BatchTable;
-
-static List *batch_tables = NIL;
-
-static BatchTable *
-find_batch_table(RangeVar *rel)
-{
-	foreach_ptr(BatchTable, bt, batch_tables)
-	{
-		if (strcmp(bt->relation->relname, rel->relname) == 0 &&
-			(bt->relation->schemaname == NULL || rel->schemaname == NULL ||
-			 strcmp(bt->relation->schemaname, rel->schemaname) == 0))
-			return bt;
-	}
-	return NULL;
-}
-
-static void
-forget_batch_table(RangeVar *rel)
-{
-	BatchTable *bt;
-
-	while ((bt = find_batch_table(rel)) != NULL)
-		batch_tables = list_delete_ptr(batch_tables, bt);
-}
-
-/* a key of a batch table: its columns and prefix key parts (prefix_key_parts()) */
-static void
-add_batch_key(BatchTable *bt, List *parts, bool primary)
-{
-	List	   *elems = NIL;
-
-	foreach_ptr(Node, part, parts)
-	{
-		IndexElem  *from = (IndexElem *) part;
-		IndexElem  *ie = makeNode(IndexElem);
-
-		if (IsA(part, String))
-			ie->name = strVal(part);
-		else if (IsA(part, IndexElem) && from->name)
-			ie->name = from->name;
-		else if (IsA(part, IndexElem) && from->indexcolname)
-		{
-			ie->expr = copyObject(from->expr);
-			ie->indexcolname = from->indexcolname;
-		}
-		else
-			return;				/* another expression: no MySQL key */
-		ie->ordering = SORTBY_DEFAULT;
-		ie->nulls_ordering = SORTBY_NULLS_DEFAULT;
-		elems = lappend(elems, ie);
-	}
-	if (primary)
-		bt->primary = elems;
-	else
-		bt->uniques = lappend(bt->uniques, elems);
-}
-
-static void
-add_batch_column(BatchTable *bt, ColumnDef *col)
-{
-	bool		generated = false;
-
-	foreach_ptr(Node, n, col->constraints)
-	{
-		Constraint *c = (Constraint *) n;
-
-		if (!IsA(n, Constraint))
-			continue;
-		if (c->contype == CONSTR_GENERATED)
-			generated = true;
-		else if (c->contype == CONSTR_PRIMARY || c->contype == CONSTR_UNIQUE)
-			add_batch_key(bt, list_make1(makeString(col->colname)),
-						  c->contype == CONSTR_PRIMARY);
-	}
-	if (!generated)
-		bt->columns = lappend(bt->columns, col->colname);
-}
-
-static void
-add_batch_constraint(BatchTable *bt, Constraint *c)
-{
-	if ((c->contype == CONSTR_PRIMARY || c->contype == CONSTR_UNIQUE) && !c->deferrable)
-		add_batch_key(bt, c->keys, c->contype == CONSTR_PRIMARY);
-}
-
-/* unique indexes that rewrite_create_stmt() / rewrite_alter_table() add */
-static void
-add_batch_indexes(BatchTable *bt, List *stmts)
-{
-	foreach_ptr(Node, n, stmts)
-	{
-		IndexStmt  *idx = (IndexStmt *) n;
-
-		if (IsA(n, IndexStmt) && idx->unique && idx->whereClause == NULL)
-			add_batch_key(bt, idx->indexParams, idx->primary);
-	}
-}
-
-/* CREATE TABLE (after rewrite_create_stmt(), which added extra) */
-static void
-remember_create_table(CreateStmt *stmt, List *extra)
-{
-	BatchTable *bt;
-
-	/* IF NOT EXISTS of a table that exists does nothing */
-	if (extra == NIL || (stmt->if_not_exists && find_batch_table(stmt->relation)))
-		return;
-	forget_batch_table(stmt->relation);
-	bt = palloc0(sizeof(BatchTable));
-	bt->relation = stmt->relation;
-	bt->known = stmt->inhRelations == NIL && stmt->partbound == NULL && stmt->ofTypename == NULL;
-	foreach_ptr(Node, elt, stmt->tableElts)
-	{
-		if (IsA(elt, ColumnDef))
-			add_batch_column(bt, (ColumnDef *) elt);
-		else if (IsA(elt, Constraint))
-			add_batch_constraint(bt, (Constraint *) elt);
-		else if (IsA(elt, TableLikeClause) && list_length(stmt->tableElts) == 1)
-		{
-			RangeVar   *source = ((TableLikeClause *) elt)->relation;
-			BatchTable *from = find_batch_table(source);
-
-			if (from)
-			{
-				*bt = *from;
-				bt->relation = stmt->relation;
-				bt->columns = list_copy(from->columns);
-				bt->uniques = list_copy(from->uniques);
-			}
-			else
-				bt->like = RangeVarGetRelid(source, NoLock, true);
-			bt->known = bt->known && (from || OidIsValid(bt->like));
-		}
-		else
-			bt->known = false;
-	}
-	add_batch_indexes(bt, extra);
-	batch_tables = lappend(batch_tables, bt);
-}
-
-/* ALTER TABLE of a batch table: added columns and keys */
-static void
-remember_alter_table(AlterTableStmt *stmt, List *extra)
-{
-	BatchTable *bt = find_batch_table(stmt->relation);
-
-	if (bt == NULL)
-		return;
-	foreach_ptr(AlterTableCmd, cmd, stmt->cmds)
-	{
-		if (cmd == NULL)
-			continue;
-		if (cmd->subtype == AT_AddColumn && cmd->def && IsA(cmd->def, ColumnDef))
-			add_batch_column(bt, (ColumnDef *) cmd->def);
-		else if (cmd->subtype == AT_AddConstraint && cmd->def && IsA(cmd->def, Constraint))
-			add_batch_constraint(bt, (Constraint *) cmd->def);
-		else
-			bt->known = false;
-	}
-	add_batch_indexes(bt, extra);
-}
-
-/*
  * ON DUPLICATE KEY UPDATE: a column name alone is the existing row's column
  * (VALUES(col), the new row's, is already EXCLUDED.col), which PostgreSQL
- * finds ambiguous between the table and EXCLUDED.  The grammar qualifies
- * the operands of a top-level operator; qualify the others too, but not
- * inside a subquery, which has tables of its own.
+ * finds ambiguous between the table and EXCLUDED.  Qualify unqualified
+ * column references (and original-table-qualified references when the target
+ * table carries an alias), except inside subqueries which have their own FROM.
  */
-static bool
-qualify_upsert_columns(Node *node, void *refname)
+typedef struct UpsertQualCtx
 {
+	const char *refname;
+	const char *relname;
+} UpsertQualCtx;
+
+static bool
+qualify_upsert_columns(Node *node, void *context)
+{
+	UpsertQualCtx *ctx = (UpsertQualCtx *) context;
+
 	if (node == NULL)
 		return false;
 	if (IsA(node, ColumnRef))
@@ -2382,12 +2214,19 @@ qualify_upsert_columns(Node *node, void *refname)
 		ColumnRef  *cref = (ColumnRef *) node;
 
 		if (list_length(cref->fields) == 1 && IsA(linitial(cref->fields), String))
-			cref->fields = lcons(makeString(pstrdup(refname)), cref->fields);
+			cref->fields = lcons(makeString(pstrdup(ctx->refname)), cref->fields);
+		else if (ctx->relname != NULL &&
+				 strcmp(ctx->refname, ctx->relname) != 0 &&
+				 pg_strcasecmp(ctx->relname, "excluded") != 0 &&
+				 list_length(cref->fields) == 2 &&
+				 IsA(linitial(cref->fields), String) &&
+				 strcmp(strVal(linitial(cref->fields)), ctx->relname) == 0)
+			linitial(cref->fields) = makeString(pstrdup(ctx->refname));
 		return false;
 	}
 	if (IsA(node, SubLink) || nodeTag(node) >= T_MysNodeBase)
 		return false;
-	return raw_expression_tree_walker(node, qualify_upsert_columns, refname);
+	return raw_expression_tree_walker(node, qualify_upsert_columns, ctx);
 }
 
 /* The executor reports the final physical row, including BEFORE triggers.
@@ -2403,11 +2242,10 @@ upsert_returning(void)
 }
 
 static void
-rewrite_upsert(InsertStmt *stmt, List *insert_cols, Relation rel, BatchTable *bt,
-			   MysStmtInfo *info)
+rewrite_upsert(InsertStmt *stmt, MysStmtInfo *info)
 {
 	OnConflictClause *oc = stmt->onConflictClause;
-	bool replace;
+	bool		replace;
 
 	if (oc == NULL || oc->infer != NULL || oc->whereClause != NULL ||
 		(oc->action != ONCONFLICT_UPDATE &&
@@ -2422,11 +2260,14 @@ rewrite_upsert(InsertStmt *stmt, List *insert_cols, Relation rel, BatchTable *bt
 		oc->targetList = NIL;
 	else
 	{
-		char *refname = stmt->relation->alias ? stmt->relation->alias->aliasname
+		UpsertQualCtx ctx;
+
+		ctx.refname = stmt->relation->alias ? stmt->relation->alias->aliasname
 			: stmt->relation->relname;
+		ctx.relname = stmt->relation->relname;
 
 		foreach_node(ResTarget, rt, oc->targetList)
-			qualify_upsert_columns(rt->val, refname);
+			qualify_upsert_columns(rt->val, &ctx);
 	}
 	if (info)
 	{
@@ -2442,20 +2283,15 @@ rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 	Oid			relid;
 	Relation	rel;
 	TupleDesc	tupdesc;
-	List	   *insert_cols = NIL;
 	OnConflictClause *oc = stmt->onConflictClause;
-	BatchTable *bt = find_batch_table(stmt->relation);
 	/* a RETURNING of the statement's own: no hidden one */
 	MysStmtInfo *hidden = stmt->returningClause == NULL ? info : NULL;
-
-	foreach_node(ResTarget, rt, stmt->cols)
-		insert_cols = lappend(insert_cols, rt->name);
 
 	relid = RangeVarGetRelid(stmt->relation, NoLock, true);
 	if (!OidIsValid(relid))
 	{
-		/* table created earlier in the same batch: just its keys */
-		rewrite_upsert(stmt, insert_cols, NULL, bt, hidden);
+		/* table created earlier in the same batch */
+		rewrite_upsert(stmt, hidden);
 		return;
 	}
 	rel = relation_open(relid, AccessShareLock);
@@ -2469,8 +2305,7 @@ rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 	if (oc && oc->action == ONCONFLICT_UPDATE)
 		literal_targets(oc->targetList, tupdesc);
 
-	/* ON DUPLICATE KEY UPDATE / REPLACE need an explicit arbiter in PG */
-	rewrite_upsert(stmt, insert_cols, rel, bt, hidden);
+	rewrite_upsert(stmt, hidden);
 
 	/*
 	 * hidden RETURNING of the AUTO_INCREMENT column for LAST_INSERT_ID(),
@@ -2486,9 +2321,12 @@ rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 			{
 				ReturningClause *rc = stmt->returningClause ? stmt->returningClause
 					: makeNode(ReturningClause);
+				char	   *refname = stmt->relation->alias ? stmt->relation->alias->aliasname
+					: stmt->relation->relname;
 
 				rc->exprs = lcons(make_target(NULL,
-											  make_colref(NULL, pstrdup(NameStr(att->attname)))),
+											  make_colref(pstrdup(refname),
+														  pstrdup(NameStr(att->attname)))),
 								  rc->exprs);
 				stmt->returningClause = rc;
 				stmt->returningInternal = true;
@@ -2501,6 +2339,165 @@ rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 	relation_close(rel, NoLock);	/* keep the lock until end of xact */
 }
 
+static bool
+cte_name_in_list(List *ctes, const char *name)
+{
+	foreach_ptr(char, cte, ctes)
+	{
+		if (pg_strcasecmp(cte, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+static void
+check_dml_rv_db_selected(RangeVar *rv, List *ctes)
+{
+	Oid			relid;
+
+	if (rv == NULL || rv->schemaname != NULL)
+		return;
+	if (pg_strcasecmp(rv->relname, "dual") == 0 || cte_name_in_list(ctes, rv->relname))
+		return;
+	if (rv->relpersistence == RELPERSISTENCE_TEMP)
+		return;
+	relid = RangeVarGetRelid(rv, NoLock, true);
+	if (OidIsValid(relid) && isTempNamespace(get_rel_namespace(relid)))
+		return;
+	ereport(ERROR,
+			(errcode(MYS_ERRCODE_NO_DB_ERROR),
+			 errmsg("No database selected")));
+}
+
+static bool
+check_dml_db_walker(Node *node, void *context)
+{
+	List	   *ctes = (List *) context;
+
+	if (node == NULL || nodeTag(node) >= T_MysNodeBase)
+		return false;
+	if (IsA(node, RangeVar))
+	{
+		check_dml_rv_db_selected((RangeVar *) node, ctes);
+		return false;
+	}
+	if (IsA(node, SelectStmt))
+	{
+		SelectStmt *sel = (SelectStmt *) node;
+		List	   *sub_ctes = list_copy(ctes);
+
+		if (sel->withClause)
+		{
+			foreach_node(CommonTableExpr, cte, sel->withClause->ctes)
+			{
+				if (sel->withClause->recursive)
+					sub_ctes = lappend(sub_ctes, cte->ctename);
+				check_dml_db_walker(cte->ctequery, sub_ctes);
+				if (!sel->withClause->recursive)
+					sub_ctes = lappend(sub_ctes, cte->ctename);
+			}
+		}
+		if (sel->op != SETOP_NONE)
+		{
+			check_dml_db_walker((Node *) sel->larg, sub_ctes);
+			check_dml_db_walker((Node *) sel->rarg, sub_ctes);
+			return false;
+		}
+		foreach_ptr(Node, from, sel->fromClause)
+			check_dml_db_walker(from, sub_ctes);
+		foreach_ptr(Node, tl, sel->targetList)
+			check_dml_db_walker(tl, sub_ctes);
+		check_dml_db_walker(sel->whereClause, sub_ctes);
+		check_dml_db_walker(sel->havingClause, sub_ctes);
+		return false;
+	}
+	if (IsA(node, RangeSubselect))
+		return check_dml_db_walker(((RangeSubselect *) node)->subquery, ctes);
+	if (IsA(node, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) node;
+
+		check_dml_db_walker(j->larg, ctes);
+		check_dml_db_walker(j->rarg, ctes);
+		check_dml_db_walker(j->quals, ctes);
+		return false;
+	}
+	if (IsA(node, SubLink))
+		return check_dml_db_walker(((SubLink *) node)->subselect, ctes);
+	return raw_expression_tree_walker(node, check_dml_db_walker, ctes);
+}
+
+static void
+check_dml_db_selected(Node *stmt)
+{
+	List	   *ctes = NIL;
+
+	if (IsA(stmt, SelectStmt))
+	{
+		check_dml_db_walker(stmt, NIL);
+	}
+	else if (IsA(stmt, InsertStmt))
+	{
+		InsertStmt *ins = (InsertStmt *) stmt;
+
+		if (ins->withClause)
+		{
+			foreach_node(CommonTableExpr, cte, ins->withClause->ctes)
+			{
+				if (ins->withClause->recursive)
+					ctes = lappend(ctes, cte->ctename);
+				check_dml_db_walker(cte->ctequery, ctes);
+				if (!ins->withClause->recursive)
+					ctes = lappend(ctes, cte->ctename);
+			}
+		}
+		check_dml_rv_db_selected(ins->relation, NIL);
+		check_dml_db_walker(ins->selectStmt, ctes);
+	}
+	else if (IsA(stmt, UpdateStmt))
+	{
+		UpdateStmt *upd = (UpdateStmt *) stmt;
+
+		if (upd->withClause)
+		{
+			foreach_node(CommonTableExpr, cte, upd->withClause->ctes)
+			{
+				if (upd->withClause->recursive)
+					ctes = lappend(ctes, cte->ctename);
+				check_dml_db_walker(cte->ctequery, ctes);
+				if (!upd->withClause->recursive)
+					ctes = lappend(ctes, cte->ctename);
+			}
+		}
+		check_dml_rv_db_selected(upd->relation, NIL);
+		foreach_ptr(Node, from, upd->fromClause)
+			check_dml_db_walker(from, ctes);
+		foreach_ptr(Node, tl, upd->targetList)
+			check_dml_db_walker(tl, ctes);
+		check_dml_db_walker(upd->whereClause, ctes);
+	}
+	else if (IsA(stmt, DeleteStmt))
+	{
+		DeleteStmt *del = (DeleteStmt *) stmt;
+
+		if (del->withClause)
+		{
+			foreach_node(CommonTableExpr, cte, del->withClause->ctes)
+			{
+				if (del->withClause->recursive)
+					ctes = lappend(ctes, cte->ctename);
+				check_dml_db_walker(cte->ctequery, ctes);
+				if (!del->withClause->recursive)
+					ctes = lappend(ctes, cte->ctename);
+			}
+		}
+		check_dml_rv_db_selected(del->relation, NIL);
+		foreach_ptr(Node, using_item, del->usingClause)
+			check_dml_db_walker(using_item, ctes);
+		check_dml_db_walker(del->whereClause, ctes);
+	}
+}
+
 /* ----------------------------------------------------------------
  * Entry point
  * ----------------------------------------------------------------
@@ -2511,10 +2508,10 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 	List	   *result = NIL;
 	ListCell   *lc;
 	bool		stop = false;
+	const char *batch_db = mys_selected_database();
 
 	*infos = NIL;
 	rewrite_warnings = NIL;
-	batch_tables = NIL;
 	foreach(lc, raw_stmts)
 	{
 		RawStmt    *rs = lfirst_node(RawStmt, lc);
@@ -2543,7 +2540,55 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 			}
 		}
 		mys_txn_classify(rs->stmt, info);
+		if (IsAbortedTransactionBlockState())
+		{
+			if (IsA(rs->stmt, MysVariableSetStmt))
+			{
+				rs->stmt = ((MysVariableSetStmt *) rs->stmt)->varSetStmt;
+				info->silent = true;
+			}
+			else if (IsA(rs->stmt, MysDoStmt))
+			{
+				SelectStmt *sel = makeNode(SelectStmt);
+
+				foreach_ptr(Node, expr, ((MysDoStmt *) rs->stmt)->exprs)
+					sel->targetList = lappend(sel->targetList, make_target(NULL, expr));
+				rs->stmt = (Node *) sel;
+				info->silent = true;
+			}
+			else if (IsA(rs->stmt, SelectStmt) &&
+					 rewrite_select_into_vars((SelectStmt *) rs->stmt))
+				info->silent = true;
+			result = lappend(result, rs);
+			*infos = lappend(*infos, info);
+			continue;
+		}
 		rs->stmt = mys_rewrite_show_create(rs->stmt);
+
+		if (mys_is_mysql_session() && halo_mysql_parser == MYS_PARSER_MYSQL)
+		{
+			if (IsA(rs->stmt, DoStmt) && ((DoStmt *) rs->stmt)->args != NIL &&
+				strcmp(linitial_node(DefElem, ((DoStmt *) rs->stmt)->args)->defname,
+					   "aux_mysql_use_db") == 0)
+			{
+				batch_db = strVal(linitial_node(DefElem, ((DoStmt *) rs->stmt)->args)->arg);
+			}
+			else if (IsA(rs->stmt, DropStmt) &&
+					 ((DropStmt *) rs->stmt)->removeType == OBJECT_SCHEMA &&
+					 batch_db != NULL)
+			{
+				foreach_ptr(Node, sname, ((DropStmt *) rs->stmt)->objects)
+				{
+					if (strcmp(strVal(sname), batch_db) == 0 ||
+						strcmp(strVal(sname), mys_catalog_schema_name(batch_db)) == 0)
+						batch_db = NULL;
+				}
+			}
+			else if (batch_db == NULL)
+			{
+				check_dml_db_selected(rs->stmt);
+			}
+		}
 
 		/* CREATE TABLE ... AS / CREATE VIEW: a literal 0x.. column is VARBINARY */
 		if (IsA(rs->stmt, CreateTableAsStmt))
@@ -2599,7 +2644,6 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 				break;
 			case T_CreateStmt:
 				extra = rewrite_create_stmt((CreateStmt *) rs->stmt);
-				remember_create_table((CreateStmt *) rs->stmt, extra);
 				break;
 			case T_RenameStmt:
 				{
@@ -2609,26 +2653,49 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 					if (rename->renameType == OBJECT_TABLE && rename->object &&
 						IsA(rename->object, RangeVar))
 					{
-						RangeVar *target = (RangeVar *) rename->object;
+						RangeVar   *target = (RangeVar *) rename->object;
+						const char *src_schema = rename->relation->schemaname ?
+							rename->relation->schemaname :
+							(batch_db ? mys_catalog_schema_name(batch_db) : NULL);
 
 						rename->newname = target->relname;
 						rename->object = NULL;
-						if (target->schemaname)
+						if (target->schemaname &&
+							(src_schema == NULL || strcmp(src_schema, target->schemaname) != 0))
 						{
 							AlterObjectSchemaStmt *move = makeNode(AlterObjectSchemaStmt);
 
 							move->objectType = OBJECT_TABLE;
 							move->relation = copyObject(rename->relation);
-							move->relation->relname = target->relname;
 							move->newschema = target->schemaname;
 							move->missing_ok = rename->missing_ok;
-							extra = list_make1(move);
+							if (strcmp(rename->relation->relname, target->relname) == 0)
+							{
+								rs->stmt = (Node *) move;
+							}
+							else
+							{
+								Oid		dst_nsp = !IsAbortedTransactionBlockState() ?
+									get_namespace_oid(target->schemaname, true) : InvalidOid;
+								bool	dst_has_oldname = OidIsValid(dst_nsp) &&
+									OidIsValid(get_relname_relid(rename->relation->relname, dst_nsp));
+
+								if (!dst_has_oldname)
+								{
+									RenameStmt *rn2 = copyObject(rename);
+
+									rn2->relation->schemaname = pstrdup(target->schemaname);
+									rs->stmt = (Node *) move;
+									extra = list_make1(rn2);
+								}
+								else
+								{
+									move->relation->relname = target->relname;
+									extra = list_make1(move);
+								}
+							}
 						}
 					}
-					if (rename->relation && rename->renameType == OBJECT_TABLE)
-						forget_batch_table(rename->relation);
-					else if (rename->relation && find_batch_table(rename->relation))
-						find_batch_table(rename->relation)->known = false;
 					break;
 				}
 			case T_InsertStmt:
@@ -2646,16 +2713,20 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 					break;
 				}
 			case T_UpdateStmt:
+				info->ignore = ((UpdateStmt *) rs->stmt)->ignoreFailure;
 				rewrite_update_stmt((UpdateStmt *) rs->stmt);
 				info->is_write = true;
 				foreach_node(ResTarget, rt, ((UpdateStmt *) rs->stmt)->targetList)
 					info->update_cols = lappend(info->update_cols, rt->name);
 				break;
+			case T_DeleteStmt:
+				info->ignore = ((DeleteStmt *) rs->stmt)->ignoreFailure;
+				info->is_write = true;
+				break;
 			case T_IndexStmt:
 				{
 					IndexStmt  *idx = (IndexStmt *) rs->stmt;
 					char	   *lookup;
-					BatchTable *bt;
 					KeyNamer	kn;
 
 					init_key_namer(&kn, idx->relation, false, true);
@@ -2667,39 +2738,10 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 					if (lookup)
 						extra = add_lookup_indexes(NIL, list_make1(make_lookup_index(idx->relation, lookup)),
 												   &kn);
-					if ((bt = find_batch_table(idx->relation)) != NULL)
-						add_batch_indexes(bt, list_make1(idx));
 					break;
 				}
-			case T_CreateTableAsStmt:
-				{
-					CreateTableAsStmt *ctas = (CreateTableAsStmt *) rs->stmt;
-
-					/* a table without keys */
-					if (ctas->objtype == OBJECT_TABLE &&
-						!(ctas->if_not_exists &&
-						  (find_batch_table(ctas->into->rel) ||
-						   OidIsValid(RangeVarGetRelid(ctas->into->rel, NoLock, true)))))
-					{
-						BatchTable *bt = palloc0(sizeof(BatchTable));
-
-						forget_batch_table(ctas->into->rel);
-						bt->relation = ctas->into->rel;
-						bt->known = true;
-						batch_tables = lappend(batch_tables, bt);
-					}
-					break;
-				}
-			case T_DropStmt:
-				if (((DropStmt *) rs->stmt)->removeType == OBJECT_TABLE)
-				{
-					foreach_node(List, names, ((DropStmt *) rs->stmt)->objects)
-						forget_batch_table(makeRangeVarFromNameList(names));
-				}
-				break;
 			case T_AlterTableStmt:
 				extra = rewrite_alter_table((AlterTableStmt *) rs->stmt);
-				remember_alter_table((AlterTableStmt *) rs->stmt, extra);
 				if (((AlterTableStmt *) rs->stmt)->cmds == NIL && extra != NIL)
 				{
 					/* nothing left but the indexes */
@@ -2738,6 +2780,5 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 		if (stop)
 			break;
 	}
-	batch_tables = NIL;
 	return result;
 }

@@ -7213,6 +7213,7 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 	if (!onconflict)
 	{
 		node->onConflictAction = ONCONFLICT_NONE;
+		node->onConflictIgnore = root->parse->ignoreFailure;
 		node->onConflictSet = NIL;
 		node->onConflictCols = NIL;
 		node->onConflictWhere = NULL;

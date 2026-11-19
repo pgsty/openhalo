@@ -1,14 +1,15 @@
 /*-------------------------------------------------------------------------
  *
  * mys_parsenodes.h
- *		Definitions for the "mys" parser (flex and bison phases only)
+ *	  Definitions for the MySQL-compatible parser (flex and bison phases)
  *
- * Portions Copyright (c) 2021, Jet C.X. ZHANG
  * Portions Copyright (c) 2026, PGSTY PTE. LTD.
  * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Portions Copyright (c) 2021, Jet C.X. ZHANG
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
  *
- * src/include/parser/mysql/mys_parsenodes.h
+ * IDENTIFICATION
+ *	  contrib/aux_mysql/src/parser/mys_parsenodes.h
  *
  *-------------------------------------------------------------------------
  */
@@ -54,46 +55,40 @@
 
 #define ONCONFLICT_REPLACE		((OnConflictAction) 1000)
 
-
 typedef struct UserVarRef
 {
-    NodeTag type;
-    char *userVarName;
-    int location;
+	NodeTag		type;
+	char	   *userVarName;
+	int			location;
 } UserVarRef;
-
 
 typedef struct UserVarAssign
 {
-    NodeTag type;
-    char *userVarName;
-    Node *expr;
-    int location;
+	NodeTag		type;
+	char	   *userVarName;
+	Node	   *expr;
+	int			location;
 } UserVarAssign;
-
 
 typedef struct SysVarRef
 {
-    NodeTag type;
-    char *sysVarName;
-    int location;
+	NodeTag		type;
+	char	   *sysVarName;
+	int			location;
 } SysVarRef;
-
 
 typedef struct MysVariableSetStmt
 {
-    NodeTag type;
-    Node *varSetStmt;   /* 目前是SelectStmt */
+	NodeTag		type;
+	Node	   *varSetStmt;		/* SelectStmt */
 } MysVariableSetStmt;
-
 
 typedef struct MysSelectIntoStmt
 {
-    NodeTag type;
-    List *target;
-    Node *expr;   /* 目前是SelectStmt */
+	NodeTag		type;
+	List	   *target;
+	Node	   *expr;			/* SelectStmt */
 } MysSelectIntoStmt;
-
 
 /* DO expr [, expr] ...: evaluate the expressions, discard the values */
 typedef struct MysDoStmt
@@ -101,6 +96,5 @@ typedef struct MysDoStmt
 	NodeTag		type;
 	List	   *exprs;
 } MysDoStmt;
-
 
 #endif							/* MYS_PARSENODES_H */

@@ -57,14 +57,26 @@
 
 /* MySQL's NAME_CHAR_LEN: the longest lock name, in characters */
 #define MYS_LOCK_NAME_CHARS		64
+#define MYS_LOCK_MAX_BYTES		(MYS_LOCK_NAME_CHARS * 4)
 
 /* deadlock_timeout (ms) while GET_LOCK() waits */
 #define MYS_LOCK_DEADLOCK_TIMEOUT	10
 
-/* locks of this session: how many times each one is held */
+/*
+ * Key in the per-session lock table: stores the full normalized lock name
+ * (zero-padded) so two distinct names with the same 64-bit hash never alias
+ * in session accounting.
+ */
+typedef struct UserLockKey
+{
+	uint16		len;
+	char		bytes[MYS_LOCK_MAX_BYTES];
+} UserLockKey;
+
 typedef struct UserLock
 {
-	uint64		key;			/* hash key */
+	UserLockKey key;			/* hash key */
+	uint64		adv_key;		/* 64-bit advisory lock hash */
 	int64		count;
 } UserLock;
 
@@ -111,7 +123,7 @@ any_arg_bytes(FunctionCallInfo fcinfo, int argno, int *len, bool *binary)
 	}
 	if (base == BPCHAROID)
 	{
-		bytea *b = mys_bpchar_bytes(PG_GETARG_DATUM(argno));
+		bytea	   *b = mys_bpchar_bytes(PG_GETARG_DATUM(argno));
 
 		*len = VARSIZE_ANY_EXHDR(b);
 		return VARDATA_ANY(b);
@@ -140,11 +152,12 @@ any_arg_bytes(FunctionCallInfo fcinfo, int argno, int *len, bool *binary)
 }
 
 /*
- * Lock tag of the lock named by argument argno; *key gets the hash key.
+ * Lock tag and normalized session key of the lock named by argument argno.
  * NULL, empty and longer than 64 characters are not lock names.
  */
 static void
-user_lock_tag(FunctionCallInfo fcinfo, int argno, LOCKTAG *tag, uint64 *key)
+user_lock_tag(FunctionCallInfo fcinfo, int argno, LOCKTAG *tag,
+			  UserLockKey *ukey, uint64 *adv_key)
 {
 	char	   *name;
 	char	   *lower;
@@ -166,16 +179,18 @@ user_lock_tag(FunctionCallInfo fcinfo, int argno, LOCKTAG *tag, uint64 *key)
 	/* lower case: 'Lock' and 'lock' are one lock, 'Straße' is not 'STRASSE' */
 	if (!binary && GetDatabaseEncoding() == PG_UTF8)
 	{
-		int n = 0;
+		int			n = 0;
 
-		/* unicode_strlower() also stops at NUL. Simple case conversion is
-		 * one codepoint at a time, including U+0000 and every suffix byte.
-		 * The already checked name has at most 64 characters, four bytes
-		 * each after case conversion. */
+		/*
+		 * unicode_strlower() also stops at NUL. Simple case conversion is one
+		 * codepoint at a time, including U+0000 and every suffix byte. The
+		 * already checked name has at most 64 characters, four bytes each
+		 * after case conversion.
+		 */
 		lower = palloc(nchars * 4);
 		for (int i = 0; i < len; i += pg_utf_mblen((const unsigned char *) name + i))
 		{
-			pg_wchar code = utf8_to_unicode((const unsigned char *) name + i);
+			pg_wchar	code = utf8_to_unicode((const unsigned char *) name + i);
 
 			unicode_to_utf8(unicode_lowercase_simple(code), (unsigned char *) lower + n);
 			n += pg_utf_mblen((const unsigned char *) lower + n);
@@ -189,9 +204,16 @@ user_lock_tag(FunctionCallInfo fcinfo, int argno, LOCKTAG *tag, uint64 *key)
 			lower[i] = pg_ascii_tolower((unsigned char) name[i]);
 	}
 
-	*key = hash_bytes_extended((const unsigned char *) lower, len, 0);
-	SET_LOCKTAG_ADVISORY(*tag, MyDatabaseId, (uint32) (*key >> 32),
-						 (uint32) *key, MYS_USER_LOCK_SPACE);
+	if (len > MYS_LOCK_MAX_BYTES)
+		wrong_lock_name(pnstrdup(name, binary ? Min(len, 192) : pg_mbcliplen(name, len, 192)));
+
+	memset(ukey, 0, sizeof(UserLockKey));
+	ukey->len = (uint16) len;
+	memcpy(ukey->bytes, lower, len);
+
+	*adv_key = hash_bytes_extended((const unsigned char *) lower, len, 0);
+	SET_LOCKTAG_ADVISORY(*tag, MyDatabaseId, (uint32) (*adv_key >> 32),
+						 (uint32) *adv_key, MYS_USER_LOCK_SPACE);
 }
 
 /*
@@ -270,11 +292,9 @@ timeout_arg(FunctionCallInfo fcinfo, int argno)
 			{
 				int			len;
 				bool		binary;
-				/* Read the length before using it; argument evaluation order
-				 * cannot sequence any_arg_bytes(...,&len) and pnstrdup(...,len).
-				 * Keep an end pointer so NUL suffixes are diagnosed as well. */
 				const char *s = any_arg_bytes(fcinfo, argno, &len, &binary);
-				const char *p = s, *end = s + len;
+				const char *p = s,
+						   *end = s + len;
 				bool		neg = false;
 				bool		digits = false;
 				uint64		v = 0;
@@ -303,7 +323,7 @@ timeout_arg(FunctionCallInfo fcinfo, int argno)
 }
 
 static UserLock *
-user_lock_entry(uint64 key, bool create)
+user_lock_entry(const UserLockKey *ukey, uint64 adv_key, bool create)
 {
 	if (user_locks == NULL)
 	{
@@ -311,7 +331,7 @@ user_lock_entry(uint64 key, bool create)
 
 		if (!create)
 			return NULL;
-		ctl.keysize = sizeof(uint64);
+		ctl.keysize = sizeof(UserLockKey);
 		ctl.entrysize = sizeof(UserLock);
 		ctl.hcxt = TopMemoryContext;
 		user_locks = hash_create("aux_mysql user locks", 16, &ctl,
@@ -320,13 +340,16 @@ user_lock_entry(uint64 key, bool create)
 	if (create)
 	{
 		bool		found;
-		UserLock   *l = hash_search(user_locks, &key, HASH_ENTER, &found);
+		UserLock   *l = hash_search(user_locks, ukey, HASH_ENTER, &found);
 
 		if (!found)
+		{
+			l->adv_key = adv_key;
 			l->count = 0;
+		}
 		return l;
 	}
-	return hash_search(user_locks, &key, HASH_FIND, NULL);
+	return hash_search(user_locks, ukey, HASH_FIND, NULL);
 }
 
 /*
@@ -334,13 +357,13 @@ user_lock_entry(uint64 key, bool create)
  * gone (pg_advisory_unlock_all(), DISCARD ALL) is dropped.
  */
 static UserLock *
-held_user_lock(uint64 key, const LOCKTAG *tag)
+held_user_lock(const UserLockKey *ukey, const LOCKTAG *tag)
 {
-	UserLock   *l = user_lock_entry(key, false);
+	UserLock   *l = user_lock_entry(ukey, 0, false);
 
 	if (l != NULL && !LockHeldByMe(tag, ExclusiveLock, false))
 	{
-		hash_search(user_locks, &key, HASH_REMOVE, NULL);
+		hash_search(user_locks, ukey, HASH_REMOVE, NULL);
 		l = NULL;
 	}
 	return l;
@@ -368,15 +391,19 @@ user_lock_holder(const LOCKTAG *tag)
 			break;
 		}
 	}
+	if (data->locks)
+		pfree(data->locks);
+	pfree(data);
 	return pid;
 }
 
 /*
  * Wait up to timeout seconds (forever if negative) for a lock that another
- * session holds.  Returns whether the lock was acquired.
+ * session holds.  Returns whether the lock was acquired; entry is already
+ * pre-allocated in user_locks so accounting cannot fail with OOM.
  */
 static bool
-wait_for_user_lock(const LOCKTAG *tag, int64 timeout)
+wait_for_user_lock(const LOCKTAG *tag, int64 timeout, UserLock *entry)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
@@ -387,8 +414,10 @@ wait_for_user_lock(const LOCKTAG *tag, int64 timeout)
 	PG_TRY();
 	{
 		/* GUC_ACTION_SAVE: the subtransaction ends both settings */
-		if (timeout < 0 || timeout > INT_MAX / 1000)
+		if (timeout < 0)
 			strcpy(buf, "0");
+		else if (timeout >= INT_MAX / 1000)
+			snprintf(buf, sizeof(buf), "%d", INT_MAX);
 		else
 			snprintf(buf, sizeof(buf), "%d", (int) timeout * 1000);
 		(void) set_config_option("lock_timeout", buf, PGC_USERSET, PGC_S_SESSION,
@@ -421,18 +450,27 @@ wait_for_user_lock(const LOCKTAG *tag, int64 timeout)
 		/* granted just as the wait ended: the session holds the lock */
 		held = LockHeldByMe(tag, ExclusiveLock, false);
 		if (edata->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE)
+		{
+			FreeErrorData(edata);
 			return held;
+		}
 		if (held)
 		{
 			/* the statement fails, the session keeps the lock, as in MySQL */
-			uint64		key = ((uint64) tag->locktag_field2 << 32) | tag->locktag_field3;
-
-			user_lock_entry(key, true)->count++;
+			entry->count++;
 		}
-		else if (edata->sqlerrcode == ERRCODE_T_R_DEADLOCK_DETECTED)
-			ereport(ERROR,
-					(errcode(ERRCODE_MYS_USER_LOCK_DEADLOCK),
-					 errmsg("Deadlock found when trying to get user-level lock; try rolling back transaction/releasing locks and restarting lock acquisition.")));
+		else
+		{
+			if (entry->count <= 0)
+				hash_search(user_locks, &entry->key, HASH_REMOVE, NULL);
+			if (edata->sqlerrcode == ERRCODE_T_R_DEADLOCK_DETECTED)
+			{
+				FreeErrorData(edata);
+				ereport(ERROR,
+						(errcode(ERRCODE_MYS_USER_LOCK_DEADLOCK),
+						 errmsg("Deadlock found when trying to get user-level lock; try rolling back transaction/releasing locks and restarting lock acquisition.")));
+			}
+		}
 		ReThrowError(edata);
 	}
 	PG_END_TRY();
@@ -447,16 +485,25 @@ Datum
 mys_get_lock(PG_FUNCTION_ARGS)
 {
 	LOCKTAG		tag;
-	uint64		key;
+	UserLockKey ukey;
+	uint64		adv_key;
 	int64		timeout;
+	UserLock   *entry;
 
-	user_lock_tag(fcinfo, 0, &tag, &key);
+	user_lock_tag(fcinfo, 0, &tag, &ukey, &adv_key);
 	timeout = timeout_arg(fcinfo, 1);
-	(void) held_user_lock(key, &tag);	/* drop a stale entry */
+	(void) held_user_lock(&ukey, &tag); /* drop a stale entry */
+
+	/* Pre-allocate entry before acquiring session lock to avoid OOM leak */
+	entry = user_lock_entry(&ukey, adv_key, true);
 	if (LockAcquire(&tag, ExclusiveLock, true, true) == LOCKACQUIRE_NOT_AVAIL &&
-		(timeout == 0 || !wait_for_user_lock(&tag, timeout)))
+		(timeout == 0 || !wait_for_user_lock(&tag, timeout, entry)))
+	{
+		if (entry->count <= 0)
+			hash_search(user_locks, &ukey, HASH_REMOVE, NULL);
 		PG_RETURN_INT64(0);
-	user_lock_entry(key, true)->count++;
+	}
+	entry->count++;
 	PG_RETURN_INT64(1);
 }
 
@@ -468,16 +515,17 @@ Datum
 mys_release_lock(PG_FUNCTION_ARGS)
 {
 	LOCKTAG		tag;
-	uint64		key;
+	UserLockKey ukey;
+	uint64		adv_key;
 	UserLock   *l;
 
-	user_lock_tag(fcinfo, 0, &tag, &key);
-	l = held_user_lock(key, &tag);
+	user_lock_tag(fcinfo, 0, &tag, &ukey, &adv_key);
+	l = held_user_lock(&ukey, &tag);
 	if (l != NULL)
 	{
 		LockRelease(&tag, ExclusiveLock, true);
 		if (--l->count <= 0)
-			hash_search(user_locks, &key, HASH_REMOVE, NULL);
+			hash_search(user_locks, &ukey, HASH_REMOVE, NULL);
 		PG_RETURN_INT64(1);
 	}
 	if (user_lock_holder(&tag) != 0)
@@ -490,10 +538,11 @@ Datum
 mys_is_free_lock(PG_FUNCTION_ARGS)
 {
 	LOCKTAG		tag;
-	uint64		key;
+	UserLockKey ukey;
+	uint64		adv_key;
 
-	user_lock_tag(fcinfo, 0, &tag, &key);
-	if (held_user_lock(key, &tag) != NULL || user_lock_holder(&tag) != 0)
+	user_lock_tag(fcinfo, 0, &tag, &ukey, &adv_key);
+	if (held_user_lock(&ukey, &tag) != NULL || user_lock_holder(&tag) != 0)
 		PG_RETURN_INT64(0);
 	PG_RETURN_INT64(1);
 }
@@ -503,11 +552,12 @@ Datum
 mys_is_used_lock(PG_FUNCTION_ARGS)
 {
 	LOCKTAG		tag;
-	uint64		key;
+	UserLockKey ukey;
+	uint64		adv_key;
 	int			pid;
 
-	user_lock_tag(fcinfo, 0, &tag, &key);
-	if (held_user_lock(key, &tag) != NULL)
+	user_lock_tag(fcinfo, 0, &tag, &ukey, &adv_key);
+	if (held_user_lock(&ukey, &tag) != NULL)
 		PG_RETURN_INT64(MyProcPid);
 	pid = user_lock_holder(&tag);
 	if (pid == 0)
@@ -530,8 +580,8 @@ mys_release_user_locks(void)
 	{
 		LOCKTAG		tag;
 
-		SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, (uint32) (l->key >> 32),
-							 (uint32) l->key, MYS_USER_LOCK_SPACE);
+		SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, (uint32) (l->adv_key >> 32),
+							 (uint32) l->adv_key, MYS_USER_LOCK_SPACE);
 		for (; l->count > 0 && LockHeldByMe(&tag, ExclusiveLock, false); l->count--)
 		{
 			LockRelease(&tag, ExclusiveLock, true);

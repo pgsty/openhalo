@@ -145,6 +145,7 @@ static void addlit(char *ytext, int yleng, core_yyscan_t yyscanner);
 static void addlitchar(unsigned char ychar, core_yyscan_t yyscanner);
 static char *litbufdup(core_yyscan_t yyscanner);
 static bool literal_needs_binary(core_yyscan_t yyscanner);
+static bool has_literal_after_introducer(core_yyscan_t yyscanner);
 //static void decStrToHexStr(core_yyscan_t yyscanner, char *result);
 static unsigned char unescape_single_char(unsigned char c, core_yyscan_t yyscanner);
 static int	process_integer_literal(const char *token, YYSTYPE *lval);
@@ -586,12 +587,14 @@ other			.
 
 {mys0bbit}        {
 					SET_YYLLOC();
+                    MYS_YYEXTRA(yyextra)->saw_underscore_binary = false;
                     yylval->str = pstrdup(yytext + 1);
                     return BCONST;
                 }
 
 {mys0hbit}      {
 					SET_YYLLOC();
+                    MYS_YYEXTRA(yyextra)->saw_underscore_binary = false;
                     yylval->str = pstrdup(yytext + 1);
                     return XCONST;
                 }
@@ -952,10 +955,7 @@ other			.
 					BEGIN(INITIAL);
 					if (yyextra->literallen == 0)
 						yyerror("zero-length delimited identifier");
-					// ident = litbufdup(yyscanner);
-					// if (yyextra->literallen >= NAMEDATALEN)
-					// 	truncate_identifier(ident, yyextra->literallen, true);
-
+					pg_verifymbstr(yyextra->literalbuf, yyextra->literallen, false);
                     ident = downcase_truncate_identifier(yyextra->literalbuf, yyextra->literallen, true);
 					yylval->str = ident;
 					return IDENT;
@@ -1295,25 +1295,24 @@ other			.
 					 */
 					ident = downcase_truncate_identifier(yytext, yyleng, true);
 
-                    if (strncasecmp(ident, "_binary", 7) != 0)
-                    {
-                        if (strncasecmp(ident, "_utf8mb4", 8) != 0)
-                        {
-                            yylval->str = ident;
-                            return IDENT;
-                        }
-                        else
-                        {
-                            /* do not return; */
-                        }
-                    }
-                    else
-                    {
-                        MYS_YYEXTRA(yyextra)->saw_underscore_binary = true;
-                        return UNDERSCORE_BINARY;
-                    }
-                    // yylval->str = ident;
-					// return IDENT;
+					if (strcmp(ident, "_binary") == 0 &&
+						has_literal_after_introducer(yyscanner))
+					{
+						MYS_YYEXTRA(yyextra)->saw_underscore_binary = true;
+						return UNDERSCORE_BINARY;
+					}
+					if ((strcmp(ident, "_utf8mb4") == 0 ||
+						 strcmp(ident, "_utf8mb3") == 0 ||
+						 strcmp(ident, "_utf8") == 0) &&
+						has_literal_after_introducer(yyscanner))
+					{
+						/* UTF-8 character set introducer: ignore */
+					}
+					else
+					{
+						yylval->str = ident;
+						return IDENT;
+					}
 				}
 
 {other}			{
@@ -1776,4 +1775,72 @@ mys_make_pl_block_str(core_yyscan_t yyscanner, int start)
     char *end_p = yyextra->scanbuf + *yylloc + yyleng;
 
     return pnstrdup(start_p, (int)(end_p - start_p));
+}
+
+/*
+ * Check whether the text following the current identifier token (ignoring
+ * whitespace and ordinary block comments) starts a string, hex, or bit
+ * literal, distinguishing MySQL character-set introducers (_binary 'x',
+ * _utf8mb4'x') from regular identifiers/columns named _binary or _utf8mb4.
+ */
+static bool
+has_literal_after_introducer(core_yyscan_t yyscanner)
+{
+	struct yyguts_t *yyg = (struct yyguts_t *) yyscanner;
+	const char *buf = yyextra->scanbuf;
+	Size		len = yyextra->scanbuflen;
+	Size		hold_idx = (Size) ((yytext - buf) + yyleng);
+	Size		i = hold_idx;
+
+#define PEEK_CHAR(pos) ((pos) == hold_idx ? yyg->yy_hold_char : buf[(pos)])
+
+	while (i < len)
+	{
+		char		c = PEEK_CHAR(i);
+
+		if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f')
+		{
+			i++;
+			continue;
+		}
+		if (i + 1 < len && c == '/' && PEEK_CHAR(i + 1) == '*' &&
+			!(i + 2 < len && PEEK_CHAR(i + 2) == '!'))
+		{
+			i += 2;
+			while (i + 1 < len && !(PEEK_CHAR(i) == '*' && PEEK_CHAR(i + 1) == '/'))
+				i++;
+			if (i + 1 < len)
+			{
+				i += 2;
+				continue;
+			}
+			return false;
+		}
+		break;
+	}
+	if (i >= len)
+		return false;
+
+	{
+		char		c0 = PEEK_CHAR(i);
+
+		if (c0 == '\'' || c0 == '"')
+			return true;
+		if ((c0 == 'x' || c0 == 'X' || c0 == 'b' || c0 == 'B') &&
+			i + 1 < len && PEEK_CHAR(i + 1) == '\'')
+			return true;
+		if (c0 == '0' && i + 2 < len)
+		{
+			char		c1 = PEEK_CHAR(i + 1);
+			char		c2 = PEEK_CHAR(i + 2);
+
+			if ((c1 == 'x' || c1 == 'X') && isxdigit((unsigned char) c2))
+				return true;
+			if ((c1 == 'b' || c1 == 'B') && (c2 == '0' || c2 == '1'))
+				return true;
+		}
+	}
+
+#undef PEEK_CHAR
+	return false;
 }

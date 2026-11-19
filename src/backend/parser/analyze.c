@@ -559,6 +559,7 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	Node	   *qual;
 
 	qry->commandType = CMD_DELETE;
+	qry->ignoreFailure = stmt->ignoreFailure;
 
 	/* process the WITH clause independently of all else */
 	if (stmt->withClause)
@@ -2533,6 +2534,7 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 	Node	   *qual;
 
 	qry->commandType = CMD_UPDATE;
+	qry->ignoreFailure = stmt->ignoreFailure;
 	pstate->p_is_insert = false;
 
 	/* process the WITH clause independently of all else */

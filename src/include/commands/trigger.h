@@ -263,6 +263,9 @@ extern void ExecASTruncateTriggers(EState *estate,
 
 extern void AfterTriggerBeginXact(void);
 extern bool RI_FKey_check_insert(Relation rel, TupleTableSlot *slot);
+extern bool RI_FKey_check_update(Relation rel, TupleTableSlot *oldslot,
+								 TupleTableSlot *newslot);
+extern bool RI_FKey_check_delete(Relation rel, TupleTableSlot *oldslot);
 extern void AfterTriggerBeginQuery(void);
 extern void AfterTriggerEndQuery(EState *estate);
 extern void AfterTriggerFireDeferred(void);

@@ -1,50 +1,11 @@
 /*-------------------------------------------------------------------------
  *
  * user_var.c
- *	  Extend user_var routines
+ *	  MySQL user variable (@var) casts, comparisons, and operators
  *
- * 
- * 版权所有 (c) 2019-2025, 易景科技保留所有权利。
- * Copyright (c) 2019-2025, Halo Tech Co.,Ltd. All rights reserved.
- * 版权所有 (c) 2026, PGSTY PTE. LTD. 保留所有权利。
- * Copyright (c) 2026, PGSTY PTE. LTD. All rights reserved.
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
- * 
- * 易景科技是Halo Database、Halo Database Management System、羲和数据
- * 库、羲和数据库管理系统（后面简称 Halo ）、openHalo软件的发明人同时也为
- * 知识产权权利人。Halo 软件的知识产权，以及与本软件相关的所有信息内容（包括
- * 但不限于文字、图片、音频、视频、图表、界面设计、版面框架、有关数据或电子文
- * 档等）均受中华人民共和国法律法规和相应的国际条约保护，易景科技享有上述知识
- * 产权，但相关权利人依照法律规定应享有的权利除外。未免疑义，本条所指的“知识
- * 产权”是指任何及所有基于 Halo 软件产生的：（a）版权、商标、商号、域名、与
- * 商标和商号相关的商誉、设计和专利；与创新、技术诀窍、商业秘密、保密技术、非
- * 技术信息相关的权利；（b）人身权、掩模作品权、署名权和发表权；以及（c）在
- * 本协议生效之前已存在或此后出现在世界任何地方的其他工业产权、专有权、与“知
- * 识产权”相关的权利，以及上述权利的所有续期和延长，无论此类权利是否已在相
- * 关法域内的相关机构注册。
- *
- * This software and related documentation are provided under a license
- * agreement containing restrictions on use and disclosure and are 
- * protected by intellectual property laws. Except as expressly permitted
- * in your license agreement or allowed by law, you may not use, copy, 
- * reproduce, translate, broadcast, modify, license, transmit, distribute,
- * exhibit, perform, publish, or display any part, in any form, or by any
- * means. Reverse engineering, disassembly, or decompilation of this 
- * software, unless required by law for interoperability, is prohibited.
- * 
- * This software is developed for general use in a variety of
- * information management applications. It is not developed or intended
- * for use in any inherently dangerous applications, including applications
- * that may create a risk of personal injury. If you use this software or
- * in dangerous applications, then you shall be responsible to take all
- * appropriate fail-safe, backup, redundancy, and other measures to ensure
- * its safe use. Halo Corporation and its affiliates disclaim any 
- * liability for any damages caused by use of this software in dangerous
- * applications.
- * 
- *
- * IDENTIFICATION
- *	  src/backend/utils/ddsm/mysm/user_var.c
  *
  *-------------------------------------------------------------------------
  */
@@ -52,11 +13,14 @@
 #include "postgres.h"
 #include "mysm_compat.h"
 #include "halo_mysql.h"
-#include "nodes/nodes.h"
-#include "catalog/pg_type.h"
 
+#include "adapter/mysql/adapter.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_type.h"
+#include "commands/mysql/mys_uservar.h"
 #include "fmgr.h"
 #include "mb/pg_wchar.h"
+#include "nodes/nodes.h"
 #include "utils/builtins.h"
 #include "utils/bytea.h"
 #include "utils/date.h"
@@ -67,529 +31,417 @@
 #include "utils/numeric.h"
 #include "utils/timestamp.h"
 #include "utils/varbit.h"
-#include "commands/mysql/mys_uservar.h"
 
+typedef enum MysCmpOp
+{
+	MYS_CMP_EQ = 0,
+	MYS_CMP_NE,
+	MYS_CMP_LT,
+	MYS_CMP_LE,
+	MYS_CMP_GT,
+	MYS_CMP_GE
+} MysCmpOp;
 
-#define COLLATION 100
-
-
-static Oid getParameterType(FmgrInfo *fmgrinfo, int parmIndex);
-static Datum anycompatibleEqBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleNeBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleCondAndBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleCondOrBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleLikeBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleNlikeBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleRegexpBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum byteaRegexpAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleNregexpBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum byteaNregexpAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleRegexpbinBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum byteaRegexpbinAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleNregexpbinBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum byteaNregexpbinAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleLtBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleLeBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleGtBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleGeBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatiblePlBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleMiBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum byteaMiAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleMulBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleDivBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum byteaDivAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleModBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum byteaModAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleAndBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-static Datum anycompatibleOrBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val);
-
-/* static void truncateStrForDigit(size_t strLen, char *str); */
-static void truncateStrTailWhileSpacesForDigit(size_t strLen, char *str);
+static Oid	getParameterType(FmgrInfo *fmgrinfo, int parmIndex);
+static bool evalCmpResult(int32 cmp, MysCmpOp op);
+static Datum anycompatibleCmpBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val,
+								   MysCmpOp op, Oid collid);
+static Datum byteaCmpBytea(Datum d0, Datum d1, MysCmpOp op);
 static Datum convertParameterToText(Oid parmType, Datum parmVal);
 static Datum convertParameterToNumeric(Oid parmType, Datum parm);
 static Datum convertParameterToInt8(Oid parmType, Datum parm);
 static Datum bytea2int8_internal(bytea *vlena);
 static Datum bytea2numeric_internal(bytea *vlena);
 static char *AppendSeconds(char *cp, int sec, fsec_t fsec, int precision, bool fillzeros);
+static void format_time_numeric_str(TimeADT timeADT, char *out, size_t outsz);
+static void format_date_numeric_str(DateADT dateADT, char *out);
+static void format_timestamp_numeric_str(Timestamp timestamp, int *tzp, char *out);
+static void truncateStrTailWhiteSpacesForDigit(size_t strLen, char *str);
+static Datum bytea_to_valid_text_datum(Datum d);
+static Oid	resolve_like_collation(Oid call_collid, PGFunction *like_fn, bool negate);
 
+/* ----------------------------------------------------------------
+ *	Temporal -> float8 helpers
+ * ----------------------------------------------------------------
+ */
+
+static void
+format_time_numeric_str(TimeADT timeADT, char *out, size_t outsz)
+{
+	struct pg_tm tt;
+	fsec_t		fsec;
+	char		buf[MAXDATELEN + 1];
+	char	   *strp = buf;
+	bool		nega = false;
+
+	if (timeADT < 0)
+	{
+		nega = true;
+		/* Avoid signed overflow on PG_INT64_MIN */
+		timeADT = (timeADT == PG_INT64_MIN) ? PG_INT64_MAX : -timeADT;
+	}
+
+	time2tm(timeADT, &tt, &fsec);
+	strp = pg_ultostr_zeropad(strp, tt.tm_hour, 2);
+	strp = pg_ultostr_zeropad(strp, tt.tm_min, 2);
+	strp = AppendSeconds(strp, tt.tm_sec, fsec, MAX_TIME_PRECISION, true);
+	*strp = '\0';
+
+	pg_snprintf(out, outsz, "%s%s", nega ? "-" : "", buf);
+}
+
+static void
+format_date_numeric_str(DateADT dateADT, char *out)
+{
+	struct pg_tm tt;
+	char	   *strp = out;
+
+	if (DATE_NOT_FINITE(dateADT))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("date out of range")));
+
+	j2date(dateADT + POSTGRES_EPOCH_JDATE,
+		   &tt.tm_year, &tt.tm_mon, &tt.tm_mday);
+	strp = pg_ultostr_zeropad(strp,
+							  (tt.tm_year > 0) ? tt.tm_year : -(tt.tm_year - 1),
+							  4);
+	strp = pg_ultostr_zeropad(strp, tt.tm_mon, 2);
+	strp = pg_ultostr_zeropad(strp, tt.tm_mday, 2);
+	*strp = '\0';
+}
+
+static void
+format_timestamp_numeric_str(Timestamp timestamp, int *tzp, char *out)
+{
+	struct pg_tm tt;
+	fsec_t		fsec;
+	const char *tzn = NULL;
+
+	if (TIMESTAMP_NOT_FINITE(timestamp) ||
+		timestamp2tm(timestamp, tzp, &tt, &fsec, tzp ? &tzn : NULL, NULL) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("timestamp out of range")));
+
+	out = pg_ultostr_zeropad(out,
+							 (tt.tm_year > 0) ? tt.tm_year : -(tt.tm_year - 1),
+							 4);
+	out = pg_ultostr_zeropad(out, tt.tm_mon, 2);
+	out = pg_ultostr_zeropad(out, tt.tm_mday, 2);
+	out = pg_ultostr_zeropad(out, tt.tm_hour, 2);
+	out = pg_ultostr_zeropad(out, tt.tm_min, 2);
+	out = AppendSeconds(out, tt.tm_sec, fsec, MAX_TIMESTAMP_PRECISION, true);
+	*out = '\0';
+}
 
 PG_FUNCTION_INFO_V1(convertTimeToDouble);
 Datum
 convertTimeToDouble(PG_FUNCTION_ARGS)
 {
-    Datum ret;
+	TimeADT		timeADT = DatumGetTimeADT(PG_GETARG_DATUM(0));
+	char		parmStr[MAXDATELEN + 1];
 
-    TimeADT timeADT = DatumGetTimeADT(PG_GETARG_DATUM(0));
-    char parmStr[MAXDATELEN + 1];
-    struct pg_tm tt;
-    struct pg_tm *tm = &tt;
-    fsec_t fsec;
-    char buf[MAXDATELEN + 1];
-    char *strp;
-    bool nega = false;
-
-    if (timeADT < 0)
-    {
-        nega = true;
-        timeADT = timeADT * -1;
-    }
-
-    strp = buf;
-    time2tm(timeADT, tm, &fsec);
-    strp = pg_ultostr_zeropad(strp, tm->tm_hour, 2);
-    strp = pg_ultostr_zeropad(strp, tm->tm_min, 2);
-    strp = AppendSeconds(strp, tm->tm_sec, fsec, MAX_TIME_PRECISION, true);
-    *strp = '\0';
-
-    if (nega)
-    {
-        pg_snprintf(parmStr, MAXDATELEN, "-%s", buf);
-    }
-    else
-    {
-        pg_snprintf(parmStr, MAXDATELEN, "%s", buf);
-    }
-
-    ret = DirectFunctionCall3(float8in,
-                              CStringGetDatum(parmStr),
-                              ObjectIdGetDatum(InvalidOid),
-                              Int32GetDatum(-1));
-
-    return ret;
+	format_time_numeric_str(timeADT, parmStr, sizeof(parmStr));
+	return DirectFunctionCall3(float8in,
+							   CStringGetDatum(parmStr),
+							   ObjectIdGetDatum(InvalidOid),
+							   Int32GetDatum(-1));
 }
 
 PG_FUNCTION_INFO_V1(convertDateToDouble);
 Datum
 convertDateToDouble(PG_FUNCTION_ARGS)
 {
-    Datum ret;
+	DateADT		dateADT = DatumGetDateADT(PG_GETARG_DATUM(0));
+	char		parmStr[MAXDATELEN + 1];
 
-    DateADT dateADT = DatumGetDateADT(PG_GETARG_DATUM(0));
-    struct pg_tm tt;
-    struct pg_tm *tm = &tt;
-    char parmStr[MAXDATELEN + 1];
-    char *strp;
-
-    strp = parmStr;
-    j2date(dateADT + POSTGRES_EPOCH_JDATE,
-           &(tm->tm_year), &(tm->tm_mon), &(tm->tm_mday));
-    strp = pg_ultostr_zeropad(strp, 
-                              (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 
-                              4);
-    strp = pg_ultostr_zeropad(strp, tm->tm_mon, 2);
-    strp = pg_ultostr_zeropad(strp, tm->tm_mday, 2);
-    *strp = '\0';
-    ret = DirectFunctionCall3(float8in,
-                              CStringGetDatum(parmStr),
-                              ObjectIdGetDatum(InvalidOid),
-                              Int32GetDatum(-1));
-
-    return ret;
+	format_date_numeric_str(dateADT, parmStr);
+	return DirectFunctionCall3(float8in,
+							   CStringGetDatum(parmStr),
+							   ObjectIdGetDatum(InvalidOid),
+							   Int32GetDatum(-1));
 }
 
 PG_FUNCTION_INFO_V1(convertTimestampToDouble);
 Datum
 convertTimestampToDouble(PG_FUNCTION_ARGS)
 {
-    Datum ret;
+	Timestamp	timestamp = DatumGetTimestamp(PG_GETARG_DATUM(0));
+	char		parmStr[MAXDATELEN + 1];
 
-    Timestamp timestamp = DatumGetTimestamp(PG_GETARG_DATUM(0));
-    struct pg_tm tt;
-    struct pg_tm *tm = &tt;
-    fsec_t fsec;
-    char parmStr[MAXDATELEN + 1];
-
-    if (timestamp2tm(timestamp, NULL, tm, &fsec, NULL, NULL) == 0)
-    {
-        char *strp = parmStr;
-        strp = pg_ultostr_zeropad(strp, 
-                                  (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 
-                                  4);
-        strp = pg_ultostr_zeropad(strp, tm->tm_mon, 2);
-        strp = pg_ultostr_zeropad(strp, tm->tm_mday, 2);
-        strp = pg_ultostr_zeropad(strp, tm->tm_hour, 2);
-        strp = pg_ultostr_zeropad(strp, tm->tm_min, 2);
-        strp = AppendSeconds(strp, tm->tm_sec, fsec, MAX_TIMESTAMP_PRECISION, true);
-        *strp = '\0';
-    }		
-    else
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-                 errmsg("timestamp out of range")));
-    }
-    ret = DirectFunctionCall3(float8in,
-                              CStringGetDatum(parmStr),
-                              ObjectIdGetDatum(InvalidOid),
-                              Int32GetDatum(-1));
-    return ret;
+	format_timestamp_numeric_str(timestamp, NULL, parmStr);
+	return DirectFunctionCall3(float8in,
+							   CStringGetDatum(parmStr),
+							   ObjectIdGetDatum(InvalidOid),
+							   Int32GetDatum(-1));
 }
+
+/* ----------------------------------------------------------------
+ *	User variable SQL entry points
+ * ----------------------------------------------------------------
+ */
 
 PG_FUNCTION_INFO_V1(mysSetUserVar);
 Datum
 mysSetUserVar(PG_FUNCTION_ARGS)
 {
-    char *varName = TextDatumGetCString(PG_GETARG_DATUM(0));
+	char	   *varName;
 
-    if (!PG_ARGISNULL(1))
-    {
-        Datum datumValue = PG_GETARG_DATUM(1);
-        Oid varValueType = get_fn_expr_argtype(fcinfo->flinfo, 1);
-        Oid	typOutput;
-        bool typIsVarlena;
-        char *varValue;
-        bool isDigit;
+	if (PG_ARGISNULL(0))
+		PG_RETURN_VOID();
 
-        getTypeOutputInfo(varValueType, &typOutput, &typIsVarlena);
-		varValue = getBaseType(varValueType) == BPCHAROID ?
-			text_to_cstring((text *) mys_bpchar_bytes(datumValue)) :
-			OidOutputFunctionCall(typOutput, datumValue);
-        varValueType = get_fn_expr_argtype(fcinfo->flinfo, 1);
-        isDigit = varValueIsDigit(datumValue, varValueType);
+	varName = TextDatumGetCString(PG_GETARG_DATUM(0));
 
-        mysSetUserVarInternal(varName, varValue, varValueType, isDigit, false);
-    }
-    else
-    {
-        mysSetUserVarInternal(varName, NULL, InvalidOid, false, true);
-    }
+	if (!PG_ARGISNULL(1))
+	{
+		Datum		datumValue = PG_GETARG_DATUM(1);
+		Oid			varValueType = get_fn_expr_argtype(fcinfo->flinfo, 1);
 
-    PG_RETURN_VOID();
+		if (!OidIsValid(varValueType))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("could not determine data type of user variable input")));
+
+		mysSetUserVarDatum(varName, datumValue, varValueType, NULL, false);
+	}
+	else
+	{
+		mysSetUserVarDatum(varName, (Datum) 0, InvalidOid, NULL, true);
+	}
+
+	pfree(varName);
+	PG_RETURN_VOID();
 }
 
 PG_FUNCTION_INFO_V1(mysClearUserVariables);
 Datum
 mysClearUserVariables(PG_FUNCTION_ARGS)
 {
-    clearUserVars();
-
-    PG_RETURN_VOID();
+	clearUserVars();
+	PG_RETURN_VOID();
 }
 
 PG_FUNCTION_INFO_V1(mysSetUserVarInExpr);
 Datum
 mysSetUserVarInExpr(PG_FUNCTION_ARGS)
 {
-    char *varName = TextDatumGetCString(PG_GETARG_DATUM(0));
-    FmgrInfo *foutcache;
-    Oid varValueType;
-    bytea *result;
+	char	   *varName;
+	bytea	   *result;
 
-    /* Get output function info, building it if first time through */
-    foutcache = (FmgrInfo *) fcinfo->flinfo->fn_extra;
-	if (foutcache == NULL)
-    {
-        Oid	typOutput;
-        bool typIsVarlena;
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
 
-        foutcache = (FmgrInfo *) MemoryContextAlloc(fcinfo->flinfo->fn_mcxt, sizeof(FmgrInfo) + sizeof(Oid));
+	varName = TextDatumGetCString(PG_GETARG_DATUM(0));
 
-        varValueType = get_fn_expr_argtype(fcinfo->flinfo, 1);
-        if (!OidIsValid(varValueType))
-            elog(ERROR, "could not determine data type of mysSetUserVar() input");
+	if (!PG_ARGISNULL(1))
+	{
+		Datum		datumValue = PG_GETARG_DATUM(1);
+		Oid			varValueType = get_fn_expr_argtype(fcinfo->flinfo, 1);
+		Oid			baseType;
+		FmgrInfo   *foutcache = NULL;
 
-        getTypeOutputInfo(varValueType, &typOutput, &typIsVarlena);
-        fmgr_info_cxt(typOutput, foutcache, fcinfo->flinfo->fn_mcxt);
-        memcpy(((char *)foutcache + sizeof(FmgrInfo)), &varValueType, sizeof(Oid));
+		if (!OidIsValid(varValueType))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("could not determine data type of user variable input")));
 
-        fcinfo->flinfo->fn_extra = foutcache;
-    }
-    else
-    {
-        varValueType = *(Oid *)((char *)foutcache + sizeof(FmgrInfo));
-    }
+		baseType = mys_binary_base_type(varValueType);
+		if (baseType != BYTEAOID &&
+			getBaseType(varValueType) != BPCHAROID &&
+			baseType != BITOID &&
+			baseType != VARBITOID &&
+			baseType != BOOLOID)
+		{
+			foutcache = (FmgrInfo *) fcinfo->flinfo->fn_extra;
+			if (foutcache == NULL)
+			{
+				Oid			typOutput;
+				bool		typIsVarlena;
 
-    if (!PG_ARGISNULL(1))
-    {
-        Datum datumValue = PG_GETARG_DATUM(1);
-		char *varValue = getBaseType(varValueType) == BPCHAROID ?
-			text_to_cstring((text *) mys_bpchar_bytes(datumValue)) :
-			OutputFunctionCall(foutcache, datumValue);
-        bool isDigit = varValueIsDigit(datumValue, varValueType);
+				foutcache = (FmgrInfo *) MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
+															sizeof(FmgrInfo));
+				getTypeOutputInfo(varValueType, &typOutput, &typIsVarlena);
+				fmgr_info_cxt(typOutput, foutcache, fcinfo->flinfo->fn_mcxt);
+				fcinfo->flinfo->fn_extra = (void *) foutcache;
+			}
+		}
 
-        mysSetUserVarInternal(varName, varValue, varValueType, isDigit, false);
-    }
-    else
-    {
-        mysSetUserVarInternal(varName, NULL, varValueType, false, true);
-    }
+		mysSetUserVarDatum(varName, datumValue, varValueType, foutcache, false);
+	}
+	else
+	{
+		mysSetUserVarDatum(varName, (Datum) 0, InvalidOid, NULL, true);
+	}
 
-    /* 获取用户变量的值 */
-    result = mysGetUserVarValueInternal(varName);
-    
-    if (result)
-    {
-        PG_RETURN_BYTEA_P(result);
-    }
-    else
-    {
-        PG_RETURN_NULL();
-    }
+	result = mysGetUserVarValueInternal(varName);
+	pfree(varName);
+
+	if (result == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_BYTEA_P(result);
 }
-
 
 PG_FUNCTION_INFO_V1(mysGetUserVarValue);
 Datum
 mysGetUserVarValue(PG_FUNCTION_ARGS)
 {
-    char *varName = TextDatumGetCString(PG_GETARG_DATUM(0));
-    bytea *result;
+	char	   *varName;
+	bytea	   *result;
 
-    result = mysGetUserVarValueInternal(varName);
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
 
-    if (result)
-    {
-        PG_RETURN_BYTEA_P(result);
-    }
-    else
-    {
-        PG_RETURN_NULL();
-    }
+	varName = TextDatumGetCString(PG_GETARG_DATUM(0));
+	result = mysGetUserVarValueInternal(varName);
+	pfree(varName);
+
+	if (result == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_BYTEA_P(result);
 }
 
+/* ----------------------------------------------------------------
+ *	bytea -> target type cast functions
+ * ----------------------------------------------------------------
+ */
+
+static char *
+bytea_to_checked_cstring(bytea *vlena, const char *typname)
+{
+	const char *byte = VARDATA_ANY(vlena);
+	size_t		byteLen = VARSIZE_ANY_EXHDR(vlena);
+
+	if (memchr(byte, '\0', byteLen) != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("Invalid input syntax for type %s", typname)));
+
+	return pnstrdup(byte, byteLen);
+}
 
 PG_FUNCTION_INFO_V1(mys_bytea2int8);
 Datum
 mys_bytea2int8(PG_FUNCTION_ARGS)
 {
-    return bytea2int8_internal(PG_GETARG_BYTEA_PP(0));
-}
+	char	   *str = bytea_to_checked_cstring(PG_GETARG_BYTEA_PP(0), "bigint");
+	Datum		result;
 
-static Datum
-bytea2int8_internal(bytea *vlena)
-{
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *num = pnstrdup(byte, byteLen);
-    size_t index;
-    Datum result;
-
-    for (index = 0; index < byteLen; index++)
-    {
-        if (!(isdigit(byte[index]) || byte[index] == '-' || byte[index] == '+'))
-        {
-            elog(ERROR, "Invalid input syntax for type int8");
-        }
-    }
-
-    result = DirectFunctionCall1(int8in, CStringGetDatum(num));
-    pfree(num);
-
-    return result;
+	truncateStrTailWhiteSpacesForDigit(strlen(str), str);
+	result = DirectFunctionCall1(int8in, CStringGetDatum(str));
+	pfree(str);
+	return result;
 }
 
 PG_FUNCTION_INFO_V1(mys_bytea2int4);
 Datum
 mys_bytea2int4(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *num = pnstrdup(byte, byteLen);
-    size_t index;
-    Datum result;
+	char	   *str = bytea_to_checked_cstring(PG_GETARG_BYTEA_PP(0), "integer");
+	Datum		result;
 
-    for (index = 0; index < byteLen; index++)
-    {
-        if (!(isdigit(byte[index]) || byte[index] == '-' || byte[index] == '+'))
-        {
-            elog(ERROR, "Invalid input syntax for type int4");
-        }
-    }
-
-    result = DirectFunctionCall1(int4in, CStringGetDatum(num));
-    pfree(num);
-
-    return result;
+	truncateStrTailWhiteSpacesForDigit(strlen(str), str);
+	result = DirectFunctionCall1(int4in, CStringGetDatum(str));
+	pfree(str);
+	return result;
 }
 
 PG_FUNCTION_INFO_V1(mys_bytea2int2);
 Datum
 mys_bytea2int2(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *num = pnstrdup(byte, byteLen);
-    size_t index;
-    Datum result;
+	char	   *str = bytea_to_checked_cstring(PG_GETARG_BYTEA_PP(0), "smallint");
+	Datum		result;
 
-    for (index = 0; index < byteLen; index++)
-    {
-        if (!(isdigit(byte[index]) || byte[index] == '-' || byte[index] == '+'))
-        {
-            elog(ERROR, "Invalid input syntax for type int2");
-        }
-    }
-
-    result = DirectFunctionCall1(int2in, CStringGetDatum(num));
-    pfree(num);
-
-    return result;
+	truncateStrTailWhiteSpacesForDigit(strlen(str), str);
+	result = DirectFunctionCall1(int2in, CStringGetDatum(str));
+	pfree(str);
+	return result;
 }
 
 PG_FUNCTION_INFO_V1(mys_bytea2numeric);
 Datum
 mys_bytea2numeric(PG_FUNCTION_ARGS)
 {
-    return bytea2numeric_internal(PG_GETARG_BYTEA_PP(0));
-}
+	char	   *str = bytea_to_checked_cstring(PG_GETARG_BYTEA_PP(0), "numeric");
+	Datum		result;
 
-static Datum
-bytea2numeric_internal(bytea *vlena)
-{
-    Datum result;
-
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *num = pnstrdup(byte, byteLen);
-    size_t index;
-
-    for (index = 0; index < byteLen; index++)
-    {
-        if (byte[index] == '\0')
-        {
-            elog(ERROR, "Invalid input syntax for type numeric");
-        }
-    }
-
-    result = DirectFunctionCall3(numeric_in,
-                                 CStringGetDatum(num),
-                                 ObjectIdGetDatum(InvalidOid),
-                                 Int32GetDatum(-1));
-
-    pfree(num);
-
-    return result;
+	truncateStrTailWhiteSpacesForDigit(strlen(str), str);
+	result = DirectFunctionCall3(numeric_in,
+								 CStringGetDatum(str),
+								 ObjectIdGetDatum(InvalidOid),
+								 Int32GetDatum(-1));
+	pfree(str);
+	return result;
 }
 
 PG_FUNCTION_INFO_V1(mys_bytea2float8);
 Datum
 mys_bytea2float8(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *num = pnstrdup(byte, byteLen);
-    size_t index;
-    Datum result;
+	char	   *str = bytea_to_checked_cstring(PG_GETARG_BYTEA_PP(0), "double precision");
+	Datum		result;
 
-    for (index = 0; index < byteLen; index++)
-    {
-        if (byte[index] == '\0')
-        {
-            elog(ERROR, "Invalid input syntax for type double precision");
-        }
-    }
-
-    result = DirectFunctionCall1(float8in, CStringGetDatum(num));
-    pfree(num);
-
-    return result;
+	truncateStrTailWhiteSpacesForDigit(strlen(str), str);
+	result = DirectFunctionCall1(float8in, CStringGetDatum(str));
+	pfree(str);
+	return result;
 }
-
 
 PG_FUNCTION_INFO_V1(mys_bytea2float4);
 Datum
 mys_bytea2float4(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *num = pnstrdup(byte, byteLen);
-    size_t index;
-    Datum result;
+	char	   *str = bytea_to_checked_cstring(PG_GETARG_BYTEA_PP(0), "real");
+	Datum		result;
 
-    for (index = 0; index < byteLen; index++)
-    {
-        if (byte[index] == '\0')
-        {
-            elog(ERROR, "Invalid input syntax for type real");
-        }
-    }
-
-    result = DirectFunctionCall1(float4in, CStringGetDatum(num));
-    pfree(num);
-
+	truncateStrTailWhiteSpacesForDigit(strlen(str), str);
+	result = DirectFunctionCall1(float4in, CStringGetDatum(str));
+	pfree(str);
 	return result;
 }
-
 
 PG_FUNCTION_INFO_V1(mys_bytea2text);
 Datum
 mys_bytea2text(PG_FUNCTION_ARGS)
 {
-    Datum result;
+	bytea	   *vlena = PG_GETARG_BYTEA_PP(0);
+	const char *byte = VARDATA_ANY(vlena);
+	size_t		byteLen = VARSIZE_ANY_EXHDR(vlena);
 
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *str = pnstrdup(byte, byteLen);
-
-    pg_verifymbstr(byte, byteLen, false);
-
-    // TODO: 最好的做法是，普通的text和varchar类型，最好是在入库前去掉末尾的空格，
-    // 这样不影响set @var = '   '
-    // TODO: 现在这里只是把bytea转为text时字符串末尾的空格去掉，
-    // 其他本来就是text/varchar的末尾的空格还是存在。
-    for (int i = (byteLen - 1); i >= 0; i--)
-    {
-        if (str[i] != ' ')
-        {
-            break;
-        }
-        else
-        {
-            str[i] = '\0';
-            byteLen -= 1;
-        }
-    }
-
-    result = DirectFunctionCall1(textin, CStringGetDatum(str));
-    pfree(str);
-
-    return result;
+	pg_verifymbstr(byte, (int) byteLen, false);
+	PG_RETURN_TEXT_P(cstring_to_text_with_len(byte, (int) byteLen));
 }
 
 PG_FUNCTION_INFO_V1(mys_bytea2varchar);
 Datum
 mys_bytea2varchar(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *str = pnstrdup(byte, byteLen);
-    Datum result;
+	bytea	   *vlena = PG_GETARG_BYTEA_PP(0);
+	const char *byte = VARDATA_ANY(vlena);
+	size_t		byteLen = VARSIZE_ANY_EXHDR(vlena);
 
-    pg_verifymbstr(byte, byteLen, false);
-
-    result = DirectFunctionCall3(varcharin,
-                                 CStringGetDatum(str),
-                                 ObjectIdGetDatum(InvalidOid),
-                                 Int32GetDatum(-1));
-    pfree(str);
-
-    return result;
+	pg_verifymbstr(byte, (int) byteLen, false);
+	PG_RETURN_VARCHAR_P((VarChar *) cstring_to_text_with_len(byte, (int) byteLen));
 }
 
 PG_FUNCTION_INFO_V1(mys_bytea2bpchar);
 Datum
 mys_bytea2bpchar(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *str = pnstrdup(byte, byteLen);
-    Datum result;
+	bytea	   *vlena = PG_GETARG_BYTEA_PP(0);
+	const char *byte = VARDATA_ANY(vlena);
+	size_t		byteLen = VARSIZE_ANY_EXHDR(vlena);
+	char	   *str;
+	Datum		result;
 
-    pg_verifymbstr(byte, byteLen, false);
-
-    result = DirectFunctionCall3(bpcharin,
-                                 CStringGetDatum(str),
-                                 ObjectIdGetDatum(InvalidOid),
-                                 Int32GetDatum(-1));
-    pfree(str);
-
+	pg_verifymbstr(byte, (int) byteLen, false);
+	str = pnstrdup(byte, byteLen);
+	result = DirectFunctionCall3(bpcharin,
+								 CStringGetDatum(str),
+								 ObjectIdGetDatum(InvalidOid),
+								 Int32GetDatum(-1));
+	pfree(str);
 	return result;
 }
 
@@ -597,3219 +449,1374 @@ PG_FUNCTION_INFO_V1(mys_bytea2date);
 Datum
 mys_bytea2date(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *str = pnstrdup(byte, byteLen);
-    size_t index;
-    Datum result;
+	char	   *str = bytea_to_checked_cstring(PG_GETARG_BYTEA_PP(0), "date");
+	Datum		result = DirectFunctionCall1(date_in, CStringGetDatum(str));
 
-    for (index = 0; index < byteLen; index++)
-    {
-        if (byte[index] == '\0')
-        {
-            elog(ERROR, "Invalid input syntax for type date");
-        }
-    }
-
-    result = DirectFunctionCall1(date_in,
-                                 CStringGetDatum(str));
-
-    pfree(str);
-
-    return result;
+	pfree(str);
+	return result;
 }
 
 PG_FUNCTION_INFO_V1(mys_bytea2time);
 Datum
 mys_bytea2time(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *str = pnstrdup(byte, byteLen);
-    size_t index;
-    Datum result;
+	char	   *str = bytea_to_checked_cstring(PG_GETARG_BYTEA_PP(0), "time");
+	Datum		result = DirectFunctionCall3(time_in,
+											 CStringGetDatum(str),
+											 ObjectIdGetDatum(InvalidOid),
+											 Int32GetDatum(-1));
 
-    for (index = 0; index < byteLen; index++)
-    {
-        if (byte[index] == '\0')
-        {
-            elog(ERROR, "Invalid input syntax for type time");
-        }
-    }
-
-    result = DirectFunctionCall3(time_in,
-                                 CStringGetDatum(str),
-                                 ObjectIdGetDatum(InvalidOid),
-                                 Int32GetDatum(-1));
-
-    pfree(str);
-
-    return result;
+	pfree(str);
+	return result;
 }
 
 PG_FUNCTION_INFO_V1(mys_bytea2timetz);
 Datum
 mys_bytea2timetz(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *str = pnstrdup(byte, byteLen);
-    size_t index;
-    Datum result;
+	char	   *str = bytea_to_checked_cstring(PG_GETARG_BYTEA_PP(0), "time with time zone");
+	Datum		result = DirectFunctionCall3(timetz_in,
+											 CStringGetDatum(str),
+											 ObjectIdGetDatum(InvalidOid),
+											 Int32GetDatum(-1));
 
-    for (index = 0; index < byteLen; index++)
-    {
-        if (byte[index] == '\0')
-        {
-            elog(ERROR, "Invalid input syntax for type time with time zone");
-        }
-    }
-
-    result = DirectFunctionCall3(timetz_in,
-                                 CStringGetDatum(str),
-                                 ObjectIdGetDatum(InvalidOid),
-                                 Int32GetDatum(-1));
-
-    pfree(str);
-
-    return result;
+	pfree(str);
+	return result;
 }
 
 PG_FUNCTION_INFO_V1(mys_bytea2timestamp);
 Datum
 mys_bytea2timestamp(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *str = pnstrdup(byte, byteLen);
-    size_t index;
-    Datum result;
+	char	   *str = bytea_to_checked_cstring(PG_GETARG_BYTEA_PP(0), "timestamp");
+	Datum		result = DirectFunctionCall3(timestamp_in,
+											 CStringGetDatum(str),
+											 ObjectIdGetDatum(InvalidOid),
+											 Int32GetDatum(-1));
 
-    for (index = 0; index < byteLen; index++)
-    {
-        if (byte[index] == '\0')
-        {
-            elog(ERROR, "Invalid input syntax for type timestamp");
-        }
-    }
-
-    result = DirectFunctionCall3(timestamp_in,
-                                 CStringGetDatum(str),
-                                 ObjectIdGetDatum(InvalidOid),
-                                 Int32GetDatum(-1));
-
-    pfree(str);
-
-    return result;
+	pfree(str);
+	return result;
 }
 
 PG_FUNCTION_INFO_V1(mys_bytea2timestamptz);
 Datum
 mys_bytea2timestamptz(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *str = pnstrdup(byte, byteLen);
-    size_t index;
-    Datum result;
+	char	   *str = bytea_to_checked_cstring(PG_GETARG_BYTEA_PP(0), "timestamp with time zone");
+	Datum		result = DirectFunctionCall3(timestamptz_in,
+											 CStringGetDatum(str),
+											 ObjectIdGetDatum(InvalidOid),
+											 Int32GetDatum(-1));
 
-    for (index = 0; index < byteLen; index++)
-    {
-        if (byte[index] == '\0')
-        {
-            elog(ERROR, "Invalid input syntax for type timestamp with time zone");
-        }
-    }
-
-    result = DirectFunctionCall3(timestamptz_in,
-                                 CStringGetDatum(str),
-                                 ObjectIdGetDatum(InvalidOid),
-                                 Int32GetDatum(-1));
-
-    pfree(str);
-
-    return result;
+	pfree(str);
+	return result;
 }
 
 PG_FUNCTION_INFO_V1(mys_bytea2bool);
 Datum
 mys_bytea2bool(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    size_t index;
-    Datum result;
+	bytea	   *vlena = PG_GETARG_BYTEA_PP(0);
+	const char *byte = VARDATA_ANY(vlena);
+	size_t		byteLen = VARSIZE_ANY_EXHDR(vlena);
+	size_t		index;
+	bool		result = false;
 
-    result = false;
-    for (index = 0; index < byteLen; index++)
-    {
-        if (!isdigit(byte[index]))
-        {
-            elog(ERROR, "Invalid input syntax for type boolean");
-        }
-        else
-        {
-            if (byte[index] != '0')
-            {
-                result = true;
-            }
-        }
-    }
+	for (index = 0; index < byteLen; index++)
+	{
+		if (!isdigit((unsigned char) byte[index]))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("Invalid input syntax for type boolean")));
+		if (byte[index] != '0')
+			result = true;
+	}
 
-    return result;
+	PG_RETURN_BOOL(result);
+}
+
+static Datum
+bytea_to_bit_common(bytea *vlena, PGFunction target_in)
+{
+	const uint8 *byte = (const uint8 *) VARDATA_ANY(vlena);
+	size_t		byteLen = VARSIZE_ANY_EXHDR(vlena);
+	char	   *str = NULL;
+	int			strIndex = 0;
+	int			strLen = 0;
+	size_t		pre_zero_bit_num = 0;
+	bool		ok = false;
+	size_t		index;
+	int			i;
+	Datum		result;
+
+	for (index = 0; index < byteLen; index++)
+	{
+		for (i = 0; i < BITS_PER_BYTE; i++)
+		{
+			bool		curBitIsZero = ((byte[index] & (0x80 >> i)) == 0);
+
+			if (ok)
+			{
+				str[strIndex++] = curBitIsZero ? '0' : '1';
+			}
+			else if (curBitIsZero)
+			{
+				pre_zero_bit_num++;
+			}
+			else
+			{
+				size_t		valid_bit_num = byteLen * BITS_PER_BYTE - pre_zero_bit_num;
+
+				if (valid_bit_num > 64)
+					ereport(ERROR,
+							(errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
+							 errmsg("Data too long for type bit")));
+
+				str = palloc(1 + valid_bit_num + 1);
+				str[0] = 'b';
+				str[1] = '1';
+				strIndex = 2;
+				strLen = (int) (1 + valid_bit_num);
+				ok = true;
+			}
+		}
+	}
+
+	if (str == NULL)
+		str = pstrdup("");
+	else
+		str[strLen] = '\0';
+
+	result = DirectFunctionCall3(target_in,
+								 CStringGetDatum(str),
+								 ObjectIdGetDatum(InvalidOid),
+								 Int32GetDatum(-1));
+	pfree(str);
+	return result;
 }
 
 PG_FUNCTION_INFO_V1(mys_bytea2bit);
 Datum
 mys_bytea2bit(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *str;
-    int strIndex;
-    int strLen;
-    size_t index;
-    int i;
-    size_t pre_zero_bit_num;
-    bool ok;
-    Datum result;
-
-    ok = false;
-    pre_zero_bit_num = 0;
-    str = NULL;
-    strLen = 0;
-    for (index = 0; index < byteLen; index++)
-    {
-        for (i = 0; i < BITS_PER_BYTE; i++)
-        {
-            bool curBitIsZero = ((byte[index] & (0x80 >> i)) == 0) ? true : false;
-            if (ok)
-            {
-                str[strIndex] = curBitIsZero ? '0' : '1';
-                strIndex++;
-            }
-            else
-            {
-                if (curBitIsZero)
-                {
-                    pre_zero_bit_num++;
-                }
-                else
-                {
-                    size_t vaild_bit_num = byteLen * BITS_PER_BYTE - pre_zero_bit_num;
-                    /* MySQL中bit类型的最大长度为64 */
-                    if (vaild_bit_num > 64)
-                    {
-                        elog(ERROR, "Data too long for type bit");
-                    }
-                    else
-                    {
-                        str = palloc(1 + vaild_bit_num + 1);
-                        str[0] = 'b';
-                        str[1] = curBitIsZero ? '0' : '1';
-                        strIndex = 2;
-                        strLen = 1 + vaild_bit_num;
-                        ok = true;
-                    }
-                }
-            }
-        }
-    }
-
-    if (str == NULL)
-    {
-        str = pstrdup("");
-    }
-    else
-    {
-        str[strLen] = '\0';
-    }
-
-    result = DirectFunctionCall3(bit_in,
-                                 CStringGetDatum(str),
-                                 ObjectIdGetDatum(InvalidOid),
-                                 Int32GetDatum(-1));
-
-    pfree(str);
-
-    return result;
+	return bytea_to_bit_common(PG_GETARG_BYTEA_PP(0), bit_in);
 }
-
 
 PG_FUNCTION_INFO_V1(mys_bytea2varbit);
 Datum
 mys_bytea2varbit(PG_FUNCTION_ARGS)
 {
-    bytea *vlena = PG_GETARG_BYTEA_PP(0);
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    char *str;
-    int strIndex;
-    int strLen;
-    size_t index;
-    int i;
-    size_t pre_zero_bit_num;
-    bool ok;
-    Datum result;
-
-    ok = false;
-    pre_zero_bit_num = 0;
-    str = NULL;
-    strLen = 0;
-    for (index = 0; index < byteLen; index++)
-    {
-        for (i = 0; i < BITS_PER_BYTE; i++)
-        {
-            bool curBitIsZero = ((byte[index] & (0x80 >> i)) == 0) ? true : false;
-            if (ok)
-            {
-                str[strIndex] = curBitIsZero ? '0' : '1';
-                strIndex++;
-            }
-            else
-            {
-                if (curBitIsZero)
-                {
-                    pre_zero_bit_num++;
-                }
-                else
-                {
-                    size_t vaild_bit_num = byteLen * BITS_PER_BYTE - pre_zero_bit_num;
-                    /* MySQL中bit类型的最大长度为64 */
-                    if (vaild_bit_num > 64)
-                    {
-                        elog(ERROR, "Data too long for type bit");
-                    }
-                    else
-                    {
-                        str = palloc(1 + vaild_bit_num + 1);
-                        str[0] = 'b';
-                        str[1] = curBitIsZero ? '0' : '1';
-                        strIndex = 2;
-                        strLen = 1 + vaild_bit_num;
-                        ok = true;
-                    }
-                }
-            }
-        }
-    }
-
-    if (str == NULL)
-    {
-        str = pstrdup("");
-    }
-    else
-    {
-        str[strLen] = '\0';
-    }
-
-    result = DirectFunctionCall3(varbit_in,
-                                 CStringGetDatum(str),
-                                 ObjectIdGetDatum(InvalidOid),
-                                 Int32GetDatum(-1));
-
-    pfree(str);
-
-    return result;
+	return bytea_to_bit_common(PG_GETARG_BYTEA_PP(0), varbit_in);
 }
 
+/* ----------------------------------------------------------------
+ *	Comparison operators (anycompatible <-> bytea, bytea <-> bytea)
+ * ----------------------------------------------------------------
+ */
 
-PG_FUNCTION_INFO_V1(anycompatibleEqByteaCImp);
-Datum
-anycompatibleEqByteaCImp(PG_FUNCTION_ARGS)
+static bool
+evalCmpResult(int32 cmp, MysCmpOp op)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleEqBytea(parmType, 
-                                PG_GETARG_DATUM(0), 
-                                PG_GETARG_DATUM(1));
+	switch (op)
+	{
+		case MYS_CMP_EQ:
+			return (cmp == 0);
+		case MYS_CMP_NE:
+			return (cmp != 0);
+		case MYS_CMP_LT:
+			return (cmp < 0);
+		case MYS_CMP_LE:
+			return (cmp <= 0);
+		case MYS_CMP_GT:
+			return (cmp > 0);
+		case MYS_CMP_GE:
+			return (cmp >= 0);
+	}
+	return false;
 }
 
-PG_FUNCTION_INFO_V1(byteaEqAnycompatibleCImp);
-Datum
-byteaEqAnycompatibleCImp(PG_FUNCTION_ARGS)
+static MysCmpOp
+commuteCmpOp(MysCmpOp op)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatibleEqBytea(parmType, 
-                                PG_GETARG_DATUM(1), 
-                                PG_GETARG_DATUM(0));
+	switch (op)
+	{
+		case MYS_CMP_LT:
+			return MYS_CMP_GT;
+		case MYS_CMP_LE:
+			return MYS_CMP_GE;
+		case MYS_CMP_GT:
+			return MYS_CMP_LT;
+		case MYS_CMP_GE:
+			return MYS_CMP_LE;
+		default:
+			return op;
+	}
 }
 
-PG_FUNCTION_INFO_V1(anycompatibleNeByteaCImp);
-Datum
-anycompatibleNeByteaCImp(PG_FUNCTION_ARGS)
+static Datum
+anycompatibleCmpBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val,
+					  MysCmpOp op, Oid collid)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleNeBytea(parmType, 
-                                PG_GETARG_DATUM(0), 
-                                PG_GETARG_DATUM(1));
+	Oid			effColl = OidIsValid(collid) ? collid : DEFAULT_COLLATION_OID;
+	bool		parm0IsDigit = varValueIsDigit(parm0Val, parm0Type);
+	bool		parm1IsDigit = varValueIsDigit(parm1Val, BYTEAOID);
+	int32		cmp = 0;
+
+	if (parm0Type == INT2OID ||
+		parm0Type == INT4OID ||
+		parm0Type == INT8OID ||
+		parm0Type == NUMERICOID ||
+		parm0Type == FLOAT4OID ||
+		parm0Type == FLOAT8OID)
+	{
+		Datum		p0 = convertParameterToNumeric(parm0Type, parm0Val);
+		Datum		p1 = convertParameterToNumeric(BYTEAOID, parm1Val);
+
+		cmp = DatumGetInt32(DirectFunctionCall2(numeric_cmp, p0, p1));
+	}
+	else if (parm0Type == TEXTOID || parm0Type == VARCHAROID)
+	{
+		if (parm1IsDigit)
+		{
+			Datum		p0 = convertParameterToNumeric(parm0Type, parm0Val);
+			Datum		p1 = convertParameterToNumeric(BYTEAOID, parm1Val);
+
+			cmp = DatumGetInt32(DirectFunctionCall2(numeric_cmp, p0, p1));
+		}
+		else
+		{
+			Datum		p1 = (parm0Type == TEXTOID) ?
+				DirectFunctionCall1(mys_bytea2text, parm1Val) :
+				DirectFunctionCall1(mys_bytea2varchar, parm1Val);
+
+			if (op == MYS_CMP_EQ || op == MYS_CMP_NE)
+			{
+				bool		eq = DatumGetBool(DirectFunctionCall2Coll(texteq, effColl,
+																	  parm0Val, p1));
+
+				PG_RETURN_BOOL(op == MYS_CMP_EQ ? eq : !eq);
+			}
+			cmp = DatumGetInt32(DirectFunctionCall2Coll(bttextcmp, effColl,
+														parm0Val, p1));
+		}
+	}
+	else if (parm0Type == BPCHAROID)
+	{
+		if (parm1IsDigit)
+		{
+			Datum		p0 = convertParameterToNumeric(BPCHAROID, parm0Val);
+			Datum		p1 = convertParameterToNumeric(BYTEAOID, parm1Val);
+
+			cmp = DatumGetInt32(DirectFunctionCall2(numeric_cmp, p0, p1));
+		}
+		else
+		{
+			Datum		p1 = DirectFunctionCall1(mys_bytea2bpchar, parm1Val);
+
+			cmp = DatumGetInt32(DirectFunctionCall2Coll(bpcharcmp, effColl,
+														parm0Val, p1));
+		}
+	}
+	else if (parm0Type == DATEOID)
+	{
+		Datum		p1 = DirectFunctionCall1(mys_bytea2date, parm1Val);
+
+		cmp = DatumGetInt32(DirectFunctionCall2(date_cmp, parm0Val, p1));
+	}
+	else if (parm0Type == TIMEOID)
+	{
+		Datum		p1 = DirectFunctionCall1(mys_bytea2time, parm1Val);
+
+		cmp = DatumGetInt32(DirectFunctionCall2(time_cmp, parm0Val, p1));
+	}
+	else if (parm0Type == TIMETZOID)
+	{
+		Datum		p1 = DirectFunctionCall1(mys_bytea2timetz, parm1Val);
+
+		cmp = DatumGetInt32(DirectFunctionCall2(timetz_cmp, parm0Val, p1));
+	}
+	else if (parm0Type == TIMESTAMPOID)
+	{
+		Datum		p1 = DirectFunctionCall1(mys_bytea2timestamp, parm1Val);
+
+		cmp = DatumGetInt32(DirectFunctionCall2(timestamp_cmp, parm0Val, p1));
+	}
+	else if (parm0Type == TIMESTAMPTZOID)
+	{
+		Datum		p1 = DirectFunctionCall1(mys_bytea2timestamptz, parm1Val);
+
+		cmp = DatumGetInt32(DirectFunctionCall2(timestamp_cmp, parm0Val, p1));
+	}
+	else if (parm0Type == BOOLOID)
+	{
+		Datum		p0 = convertParameterToNumeric(BOOLOID, parm0Val);
+		Datum		p1 = convertParameterToNumeric(BYTEAOID, parm1Val);
+
+		cmp = DatumGetInt32(DirectFunctionCall2(numeric_cmp, p0, p1));
+	}
+	else if (parm0Type == BITOID || parm0Type == VARBITOID)
+	{
+		Datum		p1 = (parm0Type == BITOID) ?
+			DirectFunctionCall1(mys_bytea2bit, parm1Val) :
+			DirectFunctionCall1(mys_bytea2varbit, parm1Val);
+
+		cmp = DatumGetInt32(DirectFunctionCall2(bitcmp, parm0Val, p1));
+	}
+	else if (parm0IsDigit || parm1IsDigit)
+	{
+		Datum		p0 = convertParameterToNumeric(parm0Type, parm0Val);
+		Datum		p1 = convertParameterToNumeric(BYTEAOID, parm1Val);
+
+		cmp = DatumGetInt32(DirectFunctionCall2(numeric_cmp, p0, p1));
+	}
+	else
+	{
+		Datum		p0 = convertParameterToText(parm0Type, parm0Val);
+		Datum		p1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
+
+		cmp = DatumGetInt32(DirectFunctionCall2Coll(bttextcmp, effColl, p0, p1));
+	}
+
+	PG_RETURN_BOOL(evalCmpResult(cmp, op));
 }
 
-PG_FUNCTION_INFO_V1(byteaNeAnycompatibleCImp);
-Datum
-byteaNeAnycompatibleCImp(PG_FUNCTION_ARGS)
+static Datum
+byteaCmpBytea(Datum d0, Datum d1, MysCmpOp op)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatibleNeBytea(parmType, 
-                                PG_GETARG_DATUM(1), 
-                                PG_GETARG_DATUM(0));
+	if (varValueIsDigit(d0, BYTEAOID) || varValueIsDigit(d1, BYTEAOID))
+	{
+		Datum		p0 = convertParameterToNumeric(BYTEAOID, d0);
+		Datum		p1 = convertParameterToNumeric(BYTEAOID, d1);
+		int32		cmp = DatumGetInt32(DirectFunctionCall2(numeric_cmp, p0, p1));
+
+		PG_RETURN_BOOL(evalCmpResult(cmp, op));
+	}
+	else
+	{
+		int32		cmp = DatumGetInt32(DirectFunctionCall2(byteacmp, d0, d1));
+
+		PG_RETURN_BOOL(evalCmpResult(cmp, op));
+	}
 }
 
-PG_FUNCTION_INFO_V1(anycompatibleCondAndByteaCImp);
-Datum
-anycompatibleCondAndByteaCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleCondAndBytea(parmType, 
-                                     PG_GETARG_DATUM(0), 
-                                     PG_GETARG_DATUM(1));
+#define DEFINE_ANY_BYTEA_CMP_PAIR(fn_any_bytea, fn_bytea_any, op_enum) \
+PG_FUNCTION_INFO_V1(fn_any_bytea); \
+Datum \
+fn_any_bytea(PG_FUNCTION_ARGS) \
+{ \
+	Oid parm0Type = getParameterType(fcinfo->flinfo, 0); \
+	return anycompatibleCmpBytea(parm0Type, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1), \
+								 (op_enum), PG_GET_COLLATION()); \
+} \
+PG_FUNCTION_INFO_V1(fn_bytea_any); \
+Datum \
+fn_bytea_any(PG_FUNCTION_ARGS) \
+{ \
+	Oid parm1Type = getParameterType(fcinfo->flinfo, 1); \
+	return anycompatibleCmpBytea(parm1Type, PG_GETARG_DATUM(1), PG_GETARG_DATUM(0), \
+								 commuteCmpOp(op_enum), PG_GET_COLLATION()); \
 }
 
-PG_FUNCTION_INFO_V1(byteaCondAndAnycompatibleCImp);
-    Datum
-byteaCondAndAnycompatibleCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatibleCondAndBytea(parmType, 
-                                     PG_GETARG_DATUM(1), 
-                                     PG_GETARG_DATUM(0));
-}
-
-PG_FUNCTION_INFO_V1(anycompatibleCondOrByteaCImp);
-Datum
-anycompatibleCondOrByteaCImp(PG_FUNCTION_ARGS)
-{
-    if (!PG_ARGISNULL(0) && !PG_ARGISNULL(1))
-    {
-        Oid parmType = getParameterType(fcinfo->flinfo, 0);
-        return anycompatibleCondOrBytea(parmType, 
-                                        PG_GETARG_DATUM(0), 
-                                        PG_GETARG_DATUM(1));
-    }
-    else if (!PG_ARGISNULL(0) && PG_ARGISNULL(1))
-    {
-        Oid parmType = getParameterType(fcinfo->flinfo, 0);
-        Datum parm0 = convertParameterToNumeric(parmType, 
-                                                PG_GETARG_DATUM(0));
-        Datum num0 = DirectFunctionCall3(numeric_in,
-                                         CStringGetDatum("0"),
-                                         ObjectIdGetDatum(InvalidOid),
-                                         Int32GetDatum(-1));
-        return DirectFunctionCall2(numeric_ne, parm0, num0);
-    }
-    else if (PG_ARGISNULL(0) && !PG_ARGISNULL(1))
-    {
-        Datum parm1 = bytea2numeric_internal(
-                                             DatumGetByteaPP(PG_GETARG_DATUM(1)));
-        Datum num0 = DirectFunctionCall3(numeric_in,
-                                         CStringGetDatum("0"),
-                                         ObjectIdGetDatum(InvalidOid),
-                                         Int32GetDatum(-1));
-        return DirectFunctionCall2(numeric_ne, parm1, num0);
-    }
-    else 
-    {
-        PG_RETURN_NULL();
-    }
-}
-
-PG_FUNCTION_INFO_V1(byteaCondOrAnycompatibleCImp);
-Datum
-byteaCondOrAnycompatibleCImp(PG_FUNCTION_ARGS)
-{
-    if (!PG_ARGISNULL(0) && !PG_ARGISNULL(1))
-    {
-        Oid parmType = getParameterType(fcinfo->flinfo, 1);
-        return anycompatibleCondOrBytea(parmType, 
-                                        PG_GETARG_DATUM(1), 
-                                        PG_GETARG_DATUM(0));
-    }
-    else if (!PG_ARGISNULL(0) && PG_ARGISNULL(1))
-    {
-        Datum parm0 = bytea2numeric_internal(
-                                             DatumGetByteaPP(PG_GETARG_DATUM(0)));
-        Datum num0 = DirectFunctionCall3(numeric_in,
-                                         CStringGetDatum("0"),
-                                         ObjectIdGetDatum(InvalidOid),
-                                         Int32GetDatum(-1));
-        return DirectFunctionCall2(numeric_ne, parm0, num0);
-    }
-    else if (PG_ARGISNULL(0) && !PG_ARGISNULL(1))
-    {
-        Oid parmType = getParameterType(fcinfo->flinfo, 1);
-        Datum parm1 = convertParameterToNumeric(parmType, 
-                                                PG_GETARG_DATUM(1));
-        Datum num0 = DirectFunctionCall3(numeric_in,
-                                         CStringGetDatum("0"),
-                                         ObjectIdGetDatum(InvalidOid),
-                                         Int32GetDatum(-1));
-        return DirectFunctionCall2(numeric_ne, parm1, num0);
-    }
-    else 
-    {
-        PG_RETURN_NULL();
-    }
-}
-
-PG_FUNCTION_INFO_V1(anycompatibleLikeByteaCImp);
-Datum
-anycompatibleLikeByteaCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleLikeBytea(parmType, 
-                                  PG_GETARG_DATUM(0), 
-                                  PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(byteaLikeAnycompatibleCImp);
-Datum
-byteaLikeAnycompatibleCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatibleLikeBytea(parmType, 
-                                   PG_GETARG_DATUM(1), 
-                                   PG_GETARG_DATUM(0));
-}
-
-PG_FUNCTION_INFO_V1(anycompatibleNlikeByteaCImp);
-Datum
-anycompatibleNlikeByteaCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleNlikeBytea(parmType, 
-                                   PG_GETARG_DATUM(0), 
-                                   PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(byteaNlikeAnycompatibleCImp);
-Datum
-byteaNlikeAnycompatibleCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatibleNlikeBytea(parmType, 
-                                   PG_GETARG_DATUM(1), 
-                                   PG_GETARG_DATUM(0));
-}
-
-PG_FUNCTION_INFO_V1(anycompatibleRegexpByteaCImp);
-Datum
-anycompatibleRegexpByteaCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleRegexpBytea(parmType, 
-                                    PG_GETARG_DATUM(0), 
-                                    PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(byteaRegexpAnycompatibleCImp);
-Datum
-byteaRegexpAnycompatibleCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return byteaRegexpAnycompatible(parmType, 
-                                    PG_GETARG_DATUM(0), 
-                                    PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(anycompatibleNregexpByteaCImp);
-Datum
-anycompatibleNregexpByteaCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleNregexpBytea(parmType, 
-                                     PG_GETARG_DATUM(0), 
-                                     PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(byteaNregexpAnycompatibleCImp);
-Datum
-byteaNregexpAnycompatibleCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return byteaNregexpAnycompatible(parmType, 
-                                     PG_GETARG_DATUM(0), 
-                                     PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(anycompatibleRegexpbinByteaCImp);
-Datum
-anycompatibleRegexpbinByteaCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleRegexpbinBytea(parmType, 
-                                       PG_GETARG_DATUM(0), 
-                                       PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(byteaRegexpbinAnycompatibleCImp);
-Datum
-byteaRegexpbinAnycompatibleCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return byteaRegexpbinAnycompatible(parmType, 
-                                       PG_GETARG_DATUM(0), 
-                                       PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(anycompatibleNregexpbinByteaCImp);
-Datum
-anycompatibleNregexpbinByteaCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleNregexpbinBytea(parmType, 
-                                        PG_GETARG_DATUM(0), 
-                                        PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(byteaNregexpbinAnycompatibleCImp);
-Datum
-byteaNregexpbinAnycompatibleCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return byteaNregexpbinAnycompatible(parmType, 
-                                        PG_GETARG_DATUM(0), 
-                                        PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(anycompatibleLtByteaCImp);
-Datum
-anycompatibleLtByteaCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleLtBytea(parmType, 
-                                PG_GETARG_DATUM(0), 
-                                PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(byteaLtAnycompatibleCImp);
-Datum
-byteaLtAnycompatibleCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatibleGtBytea(
-                                parmType, 
-                                PG_GETARG_DATUM(1), 
-                                PG_GETARG_DATUM(0));
-}
-
-PG_FUNCTION_INFO_V1(anycompatibleLeByteaCImp);
-Datum
-anycompatibleLeByteaCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleLeBytea(parmType, 
-                                PG_GETARG_DATUM(0), 
-                                PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(byteaLeAnycompatibleCImp);
-Datum
-byteaLeAnycompatibleCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatibleGeBytea(parmType, 
-                                PG_GETARG_DATUM(1), 
-                                PG_GETARG_DATUM(0));
-}
-
-PG_FUNCTION_INFO_V1(byteaCondAndByteaCImp);
-Datum
-byteaCondAndByteaCImp(PG_FUNCTION_ARGS)
-{
-    bool isParm0ValNot0 = false;
-    bool isParm1ValNot0 = false;
-
-    Datum num0 = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum("0"),
-                                     ObjectIdGetDatum(InvalidOid),
-                                     Int32GetDatum(-1));
-    Datum parm0 = bytea2numeric_internal(
-                                         DatumGetByteaPP(PG_GETARG_DATUM(0)));
-    Datum parm1 = bytea2numeric_internal(
-                                         DatumGetByteaPP(PG_GETARG_DATUM(1)));
-    isParm0ValNot0 = DatumGetBool(DirectFunctionCall2(numeric_ne, parm0, num0));
-    isParm1ValNot0 = DatumGetBool(DirectFunctionCall2(numeric_ne, parm1, num0));
-
-    PG_RETURN_BOOL(isParm0ValNot0 && isParm1ValNot0);
-}
-
-PG_FUNCTION_INFO_V1(byteaCondOrByteaCImp);
-Datum
-byteaCondOrByteaCImp(PG_FUNCTION_ARGS)
-{
-    bool isParm0ValNot0 = false;
-    bool isParm1ValNot0 = false;
-
-    Datum num0 = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum("0"),
-                                     ObjectIdGetDatum(InvalidOid),
-                                     Int32GetDatum(-1));
-    if (!PG_ARGISNULL(0))
-    {
-        Datum parm0 = bytea2numeric_internal(
-                                             DatumGetByteaPP(PG_GETARG_DATUM(0)));
-        isParm0ValNot0 = DatumGetBool(DirectFunctionCall2(numeric_ne, parm0, num0));
-    }
-    if (!PG_ARGISNULL(1))
-    {
-        Datum parm1 = bytea2numeric_internal(
-                                             DatumGetByteaPP(PG_GETARG_DATUM(1)));
-        isParm1ValNot0 = DatumGetBool(DirectFunctionCall2(numeric_ne, parm1, num0));
-    }
-
-    PG_RETURN_BOOL(isParm0ValNot0 || isParm1ValNot0);
-}
+DEFINE_ANY_BYTEA_CMP_PAIR(anycompatibleEqByteaCImp, byteaEqAnycompatibleCImp, MYS_CMP_EQ)
+DEFINE_ANY_BYTEA_CMP_PAIR(anycompatibleNeByteaCImp, byteaNeAnycompatibleCImp, MYS_CMP_NE)
+DEFINE_ANY_BYTEA_CMP_PAIR(anycompatibleLtByteaCImp, byteaLtAnycompatibleCImp, MYS_CMP_LT)
+DEFINE_ANY_BYTEA_CMP_PAIR(anycompatibleLeByteaCImp, byteaLeAnycompatibleCImp, MYS_CMP_LE)
+DEFINE_ANY_BYTEA_CMP_PAIR(anycompatibleGtByteaCImp, byteaGtAnycompatibleCImp, MYS_CMP_GT)
+DEFINE_ANY_BYTEA_CMP_PAIR(anycompatibleGeByteaCImp, byteaGeAnycompatibleCImp, MYS_CMP_GE)
 
 PG_FUNCTION_INFO_V1(byteaGtByteaCImp);
 Datum
 byteaGtByteaCImp(PG_FUNCTION_ARGS)
 {
-    Datum parm0Val = PG_GETARG_DATUM(0);
-    Datum parm1Val = PG_GETARG_DATUM(1);
-    bool isDigit0 = varValueIsDigit(parm0Val, BYTEAOID);
-    bool isDigit1 = varValueIsDigit(parm1Val, BYTEAOID);
-    if (isDigit0 || isDigit1)
-    {
-        Datum parm0 = bytea2numeric_internal(DatumGetByteaPP(parm0Val));
-        Datum parm1 = bytea2numeric_internal(DatumGetByteaPP(parm1Val));
-        return DirectFunctionCall2(numeric_gt, parm0, parm1);
-    }
-    else
-    {
-        return DirectFunctionCall2(byteagt, parm0Val, parm1Val);
-    }
+	return byteaCmpBytea(PG_GETARG_DATUM(0), PG_GETARG_DATUM(1), MYS_CMP_GT);
 }
 
 PG_FUNCTION_INFO_V1(byteaGeByteaCImp);
 Datum
 byteaGeByteaCImp(PG_FUNCTION_ARGS)
 {
-    Datum parm0Val = PG_GETARG_DATUM(0);
-    Datum parm1Val = PG_GETARG_DATUM(1);
-    bool isDigit0 = varValueIsDigit(parm0Val, BYTEAOID);
-    bool isDigit1 = varValueIsDigit(parm1Val, BYTEAOID);
-    if (isDigit0 || isDigit1)
-    {
-        Datum parm0 = bytea2numeric_internal(DatumGetByteaPP(parm0Val));
-        Datum parm1 = bytea2numeric_internal(DatumGetByteaPP(parm1Val));
-        return DirectFunctionCall2(numeric_ge, parm0, parm1);
-    }
-    else
-    {
-        return DirectFunctionCall2(byteage, parm0Val, parm1Val);
-    }
+	return byteaCmpBytea(PG_GETARG_DATUM(0), PG_GETARG_DATUM(1), MYS_CMP_GE);
 }
 
 PG_FUNCTION_INFO_V1(byteaLtByteaCImp);
 Datum
 byteaLtByteaCImp(PG_FUNCTION_ARGS)
 {
-    Datum parm0Val = PG_GETARG_DATUM(0);
-    Datum parm1Val = PG_GETARG_DATUM(1);
-    bool isDigit0 = varValueIsDigit(parm0Val, BYTEAOID);
-    bool isDigit1 = varValueIsDigit(parm1Val, BYTEAOID);
-    if (isDigit0 || isDigit1)
-    {
-        Datum parm0 = bytea2numeric_internal(DatumGetByteaPP(parm0Val));
-        Datum parm1 = bytea2numeric_internal(DatumGetByteaPP(parm1Val));
-        return DirectFunctionCall2(numeric_lt, parm0, parm1);
-    }
-    else
-    {
-        return DirectFunctionCall2(bytealt, parm0Val, parm1Val);
-    }
+	return byteaCmpBytea(PG_GETARG_DATUM(0), PG_GETARG_DATUM(1), MYS_CMP_LT);
 }
 
 PG_FUNCTION_INFO_V1(byteaLeByteaCImp);
 Datum
 byteaLeByteaCImp(PG_FUNCTION_ARGS)
 {
-    Datum parm0Val = PG_GETARG_DATUM(0);
-    Datum parm1Val = PG_GETARG_DATUM(1);
-    bool isDigit0 = varValueIsDigit(parm0Val, BYTEAOID);
-    bool isDigit1 = varValueIsDigit(parm1Val, BYTEAOID);
-    if (isDigit0 || isDigit1)
-    {
-        Datum parm0 = bytea2numeric_internal(DatumGetByteaPP(parm0Val));
-        Datum parm1 = bytea2numeric_internal(DatumGetByteaPP(parm1Val));
-        return DirectFunctionCall2(numeric_le, parm0, parm1);
-    }
-    else
-    {
-        return DirectFunctionCall2(byteale, parm0Val, parm1Val);
-    }
+	return byteaCmpBytea(PG_GETARG_DATUM(0), PG_GETARG_DATUM(1), MYS_CMP_LE);
+}
+
+/* ----------------------------------------------------------------
+ *	3-valued logical AND (&&) and OR (||) operators
+ * ----------------------------------------------------------------
+ */
+
+static bool
+datum_is_truthy(Oid typid, Datum val)
+{
+	Datum		num = convertParameterToNumeric(typid, val);
+	Datum		zero = DirectFunctionCall1(int4_numeric, Int32GetDatum(0));
+
+	return DatumGetBool(DirectFunctionCall2(numeric_ne, num, zero));
+}
+
+static Datum
+eval_three_valued_and(FunctionCallInfo fcinfo,
+					  bool null0, Oid type0, Datum val0,
+					  bool null1, Oid type1, Datum val1)
+{
+	bool		b0 = false;
+	bool		b1 = false;
+
+	if (!null0)
+	{
+		b0 = datum_is_truthy(type0, val0);
+		if (!b0)
+			PG_RETURN_BOOL(false);
+	}
+	if (!null1)
+	{
+		b1 = datum_is_truthy(type1, val1);
+		if (!b1)
+			PG_RETURN_BOOL(false);
+	}
+	if (null0 || null1)
+		PG_RETURN_NULL();
+
+	PG_RETURN_BOOL(true);
+}
+
+static Datum
+eval_three_valued_or(FunctionCallInfo fcinfo,
+					 bool null0, Oid type0, Datum val0,
+					 bool null1, Oid type1, Datum val1)
+{
+	if (!null0 && datum_is_truthy(type0, val0))
+		PG_RETURN_BOOL(true);
+	if (!null1 && datum_is_truthy(type1, val1))
+		PG_RETURN_BOOL(true);
+	if (null0 || null1)
+		PG_RETURN_NULL();
+
+	PG_RETURN_BOOL(false);
+}
+
+PG_FUNCTION_INFO_V1(anycompatibleCondAndByteaCImp);
+Datum
+anycompatibleCondAndByteaCImp(PG_FUNCTION_ARGS)
+{
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+
+	return eval_three_valued_and(fcinfo,
+								 PG_ARGISNULL(0), t0,
+								 PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0),
+								 PG_ARGISNULL(1), BYTEAOID,
+								 PG_ARGISNULL(1) ? (Datum) 0 : PG_GETARG_DATUM(1));
+}
+
+PG_FUNCTION_INFO_V1(byteaCondAndAnycompatibleCImp);
+Datum
+byteaCondAndAnycompatibleCImp(PG_FUNCTION_ARGS)
+{
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+
+	return eval_three_valued_and(fcinfo,
+								 PG_ARGISNULL(0), BYTEAOID,
+								 PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0),
+								 PG_ARGISNULL(1), t1,
+								 PG_ARGISNULL(1) ? (Datum) 0 : PG_GETARG_DATUM(1));
+}
+
+PG_FUNCTION_INFO_V1(byteaCondAndByteaCImp);
+Datum
+byteaCondAndByteaCImp(PG_FUNCTION_ARGS)
+{
+	return eval_three_valued_and(fcinfo,
+								 PG_ARGISNULL(0), BYTEAOID,
+								 PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0),
+								 PG_ARGISNULL(1), BYTEAOID,
+								 PG_ARGISNULL(1) ? (Datum) 0 : PG_GETARG_DATUM(1));
+}
+
+PG_FUNCTION_INFO_V1(anycompatibleCondOrByteaCImp);
+Datum
+anycompatibleCondOrByteaCImp(PG_FUNCTION_ARGS)
+{
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+
+	return eval_three_valued_or(fcinfo,
+								PG_ARGISNULL(0), t0,
+								PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0),
+								PG_ARGISNULL(1), BYTEAOID,
+								PG_ARGISNULL(1) ? (Datum) 0 : PG_GETARG_DATUM(1));
+}
+
+PG_FUNCTION_INFO_V1(byteaCondOrAnycompatibleCImp);
+Datum
+byteaCondOrAnycompatibleCImp(PG_FUNCTION_ARGS)
+{
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+
+	return eval_three_valued_or(fcinfo,
+								PG_ARGISNULL(0), BYTEAOID,
+								PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0),
+								PG_ARGISNULL(1), t1,
+								PG_ARGISNULL(1) ? (Datum) 0 : PG_GETARG_DATUM(1));
+}
+
+PG_FUNCTION_INFO_V1(byteaCondOrByteaCImp);
+Datum
+byteaCondOrByteaCImp(PG_FUNCTION_ARGS)
+{
+	return eval_three_valued_or(fcinfo,
+								PG_ARGISNULL(0), BYTEAOID,
+								PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0),
+								PG_ARGISNULL(1), BYTEAOID,
+								PG_ARGISNULL(1) ? (Datum) 0 : PG_GETARG_DATUM(1));
+}
+
+/* ----------------------------------------------------------------
+ *	LIKE / NOT LIKE and REGEXP / RLIKE operators
+ * ----------------------------------------------------------------
+ */
+
+static Datum
+bytea_to_valid_text_datum(Datum d)
+{
+	return DirectFunctionCall1(mys_bytea2text, d);
+}
+
+static Oid
+resolve_like_collation(Oid call_collid, PGFunction *like_fn, bool negate)
+{
+	if (OidIsValid(call_collid) && call_collid != DEFAULT_COLLATION_OID)
+	{
+		*like_fn = negate ? textnlike : textlike;
+		return call_collid;
+	}
+	if (OidIsValid(getCaseInsensitiveId()))
+	{
+		*like_fn = negate ? textnlike : textlike;
+		return getCaseInsensitiveId();
+	}
+	*like_fn = negate ? texticnlike : texticlike;
+	return DEFAULT_COLLATION_OID;
+}
+
+PG_FUNCTION_INFO_V1(anycompatibleLikeByteaCImp);
+Datum
+anycompatibleLikeByteaCImp(PG_FUNCTION_ARGS)
+{
+	Oid			parm0Type = getParameterType(fcinfo->flinfo, 0);
+	Datum		s = convertParameterToText(parm0Type, PG_GETARG_DATUM(0));
+	Datum		p = bytea_to_valid_text_datum(PG_GETARG_DATUM(1));
+	PGFunction	fn;
+	Oid			coll = resolve_like_collation(PG_GET_COLLATION(), &fn, false);
+
+	return DirectFunctionCall2Coll(fn, coll, s, p);
+}
+
+PG_FUNCTION_INFO_V1(byteaLikeAnycompatibleCImp);
+Datum
+byteaLikeAnycompatibleCImp(PG_FUNCTION_ARGS)
+{
+	Oid			parm1Type = getParameterType(fcinfo->flinfo, 1);
+	Datum		s = bytea_to_valid_text_datum(PG_GETARG_DATUM(0));
+	Datum		p = convertParameterToText(parm1Type, PG_GETARG_DATUM(1));
+	PGFunction	fn;
+	Oid			coll = resolve_like_collation(PG_GET_COLLATION(), &fn, false);
+
+	return DirectFunctionCall2Coll(fn, coll, s, p);
+}
+
+PG_FUNCTION_INFO_V1(anycompatibleNlikeByteaCImp);
+Datum
+anycompatibleNlikeByteaCImp(PG_FUNCTION_ARGS)
+{
+	Oid			parm0Type = getParameterType(fcinfo->flinfo, 0);
+	Datum		s = convertParameterToText(parm0Type, PG_GETARG_DATUM(0));
+	Datum		p = bytea_to_valid_text_datum(PG_GETARG_DATUM(1));
+	PGFunction	fn;
+	Oid			coll = resolve_like_collation(PG_GET_COLLATION(), &fn, true);
+
+	return DirectFunctionCall2Coll(fn, coll, s, p);
+}
+
+PG_FUNCTION_INFO_V1(byteaNlikeAnycompatibleCImp);
+Datum
+byteaNlikeAnycompatibleCImp(PG_FUNCTION_ARGS)
+{
+	Oid			parm1Type = getParameterType(fcinfo->flinfo, 1);
+	Datum		s = bytea_to_valid_text_datum(PG_GETARG_DATUM(0));
+	Datum		p = convertParameterToText(parm1Type, PG_GETARG_DATUM(1));
+	PGFunction	fn;
+	Oid			coll = resolve_like_collation(PG_GET_COLLATION(), &fn, true);
+
+	return DirectFunctionCall2Coll(fn, coll, s, p);
+}
+
+/*
+ * PostgreSQL's regex engine rejects nondeterministic ICU collations, so we
+ * always pass DEFAULT_COLLATION_OID for case-insensitive REGEXP and
+ * C_COLLATION_OID for binary REGEXP, after validating UTF-8 on bytea inputs.
+ */
+PG_FUNCTION_INFO_V1(anycompatibleRegexpByteaCImp);
+Datum
+anycompatibleRegexpByteaCImp(PG_FUNCTION_ARGS)
+{
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+
+	return DirectFunctionCall2Coll(texticregexeq, DEFAULT_COLLATION_OID,
+								   convertParameterToText(t0, PG_GETARG_DATUM(0)),
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(1)));
+}
+
+PG_FUNCTION_INFO_V1(byteaRegexpAnycompatibleCImp);
+Datum
+byteaRegexpAnycompatibleCImp(PG_FUNCTION_ARGS)
+{
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+
+	return DirectFunctionCall2Coll(texticregexeq, DEFAULT_COLLATION_OID,
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(0)),
+								   convertParameterToText(t1, PG_GETARG_DATUM(1)));
+}
+
+PG_FUNCTION_INFO_V1(anycompatibleNregexpByteaCImp);
+Datum
+anycompatibleNregexpByteaCImp(PG_FUNCTION_ARGS)
+{
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+
+	return DirectFunctionCall2Coll(texticregexne, DEFAULT_COLLATION_OID,
+								   convertParameterToText(t0, PG_GETARG_DATUM(0)),
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(1)));
+}
+
+PG_FUNCTION_INFO_V1(byteaNregexpAnycompatibleCImp);
+Datum
+byteaNregexpAnycompatibleCImp(PG_FUNCTION_ARGS)
+{
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+
+	return DirectFunctionCall2Coll(texticregexne, DEFAULT_COLLATION_OID,
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(0)),
+								   convertParameterToText(t1, PG_GETARG_DATUM(1)));
+}
+
+PG_FUNCTION_INFO_V1(anycompatibleRegexpbinByteaCImp);
+Datum
+anycompatibleRegexpbinByteaCImp(PG_FUNCTION_ARGS)
+{
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+
+	return DirectFunctionCall2Coll(textregexeq, C_COLLATION_OID,
+								   convertParameterToText(t0, PG_GETARG_DATUM(0)),
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(1)));
+}
+
+PG_FUNCTION_INFO_V1(byteaRegexpbinAnycompatibleCImp);
+Datum
+byteaRegexpbinAnycompatibleCImp(PG_FUNCTION_ARGS)
+{
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+
+	return DirectFunctionCall2Coll(textregexeq, C_COLLATION_OID,
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(0)),
+								   convertParameterToText(t1, PG_GETARG_DATUM(1)));
+}
+
+PG_FUNCTION_INFO_V1(anycompatibleNregexpbinByteaCImp);
+Datum
+anycompatibleNregexpbinByteaCImp(PG_FUNCTION_ARGS)
+{
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+
+	return DirectFunctionCall2Coll(textregexne, C_COLLATION_OID,
+								   convertParameterToText(t0, PG_GETARG_DATUM(0)),
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(1)));
+}
+
+PG_FUNCTION_INFO_V1(byteaNregexpbinAnycompatibleCImp);
+Datum
+byteaNregexpbinAnycompatibleCImp(PG_FUNCTION_ARGS)
+{
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+
+	return DirectFunctionCall2Coll(textregexne, C_COLLATION_OID,
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(0)),
+								   convertParameterToText(t1, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaRegexpByteaCImp);
 Datum
 byteaRegexpByteaCImp(PG_FUNCTION_ARGS)
 {
-    Datum parm0 = PG_GETARG_DATUM(0);
-    Datum parm1 = PG_GETARG_DATUM(1);
-    bytea *vlena = DatumGetByteaPP(parm1);
-    size_t len = VARSIZE_ANY_EXHDR(vlena);
-    if (0 < len)
-    {
-        return DirectFunctionCall2Coll(texticregexeq, COLLATION, parm0, parm1);
-    }
-    else 
-    {
-        elog(ERROR, "Got error 'empty (sub)expression' from regexp");
-    }
+	return DirectFunctionCall2Coll(texticregexeq, DEFAULT_COLLATION_OID,
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(0)),
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaNregexpByteaCImp);
 Datum
 byteaNregexpByteaCImp(PG_FUNCTION_ARGS)
 {
-    Datum parm0 = PG_GETARG_DATUM(0);
-    Datum parm1 = PG_GETARG_DATUM(1);
-    bytea *vlena = DatumGetByteaPP(parm1);
-    size_t len = VARSIZE_ANY_EXHDR(vlena);
-    if (0 < len)
-    {
-        return DirectFunctionCall2Coll(texticregexne, COLLATION, parm0, parm1);
-    }
-    else 
-    {
-        elog(ERROR, "Got error 'empty (sub)expression' from regexp");
-    }
+	return DirectFunctionCall2Coll(texticregexne, DEFAULT_COLLATION_OID,
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(0)),
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaRegexpbinByteaCImp);
 Datum
 byteaRegexpbinByteaCImp(PG_FUNCTION_ARGS)
 {
-    Datum parm0 = PG_GETARG_DATUM(0);
-    Datum parm1 = PG_GETARG_DATUM(1);
-    bytea *vlena = DatumGetByteaPP(parm1);
-    size_t len = VARSIZE_ANY_EXHDR(vlena);
-    if (0 < len)
-    {
-        return DirectFunctionCall2Coll(textregexeq, COLLATION, parm0, parm1);
-    }
-    else 
-    {
-        elog(ERROR, "Got error 'empty (sub)expression' from regexp");
-    }
+	return DirectFunctionCall2Coll(textregexeq, C_COLLATION_OID,
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(0)),
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaNregexpbinByteaCImp);
 Datum
 byteaNregexpbinByteaCImp(PG_FUNCTION_ARGS)
 {
-    Datum parm0 = PG_GETARG_DATUM(0);
-    Datum parm1 = PG_GETARG_DATUM(1);
-    bytea *vlena = DatumGetByteaPP(parm1);
-    size_t len = VARSIZE_ANY_EXHDR(vlena);
-    if (0 < len)
-    {
-        return DirectFunctionCall2Coll(textregexne, COLLATION, parm0, parm1);
-    }
-    else 
-    {
-        elog(ERROR, "Got error 'empty (sub)expression' from regexp");
-    }
+	return DirectFunctionCall2Coll(textregexne, C_COLLATION_OID,
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(0)),
+								   bytea_to_valid_text_datum(PG_GETARG_DATUM(1)));
 }
 
-PG_FUNCTION_INFO_V1(anycompatibleGtByteaCImp);
-Datum
-anycompatibleGtByteaCImp(PG_FUNCTION_ARGS)
+/* ----------------------------------------------------------------
+ *	Arithmetic (+, -, *, /, %) and bitwise (&, |) operators
+ * ----------------------------------------------------------------
+ */
+
+static Datum
+numeric_div_mysql_null(Datum p0, Datum p1)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleGtBytea(parmType, 
-                                PG_GETARG_DATUM(0), 
-                                PG_GETARG_DATUM(1));
+	Datum		zero = DirectFunctionCall1(int4_numeric, Int32GetDatum(0));
+
+	if (DatumGetBool(DirectFunctionCall2(numeric_eq, p1, zero)))
+		return (Datum) 0;
+	return DirectFunctionCall2(numeric_div, p0, p1);
 }
 
-PG_FUNCTION_INFO_V1(byteaGtAnycompatibleCImp);
-Datum
-byteaGtAnycompatibleCImp(PG_FUNCTION_ARGS)
+static Datum
+numeric_mod_mysql_null(Datum p0, Datum p1)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatibleLtBytea(parmType, 
-                                PG_GETARG_DATUM(1), 
-                                PG_GETARG_DATUM(0));
-}
+	Datum		zero = DirectFunctionCall1(int4_numeric, Int32GetDatum(0));
 
-PG_FUNCTION_INFO_V1(anycompatibleGeByteaCImp);
-Datum
-anycompatibleGeByteaCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleGeBytea(parmType, 
-                                PG_GETARG_DATUM(0), 
-                                PG_GETARG_DATUM(1));
-}
-
-PG_FUNCTION_INFO_V1(byteaGeAnycompatibleCImp);
-Datum
-byteaGeAnycompatibleCImp(PG_FUNCTION_ARGS)
-{
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatibleLeBytea(parmType, 
-                                PG_GETARG_DATUM(1), 
-                                PG_GETARG_DATUM(0));
+	if (DatumGetBool(DirectFunctionCall2(numeric_eq, p1, zero)))
+		return (Datum) 0;
+	return DirectFunctionCall2(numeric_mod, p0, p1);
 }
 
 PG_FUNCTION_INFO_V1(byteaPlByteaCImp);
 Datum
 byteaPlByteaCImp(PG_FUNCTION_ARGS)
 {
-    Numeric	result;
-
-    Datum parm0 = bytea2numeric_internal(PG_GETARG_BYTEA_PP(0));
-    Datum parm1 = bytea2numeric_internal(PG_GETARG_BYTEA_PP(1));
-    result = numeric_add_opt_error(DatumGetNumeric(parm0), DatumGetNumeric(parm1), NULL);
-
-    PG_RETURN_NUMERIC(result);
+	return DirectFunctionCall2(numeric_add,
+							   convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(0)),
+							   convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(anycompatiblePlByteaCImp);
 Datum
 anycompatiblePlByteaCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatiblePlBytea(parmType, 
-                                PG_GETARG_DATUM(0), 
-                                PG_GETARG_DATUM(1));
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+
+	return DirectFunctionCall2(numeric_add,
+							   convertParameterToNumeric(t0, PG_GETARG_DATUM(0)),
+							   convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaPlAnycompatibleCImp);
 Datum
 byteaPlAnycompatibleCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatiblePlBytea(parmType, 
-                                PG_GETARG_DATUM(1), 
-                                PG_GETARG_DATUM(0));
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+
+	return DirectFunctionCall2(numeric_add,
+							   convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(0)),
+							   convertParameterToNumeric(t1, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaMiByteaCImp);
 Datum
 byteaMiByteaCImp(PG_FUNCTION_ARGS)
 {
-    Numeric	result;
-
-    Datum parm0 = bytea2numeric_internal(PG_GETARG_BYTEA_PP(0));
-    Datum parm1 = bytea2numeric_internal(PG_GETARG_BYTEA_PP(1));
-    result = numeric_sub_opt_error(DatumGetNumeric(parm0), DatumGetNumeric(parm1), NULL);
-
-    PG_RETURN_NUMERIC(result);
+	return DirectFunctionCall2(numeric_sub,
+							   convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(0)),
+							   convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(anycompatibleMiByteaCImp);
 Datum
 anycompatibleMiByteaCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleMiBytea(parmType, 
-                                PG_GETARG_DATUM(0), 
-                                PG_GETARG_DATUM(1));
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+
+	return DirectFunctionCall2(numeric_sub,
+							   convertParameterToNumeric(t0, PG_GETARG_DATUM(0)),
+							   convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaMiAnycompatibleCImp);
 Datum
 byteaMiAnycompatibleCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return byteaMiAnycompatible(parmType, 
-                                PG_GETARG_DATUM(0), 
-                                PG_GETARG_DATUM(1));
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+
+	return DirectFunctionCall2(numeric_sub,
+							   convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(0)),
+							   convertParameterToNumeric(t1, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaMulByteaCImp);
 Datum
 byteaMulByteaCImp(PG_FUNCTION_ARGS)
 {
-    Numeric	result;
-
-    Datum parm0 = bytea2numeric_internal(PG_GETARG_BYTEA_PP(0));
-    Datum parm1 = bytea2numeric_internal(PG_GETARG_BYTEA_PP(1));
-    result = numeric_mul_opt_error(DatumGetNumeric(parm0), DatumGetNumeric(parm1), NULL);
-
-    PG_RETURN_NUMERIC(result);
+	return DirectFunctionCall2(numeric_mul,
+							   convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(0)),
+							   convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(anycompatibleMulByteaCImp);
 Datum
 anycompatibleMulByteaCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleMulBytea(parmType, 
-                                 PG_GETARG_DATUM(0), 
-                                 PG_GETARG_DATUM(1));
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+
+	return DirectFunctionCall2(numeric_mul,
+							   convertParameterToNumeric(t0, PG_GETARG_DATUM(0)),
+							   convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaMulAnycompatibleCImp);
 Datum
 byteaMulAnycompatibleCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatibleMulBytea(parmType, 
-                                 PG_GETARG_DATUM(1), 
-                                 PG_GETARG_DATUM(0));
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+
+	return DirectFunctionCall2(numeric_mul,
+							   convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(0)),
+							   convertParameterToNumeric(t1, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaDivByteaCImp);
 Datum
 byteaDivByteaCImp(PG_FUNCTION_ARGS)
 {
-    Numeric	result;
+	Datum		res = numeric_div_mysql_null(convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(0)),
+											 convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(1)));
 
-    Datum parm0 = bytea2numeric_internal(PG_GETARG_BYTEA_PP(0));
-    Datum parm1 = bytea2numeric_internal(PG_GETARG_BYTEA_PP(1));
-    result = numeric_div_opt_error(DatumGetNumeric(parm0), DatumGetNumeric(parm1), NULL);
-
-    PG_RETURN_NUMERIC(result);
+	if (res == (Datum) 0)
+		PG_RETURN_NULL();
+	return res;
 }
 
 PG_FUNCTION_INFO_V1(anycompatibleDivByteaCImp);
 Datum
 anycompatibleDivByteaCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleDivBytea(parmType, 
-                                 PG_GETARG_DATUM(0), 
-                                 PG_GETARG_DATUM(1));
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+	Datum		res = numeric_div_mysql_null(convertParameterToNumeric(t0, PG_GETARG_DATUM(0)),
+											 convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(1)));
+
+	if (res == (Datum) 0)
+		PG_RETURN_NULL();
+	return res;
 }
 
 PG_FUNCTION_INFO_V1(byteaDivAnycompatibleCImp);
 Datum
 byteaDivAnycompatibleCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return byteaDivAnycompatible(parmType, 
-                                 PG_GETARG_DATUM(0), 
-                                 PG_GETARG_DATUM(1));
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+	Datum		res = numeric_div_mysql_null(convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(0)),
+											 convertParameterToNumeric(t1, PG_GETARG_DATUM(1)));
+
+	if (res == (Datum) 0)
+		PG_RETURN_NULL();
+	return res;
 }
 
 PG_FUNCTION_INFO_V1(byteaModByteaCImp);
 Datum
 byteaModByteaCImp(PG_FUNCTION_ARGS)
 {
-    Numeric	result;
+	Datum		res = numeric_mod_mysql_null(convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(0)),
+											 convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(1)));
 
-    Datum parm0 = bytea2numeric_internal(PG_GETARG_BYTEA_PP(0));
-    Datum parm1 = bytea2numeric_internal(PG_GETARG_BYTEA_PP(1));
-    result = numeric_mod_opt_error(DatumGetNumeric(parm0), 
-                                   DatumGetNumeric(parm1), 
-                                   NULL);
-
-    PG_RETURN_NUMERIC(result);
+	if (res == (Datum) 0)
+		PG_RETURN_NULL();
+	return res;
 }
 
 PG_FUNCTION_INFO_V1(anycompatibleModByteaCImp);
 Datum
 anycompatibleModByteaCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleModBytea(parmType, 
-                                 PG_GETARG_DATUM(0), 
-                                 PG_GETARG_DATUM(1));
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+	Datum		res = numeric_mod_mysql_null(convertParameterToNumeric(t0, PG_GETARG_DATUM(0)),
+											 convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(1)));
+
+	if (res == (Datum) 0)
+		PG_RETURN_NULL();
+	return res;
 }
 
 PG_FUNCTION_INFO_V1(byteaModAnycompatibleCImp);
 Datum
 byteaModAnycompatibleCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return byteaModAnycompatible(parmType, 
-                                 PG_GETARG_DATUM(0), 
-                                 PG_GETARG_DATUM(1));
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+	Datum		res = numeric_mod_mysql_null(convertParameterToNumeric(BYTEAOID, PG_GETARG_DATUM(0)),
+											 convertParameterToNumeric(t1, PG_GETARG_DATUM(1)));
+
+	if (res == (Datum) 0)
+		PG_RETURN_NULL();
+	return res;
 }
 
 PG_FUNCTION_INFO_V1(byteaAndByteaCImp);
 Datum
 byteaAndByteaCImp(PG_FUNCTION_ARGS)
 {
-    Datum parm0Int64;
-    Datum parm1Int64;
-
-    bool isDigit0 = varValueIsDigit(PG_GETARG_DATUM(0), BYTEAOID);
-    bool isDigit1 = varValueIsDigit(PG_GETARG_DATUM(1), BYTEAOID);
-
-    if (isDigit0)
-    {
-        Datum parm0Numeric = bytea2numeric_internal(
-                                                    PG_GETARG_BYTEA_PP(0));
-        parm0Int64 = DirectFunctionCall1(numeric_int8, parm0Numeric);
-    }
-    else
-    {
-        parm0Int64 = bytea2int8_internal(PG_GETARG_BYTEA_PP(0));
-    }
-
-    if (isDigit1)
-    {
-        Datum parm1Numeric = bytea2numeric_internal(
-                                                    PG_GETARG_BYTEA_PP(1));
-        parm1Int64 = DirectFunctionCall1(numeric_int8, parm1Numeric);
-    }
-    else
-    {
-        parm1Int64 = bytea2int8_internal(PG_GETARG_BYTEA_PP(1));
-    }
-
-    PG_RETURN_INT64(DatumGetInt64(parm0Int64) & DatumGetInt64(parm1Int64));
+	return DirectFunctionCall2(int8and,
+							   convertParameterToInt8(BYTEAOID, PG_GETARG_DATUM(0)),
+							   convertParameterToInt8(BYTEAOID, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(anycompatibleAndByteaCImp);
 Datum
 anycompatibleAndByteaCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleAndBytea(parmType, 
-                                 PG_GETARG_DATUM(0), 
-                                 PG_GETARG_DATUM(1));
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+
+	return DirectFunctionCall2(int8and,
+							   convertParameterToInt8(t0, PG_GETARG_DATUM(0)),
+							   convertParameterToInt8(BYTEAOID, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaAndAnycompatibleCImp);
 Datum
 byteaAndAnycompatibleCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatibleAndBytea(parmType, 
-                                 PG_GETARG_DATUM(1), 
-                                 PG_GETARG_DATUM(0));
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+
+	return DirectFunctionCall2(int8and,
+							   convertParameterToInt8(BYTEAOID, PG_GETARG_DATUM(0)),
+							   convertParameterToInt8(t1, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaOrByteaCImp);
 Datum
 byteaOrByteaCImp(PG_FUNCTION_ARGS)
 {
-    Datum parm0Int64;
-    Datum parm1Int64;
-
-    bool isDigit0 = varValueIsDigit(PG_GETARG_DATUM(0), BYTEAOID);
-    bool isDigit1 = varValueIsDigit(PG_GETARG_DATUM(1), BYTEAOID);
-
-    if (isDigit0)
-    {
-        Datum parm0Numeric = bytea2numeric_internal(PG_GETARG_BYTEA_PP(0));
-        parm0Int64 = DirectFunctionCall1(numeric_int8, parm0Numeric);
-    }
-    else
-    {
-        parm0Int64 = bytea2int8_internal(PG_GETARG_BYTEA_PP(0));
-    }
-
-    if (isDigit1)
-    {
-        Datum parm1Numeric = bytea2numeric_internal(PG_GETARG_BYTEA_PP(1));
-        parm1Int64 = DirectFunctionCall1(numeric_int8, parm1Numeric);
-    }
-    else
-    {
-        parm1Int64 = bytea2int8_internal(PG_GETARG_BYTEA_PP(1));
-    }
-
-    PG_RETURN_INT64(DatumGetInt64(parm0Int64) | DatumGetInt64(parm1Int64));
+	return DirectFunctionCall2(int8or,
+							   convertParameterToInt8(BYTEAOID, PG_GETARG_DATUM(0)),
+							   convertParameterToInt8(BYTEAOID, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(anycompatibleOrByteaCImp);
 Datum
 anycompatibleOrByteaCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 0);
-    return anycompatibleOrBytea(parmType, 
-                                PG_GETARG_DATUM(0), 
-                                PG_GETARG_DATUM(1));
+	Oid			t0 = getParameterType(fcinfo->flinfo, 0);
+
+	return DirectFunctionCall2(int8or,
+							   convertParameterToInt8(t0, PG_GETARG_DATUM(0)),
+							   convertParameterToInt8(BYTEAOID, PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(byteaOrAnycompatibleCImp);
 Datum
 byteaOrAnycompatibleCImp(PG_FUNCTION_ARGS)
 {
-    Oid parmType = getParameterType(fcinfo->flinfo, 1);
-    return anycompatibleOrBytea(parmType, 
-                                PG_GETARG_DATUM(1), 
-                                PG_GETARG_DATUM(0));
+	Oid			t1 = getParameterType(fcinfo->flinfo, 1);
+
+	return DirectFunctionCall2(int8or,
+							   convertParameterToInt8(BYTEAOID, PG_GETARG_DATUM(0)),
+							   convertParameterToInt8(t1, PG_GETARG_DATUM(1)));
 }
 
-static Oid 
-getParameterType(FmgrInfo *flinfo, int parmIndex)
+/* ----------------------------------------------------------------
+ *	Internal parameter conversion helpers
+ * ----------------------------------------------------------------
+ */
+
+static Oid
+getParameterType(FmgrInfo *fmgrinfo, int parmIndex)
 {
-    Oid parmType;
+	Oid			parmType = get_fn_expr_argtype(fmgrinfo, parmIndex);
 
-    parmType = get_fn_expr_argtype(flinfo, parmIndex);
-    if (!OidIsValid(parmType))
-        elog(ERROR, "could not determine data type of input");
+	if (!OidIsValid(parmType))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("could not determine data type of input")));
 
-    parmType = getBaseType(parmType);
-
-    return parmType;
+	return parmType;
 }
 
-static Datum 
-anycompatibleEqBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
+/*
+ * Parse the leading numeric prefix of a MySQL string / user variable into a
+ * clean ASCII numeric string (returns "0" if no valid leading number).
+ */
+static void
+extract_mysql_leading_number(const char *src, size_t srcLen, char **out_str)
 {
-    if (parm0Type == INT2OID)
-    {
-        /* int2 (oid: 21) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_eq, parm0, parm1);
-    }
-    else if (parm0Type == INT4OID)
-    {
-        /* int4 (oid: 23) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_eq, parm0, parm1);
-    }
-    else if (parm0Type == INT8OID)
-    {
-        /* int8 (oid: 20) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_eq, parm0, parm1);
-    }
-    else if (parm0Type == TEXTOID)
-    {
-        /* text (oid: 25) */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_eq, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
-            return DirectFunctionCall2Coll(texteq, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == VARCHAROID)
-    {
-        /* varchar (oid: 1043) operator is same as text */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_eq, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2varchar, parm1Val);
-            return DirectFunctionCall2Coll(texteq, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == BPCHAROID)
-    {
-        /* char (oid: 1042) */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_eq, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2bpchar, parm1Val);
-            return DirectFunctionCall2Coll(bpchareq, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == NUMERICOID)
-    {
-        /* numeric (oid: 1700) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_eq, parm0, parm1);
-    }
-    else if (parm0Type == FLOAT4OID)
-    {
-        /* float4 (oid: 700) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_eq, parm0, parm1);
-    }
-    else if (parm0Type == FLOAT8OID)
-    {
-        /* float8 (oid: 701) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_eq, parm0, parm1);
-    }
-    else if (parm0Type == BOOLOID)
-    {
-        /* boolean (oid: 16) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_eq, parm0, parm1);
-    }
-    else if (parm0Type == TIMESTAMPOID)
-    {
-        /* timestamp (oid: 1114) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timestamp, parm1Val);
-        return DirectFunctionCall2(timestamp_eq, parm0, parm1);
-    }
-    else if (parm0Type == TIMESTAMPTZOID)
-    {
-        /* timestamptz (oid: 1184) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timestamptz, parm1Val);
-        return DirectFunctionCall2(timestamp_eq, parm0, parm1);
-    }
-    else if (parm0Type == TIMEOID)
-    {
-        /* time (oid: 1083) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2time, parm1Val);
-        return DirectFunctionCall2(time_eq, parm0, parm1);
-    }
-    else if (parm0Type == TIMETZOID)
-    {
-        /* timetz (oid: 1266) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timetz, parm1Val);
-        return DirectFunctionCall2(timetz_eq, parm0, parm1);
-    }
-    else if (parm0Type == DATEOID)
-    {
-        /* date (oid: 1082) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2date, parm1Val);
-        return DirectFunctionCall2(date_eq, parm0, parm1);
-    }
-    else if (parm0Type == BITOID)
-    {
-        /* date (oid: 1560) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_eq, parm0, parm1);
-    }
-    else if (parm0Type == VARBITOID)
-    {
-        /* date (oid: 1562) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_eq, parm0, parm1);
-    }
-    else 
-    {
-        elog(WARNING, "Invalid parameter tpye \"%d\" for \"anycompatibleLtBytea\" function.", parm0Type);
-        PG_RETURN_BOOL(false);
-    }
+	size_t		i = 0;
+	size_t		start;
+	size_t		numStart;
+	bool		sawDigits = false;
+	size_t		endPos;
+
+	while (i < srcLen && isspace((unsigned char) src[i]))
+		i++;
+
+	start = i;
+	if (i < srcLen && (src[i] == '+' || src[i] == '-'))
+		i++;
+
+	numStart = i;
+	while (i < srcLen && isdigit((unsigned char) src[i]))
+	{
+		sawDigits = true;
+		i++;
+	}
+
+	if (i < srcLen && src[i] == '.')
+	{
+		i++;
+		while (i < srcLen && isdigit((unsigned char) src[i]))
+		{
+			sawDigits = true;
+			i++;
+		}
+	}
+
+	if (!sawDigits)
+	{
+		*out_str = pstrdup("0");
+		return;
+	}
+
+	endPos = i;
+	if (i < srcLen && (src[i] == 'e' || src[i] == 'E'))
+	{
+		size_t		expIdx = i + 1;
+
+		if (expIdx < srcLen && (src[expIdx] == '+' || src[expIdx] == '-'))
+			expIdx++;
+		if (expIdx < srcLen && isdigit((unsigned char) src[expIdx]))
+		{
+			while (expIdx < srcLen && isdigit((unsigned char) src[expIdx]))
+				expIdx++;
+			endPos = expIdx;
+		}
+	}
+
+	(void) numStart;
+	*out_str = pnstrdup(src + start, endPos - start);
 }
 
-
-static Datum 
-anycompatibleNeBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
+static void
+truncateStrTailWhiteSpacesForDigit(size_t strLen, char *str)
 {
-    if (parm0Type == INT2OID)
-    {
-        /* int2 (oid: 21) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ne, parm0, parm1);
-    }
-    else if (parm0Type == INT4OID)
-    {
-        /* int4 (oid: 23) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ne, parm0, parm1);
-    }
-    else if (parm0Type == INT8OID)
-    {
-        /* int8 (oid: 20) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ne, parm0, parm1);
-    }
-    else if (parm0Type == TEXTOID)
-    {
-        /* text (oid: 25) */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_ne, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
-            return DirectFunctionCall2Coll(textne, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == VARCHAROID)
-    {
-        /* varchar (oid: 1043) operator is same as text */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_ne, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2varchar, parm1Val);
-            return DirectFunctionCall2Coll(textne, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == BPCHAROID)
-    {
-        /* char (oid: 1042) */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_ne, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2bpchar, parm1Val);
-            return DirectFunctionCall2Coll(bpcharne, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == NUMERICOID)
-    {
-        /* numeric (oid: 1700) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ne, parm0, parm1);
-    }
-    else if (parm0Type == FLOAT4OID)
-    {
-        /* float4 (oid: 700) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ne, parm0, parm1);
-    }
-    else if (parm0Type == FLOAT8OID)
-    {
-        /* float8 (oid: 701) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ne, parm0, parm1);
-    }
-    else if (parm0Type == BOOLOID)
-    {
-        /* boolean (oid: 16) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ne, parm0, parm1);
-    }
-    else if (parm0Type == TIMESTAMPOID)
-    {
-        /* timestamp (oid: 1114) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timestamp, parm1Val);
-        return DirectFunctionCall2(timestamp_ne, parm0, parm1);
-    }
-    else if (parm0Type == TIMESTAMPTZOID)
-    {
-        /* timestamptz (oid: 1184) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timestamptz, parm1Val);
-        return DirectFunctionCall2(timestamp_ne, parm0, parm1);
-    }
-    else if (parm0Type == TIMEOID)
-    {
-        /* time (oid: 1083) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2time, parm1Val);
-        return DirectFunctionCall2(time_ne, parm0, parm1);
-    }
-    else if (parm0Type == TIMETZOID)
-    {
-        /* timetz (oid: 1266) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timetz, parm1Val);
-        return DirectFunctionCall2(timetz_ne, parm0, parm1);
-    }
-    else if (parm0Type == DATEOID)
-    {
-        /* date (oid: 1082) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2date, parm1Val);
-        return DirectFunctionCall2(date_ne, parm0, parm1);
-    }
-    else if (parm0Type == BITOID)
-    {
-        /* date (oid: 1560) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ne, parm0, parm1);
-    }
-    else if (parm0Type == VARBITOID)
-    {
-        /* date (oid: 1562) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ne, parm0, parm1);
-    }
-    else 
-    {
-        elog(WARNING, "Invalid parameter tpye \"%d\" for \"anycompatibleNeBytea\" function.", parm0Type);
-        PG_RETURN_BOOL(false);
-    }
-}
+	bool		meetNumber = false;
+	bool		meetWhiteSpace = false;
+	size_t		index;
 
-static Datum 
-anycompatibleCondAndBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    bool isParm0ValNot0 = false;
-    bool isParm1ValNot0 = false;
+	for (index = 0; index < strLen; index++)
+	{
+		unsigned char ch = (unsigned char) str[index];
 
-    Datum num0 = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum("0"),
-                                     ObjectIdGetDatum(InvalidOid),
-                                     Int32GetDatum(-1));
-    Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-    Datum parm1 = bytea2numeric_internal(DatumGetByteaPP(parm1Val));
-    isParm0ValNot0 = DatumGetBool(DirectFunctionCall2(numeric_ne, parm0, num0));
-    isParm1ValNot0 = DatumGetBool(DirectFunctionCall2(numeric_ne, parm1, num0));
-
-    PG_RETURN_BOOL(isParm0ValNot0 && isParm1ValNot0);
-}
-
-static Datum 
-anycompatibleCondOrBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    bool isParm0ValNot0 = false;
-    bool isParm1ValNot0 = false;
-
-    Datum num0 = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum("0"),
-                                     ObjectIdGetDatum(InvalidOid),
-                                     Int32GetDatum(-1));
-    Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-    Datum parm1 = bytea2numeric_internal(DatumGetByteaPP(parm1Val));
-    isParm0ValNot0 = DatumGetBool(DirectFunctionCall2(numeric_ne, parm0, num0));
-    isParm1ValNot0 = DatumGetBool(DirectFunctionCall2(numeric_ne, parm1, num0));
-
-    PG_RETURN_BOOL(isParm0ValNot0 || isParm1ValNot0);
-}
-
-static Datum 
-anycompatibleLikeBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    Datum parm0 = convertParameterToText(parm0Type, parm0Val);
-    Datum parm1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
-    return DirectFunctionCall2Coll(texticlike, COLLATION, parm0, parm1);
-}
-
-static Datum 
-anycompatibleNlikeBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    Datum parm0 = convertParameterToText(parm0Type, parm0Val);
-    Datum parm1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
-    return DirectFunctionCall2Coll(texticnlike, COLLATION, parm0, parm1);
-}
-
-static Datum 
-anycompatibleRegexpBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    Datum parm0 = convertParameterToText(parm0Type, parm0Val);
-    Datum parm1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
-    return DirectFunctionCall2Coll(texticregexeq, COLLATION, parm0, parm1);
-}
-
-static Datum 
-byteaRegexpAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val)
-{
-    Datum parm0 = DirectFunctionCall1(mys_bytea2text, parm0Val);
-    Datum parm1 = convertParameterToText(parm1Type, parm1Val);
-    return DirectFunctionCall2Coll(texticregexeq, COLLATION, parm0, parm1);
-}
-
-static Datum 
-anycompatibleNregexpBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    Datum parm0 = convertParameterToText(parm0Type, parm0Val);
-    Datum parm1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
-    return DirectFunctionCall2Coll(texticregexne, COLLATION, parm0, parm1);
-}
-
-static Datum 
-byteaNregexpAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val)
-{
-    Datum parm0 = DirectFunctionCall1(mys_bytea2text, parm0Val);
-    Datum parm1 = convertParameterToText(parm1Type, parm1Val);
-    return DirectFunctionCall2Coll(texticregexne, COLLATION, parm0, parm1);
-}
-
-static Datum 
-anycompatibleRegexpbinBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    Datum parm0 = convertParameterToText(parm0Type, parm0Val);
-    Datum parm1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
-    return DirectFunctionCall2Coll(textregexeq, COLLATION, parm0, parm1);
-}
-
-static Datum 
-byteaRegexpbinAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val)
-{
-    Datum parm0 = DirectFunctionCall1(mys_bytea2text, parm0Val);
-    Datum parm1 = convertParameterToText(parm1Type, parm1Val);
-    return DirectFunctionCall2Coll(textregexeq, COLLATION, parm0, parm1);
-}
-
-static Datum 
-anycompatibleNregexpbinBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    Datum parm0 = convertParameterToText(parm0Type, parm0Val);
-    Datum parm1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
-    return DirectFunctionCall2Coll(textregexne, COLLATION, parm0, parm1);
-}
-
-static Datum 
-byteaNregexpbinAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val)
-{
-    Datum parm0 = DirectFunctionCall1(mys_bytea2text, parm0Val);
-    Datum parm1 = convertParameterToText(parm1Type, parm1Val);
-    return DirectFunctionCall2Coll(textregexne, COLLATION, parm0, parm1);
-}
-
-static Datum 
-anycompatibleLtBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    if (parm0Type == INT2OID)
-    {
-        /* int2 (oid: 21) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_lt, parm0, parm1);
-    }
-    else if (parm0Type == INT4OID)
-    {
-        /* int4 (oid: 23) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_lt, parm0, parm1);
-    }
-    else if (parm0Type == INT8OID)
-    {
-        /* int8 (oid: 20) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_lt, parm0, parm1);
-    }
-    else if (parm0Type == TEXTOID)
-    {
-        /* text (oid: 25) */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_lt, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
-            return DirectFunctionCall2Coll(text_lt, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == VARCHAROID)
-    {
-        /* varchar (oid: 1043) operator is same as text */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_lt, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2varchar, parm1Val);
-            return DirectFunctionCall2Coll(text_lt, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == BPCHAROID)
-    {
-        /* char (oid: 1042) */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_lt, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2bpchar, parm1Val);
-            return DirectFunctionCall2Coll(bpcharlt, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == NUMERICOID)
-    {
-        /* numeric (oid: 1700) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_lt, parm0, parm1);
-    }
-    else if (parm0Type == FLOAT4OID)
-    {
-        /* float4 (oid: 700) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_lt, parm0, parm1);
-    }
-    else if (parm0Type == FLOAT8OID)
-    {
-        /* float8 (oid: 701) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_lt, parm0, parm1);
-    }
-    else if (parm0Type == BOOLOID)
-    {
-        /* boolean (oid: 16) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_lt, parm0, parm1);
-    }
-    else if (parm0Type == TIMESTAMPOID)
-    {
-        /* timestamp (oid: 1114) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timestamp, parm1Val);
-        return DirectFunctionCall2(timestamp_lt, parm0, parm1);
-    }
-    else if (parm0Type == TIMESTAMPTZOID)
-    {
-        /* timestamptz (oid: 1184) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timestamptz, parm1Val);
-        return DirectFunctionCall2(timestamp_lt, parm0, parm1);
-    }
-    else if (parm0Type == TIMEOID)
-    {
-        /* time (oid: 1083) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2time, parm1Val);
-        return DirectFunctionCall2(time_lt, parm0, parm1);
-    }
-    else if (parm0Type == TIMETZOID)
-    {
-        /* timetz (oid: 1266) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timetz, parm1Val);
-        return DirectFunctionCall2(timetz_lt, parm0, parm1);
-    }
-    else if (parm0Type == DATEOID)
-    {
-        /* date (oid: 1082) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2date, parm1Val);
-        return DirectFunctionCall2(date_lt, parm0, parm1);
-    }
-    else if (parm0Type == BITOID)
-    {
-        /* date (oid: 1560) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_lt, parm0, parm1);
-    }
-    else if (parm0Type == VARBITOID)
-    {
-        /* date (oid: 1562) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_lt, parm0, parm1);
-    }
-    else 
-    {
-        elog(WARNING, "Invalid parameter tpye \"%d\" for \"anycompatibleLtBytea\" function.", parm0Type);
-        PG_RETURN_BOOL(false);
-    }
-}
-
-static Datum 
-anycompatibleLeBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    if (parm0Type == INT2OID)
-    {
-        /* int2 (oid: 21) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_le, parm0, parm1);
-    }
-    else if (parm0Type == INT4OID)
-    {
-        /* int4 (oid: 23) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_le, parm0, parm1);
-    }
-    else if (parm0Type == INT8OID)
-    {
-        /* int8 (oid: 20) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_le, parm0, parm1);
-    }
-    else if (parm0Type == TEXTOID)
-    {
-        /* text (oid: 25) */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_le, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
-            return DirectFunctionCall2Coll(text_le, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == VARCHAROID)
-    {
-        /* varchar (oid: 1043) operator is same as text */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_le, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2varchar, parm1Val);
-            return DirectFunctionCall2Coll(text_le, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == BPCHAROID)
-    {
-        /* char (oid: 1042) */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_le, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2bpchar, parm1Val);
-            return DirectFunctionCall2Coll(bpcharle, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == NUMERICOID)
-    {
-        /* numeric (oid: 1700) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_le, parm0, parm1);
-    }
-    else if (parm0Type == FLOAT4OID)
-    {
-        /* float4 (oid: 700) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_le, parm0, parm1);
-    }
-    else if (parm0Type == FLOAT8OID)
-    {
-        /* float8 (oid: 701) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_le, parm0, parm1);
-    }
-    else if (parm0Type == BOOLOID)
-    {
-        /* boolean (oid: 16) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_le, parm0, parm1);
-    }
-    else if (parm0Type == TIMESTAMPOID)
-    {
-        /* timestamp (oid: 1114) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timestamp, parm1Val);
-        return DirectFunctionCall2(timestamp_le, parm0, parm1);
-    }
-    else if (parm0Type == TIMESTAMPTZOID)
-    {
-        /* timestamptz (oid: 1184) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timestamptz, parm1Val);
-        return DirectFunctionCall2(timestamp_le, parm0, parm1);
-    }
-    else if (parm0Type == TIMEOID)
-    {
-        /* time (oid: 1083) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2time, parm1Val);
-        return DirectFunctionCall2(time_le, parm0, parm1);
-    }
-    else if (parm0Type == TIMETZOID)
-    {
-        /* timetz (oid: 1266) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timetz, parm1Val);
-        return DirectFunctionCall2(timetz_le, parm0, parm1);
-    }
-    else if (parm0Type == DATEOID)
-    {
-        /* date (oid: 1082) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2date, parm1Val);
-        return DirectFunctionCall2(date_le, parm0, parm1);
-    }
-    else if (parm0Type == BITOID)
-    {
-        /* date (oid: 1560) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_le, parm0, parm1);
-    }
-    else if (parm0Type == VARBITOID)
-    {
-        /* date (oid: 1562) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_le, parm0, parm1);
-    }
-    else 
-    {
-        elog(WARNING, "Invalid parameter tpye \"%d\" for \"anycompatibleLtBytea\" function.", parm0Type);
-        PG_RETURN_BOOL(false);
-    }
-}
-
-static Datum 
-anycompatibleGtBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    if (parm0Type == INT2OID)
-    {
-        /* int2 (oid: 21) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_gt, parm0, parm1);
-    }
-    else if (parm0Type == INT4OID)
-    {
-        /* int4 (oid: 23) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_gt, parm0, parm1);
-    }
-    else if (parm0Type == INT8OID)
-    {
-        /* int8 (oid: 20) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_gt, parm0, parm1);
-    }
-    else if (parm0Type == TEXTOID)
-    {
-        /* text (oid: 25) */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_gt, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
-            return DirectFunctionCall2Coll(text_gt, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == VARCHAROID)
-    {
-        /* varchar (oid: 1043) operator is same as text */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_gt, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2varchar, parm1Val);
-            return DirectFunctionCall2Coll(text_gt, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == BPCHAROID)
-    {
-        /* char (oid: 1042) */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_gt, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2bpchar, parm1Val);
-            return DirectFunctionCall2Coll(bpchargt, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == NUMERICOID)
-    {
-        /* numeric (oid: 1700) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_gt, parm0, parm1);
-    }
-    else if (parm0Type == FLOAT4OID)
-    {
-        /* float4 (oid: 700) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_gt, parm0, parm1);
-    }
-    else if (parm0Type == FLOAT8OID)
-    {
-        /* float8 (oid: 701) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_gt, parm0, parm1);
-    }
-    else if (parm0Type == BOOLOID)
-    {
-        /* boolean (oid: 16) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_gt, parm0, parm1);
-    }
-    else if (parm0Type == TIMESTAMPOID)
-    {
-        /* timestamp (oid: 1114) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timestamp, parm1Val);
-        return DirectFunctionCall2(timestamp_gt, parm0, parm1);
-    }
-    else if (parm0Type == TIMESTAMPTZOID)
-    {
-        /* timestamptz (oid: 1184) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timestamptz, parm1Val);
-        return DirectFunctionCall2(timestamp_gt, parm0, parm1);
-    }
-    else if (parm0Type == TIMEOID)
-    {
-        /* time (oid: 1083) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2time, parm1Val);
-        return DirectFunctionCall2(time_gt, parm0, parm1);
-    }
-    else if (parm0Type == TIMETZOID)
-    {
-        /* timetz (oid: 1266) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timetz, parm1Val);
-        return DirectFunctionCall2(timetz_gt, parm0, parm1);
-    }
-    else if (parm0Type == DATEOID)
-    {
-        /* date (oid: 1082) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2date, parm1Val);
-        return DirectFunctionCall2(date_gt, parm0, parm1);
-    }
-    else if (parm0Type == BITOID)
-    {
-        /* date (oid: 1560) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_gt, parm0, parm1);
-    }
-    else if (parm0Type == VARBITOID)
-    {
-        /* date (oid: 1562) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_gt, parm0, parm1);
-    }
-    else 
-    {
-        elog(WARNING, "Invalid parameter tpye \"%d\" for \"anycompatibleLtBytea\" function.", parm0Type);
-        PG_RETURN_BOOL(false);
-    }
-}
-
-static Datum 
-anycompatibleGeBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    if (parm0Type == INT2OID)
-    {
-        /* int2 (oid: 21) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ge, parm0, parm1);
-    }
-    else if (parm0Type == INT4OID)
-    {
-        /* int4 (oid: 23) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ge, parm0, parm1);
-    }
-    else if (parm0Type == INT8OID)
-    {
-        /* int8 (oid: 20) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ge, parm0, parm1);
-    }
-    else if (parm0Type == TEXTOID)
-    {
-        /* text (oid: 25) */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_ge, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2text, parm1Val);
-            return DirectFunctionCall2Coll(text_ge, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == VARCHAROID)
-    {
-        /* varchar (oid: 1043) operator is same as text */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_ge, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2varchar, parm1Val);
-            return DirectFunctionCall2Coll(text_ge, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == BPCHAROID)
-    {
-        /* char (oid: 1042) */
-        bool isDigit = varValueIsDigit(parm1Val, BYTEAOID);
-        if (isDigit)
-        {
-            Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-            Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-            return DirectFunctionCall2(numeric_ge, parm0, parm1);
-        }
-        else
-        {
-            Datum parm0 = parm0Val;
-            Datum parm1 = DirectFunctionCall1(mys_bytea2bpchar, parm1Val);
-            return DirectFunctionCall2Coll(bpcharge, COLLATION, parm0, parm1);
-        }
-    }
-    else if (parm0Type == NUMERICOID)
-    {
-        /* numeric (oid: 1700) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ge, parm0, parm1);
-    }
-    else if (parm0Type == FLOAT4OID)
-    {
-        /* float4 (oid: 700) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ge, parm0, parm1);
-    }
-    else if (parm0Type == FLOAT8OID)
-    {
-        /* float8 (oid: 701) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ge, parm0, parm1);
-    }
-    else if (parm0Type == BOOLOID)
-    {
-        /* boolean (oid: 16) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ge, parm0, parm1);
-    }
-    else if (parm0Type == TIMESTAMPOID)
-    {
-        /* timestamp (oid: 1114) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timestamp, parm1Val);
-        return DirectFunctionCall2(timestamp_ge, parm0, parm1);
-    }
-    else if (parm0Type == TIMESTAMPTZOID)
-    {
-        /* timestamptz (oid: 1184) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timestamptz, parm1Val);
-        return DirectFunctionCall2(timestamp_ge, parm0, parm1);
-    }
-    else if (parm0Type == TIMEOID)
-    {
-        /* time (oid: 1083) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2time, parm1Val);
-        return DirectFunctionCall2(time_ge, parm0, parm1);
-    }
-    else if (parm0Type == TIMETZOID)
-    {
-        /* timetz (oid: 1266) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2timetz, parm1Val);
-        return DirectFunctionCall2(timetz_ge, parm0, parm1);
-    }
-    else if (parm0Type == DATEOID)
-    {
-        /* date (oid: 1082) */
-        Datum parm0 = parm0Val;
-        Datum parm1 = DirectFunctionCall1(mys_bytea2date, parm1Val);
-        return DirectFunctionCall2(date_ge, parm0, parm1);
-    }
-    else if (parm0Type == BITOID)
-    {
-        /* date (oid: 1560) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ge, parm0, parm1);
-    }
-    else if (parm0Type == VARBITOID)
-    {
-        /* date (oid: 1562) */
-        Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-        Datum parm1 = DirectFunctionCall1(mys_bytea2numeric, parm1Val);
-        return DirectFunctionCall2(numeric_ge, parm0, parm1);
-    }
-    else 
-    {
-        elog(WARNING, "Invalid parameter tpye \"%d\" for \"anycompatibleLtBytea\" function.", parm0Type);
-        PG_RETURN_BOOL(false);
-    }
-}
-
-static Datum 
-anycompatiblePlBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    Numeric	result;
-    Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-    Datum parm1 = bytea2numeric_internal(DatumGetByteaPP(parm1Val));
-    result = numeric_add_opt_error(DatumGetNumeric(parm0), 
-                                   DatumGetNumeric(parm1), 
-                                   NULL);
-    PG_RETURN_NUMERIC(result);
-}
-
-static Datum 
-anycompatibleMiBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    Numeric result;
-
-    Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-    Datum parm1 = bytea2numeric_internal(DatumGetByteaPP(parm1Val));
-    result = numeric_sub_opt_error(DatumGetNumeric(parm0), 
-                                   DatumGetNumeric(parm1), 
-                                   NULL);
-    PG_RETURN_NUMERIC(result);
-}
-
-static Datum 
-byteaMiAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val)
-{
-    Numeric result;
-
-    Datum parm0 = bytea2numeric_internal(DatumGetByteaPP(parm0Val));
-    Datum parm1 = convertParameterToNumeric(parm1Type, parm1Val);
-    result = numeric_sub_opt_error(DatumGetNumeric(parm0), 
-                                   DatumGetNumeric(parm1), 
-                                   NULL);
-
-    PG_RETURN_NUMERIC(result);
-}
-
-static Datum 
-anycompatibleMulBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    Numeric result;
-
-    Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-    Datum parm1 = bytea2numeric_internal(DatumGetByteaPP(parm1Val));
-    result = numeric_mul_opt_error(DatumGetNumeric(parm0), 
-                                   DatumGetNumeric(parm1), 
-                                   NULL);
-
-    PG_RETURN_NUMERIC(result);
-}
-
-static Datum 
-anycompatibleDivBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    Numeric result;
-
-    Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-    Datum parm1 = bytea2numeric_internal(DatumGetByteaPP(parm1Val));
-    result = numeric_div_opt_error(DatumGetNumeric(parm0), 
-                                   DatumGetNumeric(parm1), 
-                                   NULL);
-
-    PG_RETURN_NUMERIC(result);
+		if (meetNumber)
+		{
+			if (!meetWhiteSpace)
+			{
+				if (ch == ' ' || ch == '\t' || ch == '\n')
+				{
+					meetWhiteSpace = true;
+					str[index] = '\0';
+				}
+			}
+			else
+			{
+				if (ch != ' ' && ch != '\t' && ch != '\n')
+				{
+					/* Non-whitespace after trailing space: restore space so PG rejects it */
+					str[index - 1] = ' ';
+					return;
+				}
+				str[index] = '\0';
+			}
+		}
+		else if (isdigit(ch) || ch == '.')
+		{
+			meetNumber = true;
+		}
+	}
 }
 
 static Datum
-byteaDivAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val)
-{
-    Numeric result;
-
-    Datum parm0 = bytea2numeric_internal(DatumGetByteaPP(parm0Val));
-    Datum parm1 = convertParameterToNumeric(parm1Type, parm1Val);
-    result = numeric_div_opt_error(DatumGetNumeric(parm0), 
-                                   DatumGetNumeric(parm1), 
-                                   NULL);
-
-    PG_RETURN_NUMERIC(result);
-}
-
-static Datum 
-anycompatibleModBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    Numeric result;
-
-    Datum parm0 = convertParameterToNumeric(parm0Type, parm0Val);
-    Datum parm1 = bytea2numeric_internal(DatumGetByteaPP(parm1Val));
-    result = numeric_mod_opt_error(DatumGetNumeric(parm0), 
-                                   DatumGetNumeric(parm1), 
-                                   NULL);
-
-    PG_RETURN_NUMERIC(result);
-}
-
-static Datum
-byteaModAnycompatible(Oid parm1Type, Datum parm0Val, Datum parm1Val)
-{
-    Numeric result;
-
-    Datum parm0 = bytea2numeric_internal(DatumGetByteaPP(parm0Val));
-    Datum parm1 = convertParameterToNumeric(parm1Type, parm1Val);
-    result = numeric_mod_opt_error(DatumGetNumeric(parm0), DatumGetNumeric(parm1), NULL);
-
-    PG_RETURN_NUMERIC(result);
-}
-
-static Datum 
-anycompatibleAndBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    bool isDigit1 = varValueIsDigit(parm1Val, BYTEAOID);
-    Datum parm0Int64 = convertParameterToInt8(parm0Type, parm0Val);
-    Datum parm1Int64;
-
-    if (isDigit1)
-    {
-        Datum parm1Numeric = bytea2numeric_internal(
-                                                    DatumGetByteaPP(parm1Val));
-        parm1Int64 = DirectFunctionCall1(numeric_int8, parm1Numeric);
-    }
-    else
-    {
-        parm1Int64 = bytea2int8_internal(DatumGetByteaPP(parm1Val));
-    }
-
-    PG_RETURN_INT64(DatumGetInt64(parm0Int64) & DatumGetInt64(parm1Int64));
-}
-
-static Datum 
-anycompatibleOrBytea(Oid parm0Type, Datum parm0Val, Datum parm1Val)
-{
-    bool isDigit1 = varValueIsDigit(parm1Val, BYTEAOID);
-    Datum parm0Int64 = convertParameterToInt8(parm0Type, parm0Val);
-    Datum parm1Int64;
-
-    if (isDigit1)
-    {
-        Datum parm1Numeric = bytea2numeric_internal(
-                                                    DatumGetByteaPP(parm1Val));
-        parm1Int64 = DirectFunctionCall1(numeric_int8, parm1Numeric);
-    }
-    else
-    {
-        parm1Int64 = bytea2int8_internal(DatumGetByteaPP(parm1Val));
-    }
-
-    PG_RETURN_INT64(DatumGetInt64(parm0Int64) | DatumGetInt64(parm1Int64));
-}
-
-/**
- * 暂时不用
-static void 
-truncateStrForDigit(size_t strLen, char *str)
-{
-    bool signExist = false;
-    bool digitExist = false;
-    bool dotExist = false;
-    for (size_t index = 0; index < strLen; index++)
-    {
-        if (('0' <= str[index]) && (str[index] <= '9'))
-        {
-            if (!digitExist)
-            {
-                digitExist = true;
-            }
-        }
-        else if ((str[index] == '+') || (str[index] == '-'))
-        {
-            if (!digitExist && !dotExist && !signExist)
-            {
-                signExist = true;
-            }
-            else 
-            {
-                str[0] = '0';
-                str[1] = '\0';
-                break;
-            }
-        }
-        else if (str[index] == '.')
-        {
-            if (!dotExist)
-            {
-                dotExist = true;
-            }
-            else
-            {
-                str[index] = '\0';
-                break;
-            }
-        }
-        else if (str[index] == ' ')
-        {
-            if (!digitExist && !dotExist && !signExist)
-            {
-                continue;
-            }
-            else 
-            {
-                str[index] = '\0';
-                break;
-            }
-        }
-        else 
-        {
-            if (0 < index)
-            {
-                str[index] = '\0';
-            }
-            else 
-            {
-                str[0] = '0';
-                str[1] = '\0';
-            }
-            break;
-        }
-    }
-}
-**/
-
-static void 
-truncateStrTailWhileSpacesForDigit(size_t strLen, char *str)
-{
-    for (int i = (strLen - 1); i >= 0; i--)
-    {
-        if (str[i] != ' ')
-        {
-            break;
-        }
-        else
-        {
-            str[i] = '\0';
-        }
-    }
-}
-
-static Datum 
 convertParameterToText(Oid parmType, Datum parmVal)
 {
-    if (parmType == INT2OID)
-    {
-        /* int2 (oid: 21) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(int2out, parmVal)));
-    }
-    else if (parmType == INT4OID)
-    {
-        /* int4 (oid: 23) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(int4out, parmVal)));
-    }
-    else if (parmType == INT8OID)
-    {
-        /* int8 (oid: 20) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(int8out, parmVal)));
-    }
-    else if (parmType == TEXTOID)
-    {
-        /* text (oid: 25) */
-        return parmVal;
-    }
-    else if (parmType == VARCHAROID)
-    {
-        /* varchar (oid: 1043) operator is same as text */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(varcharout, parmVal)));
-    }
-    else if (parmType == BPCHAROID)
-    {
-        /* char (oid: 1042) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(bpcharout, parmVal)));
-    }
-    else if (parmType == NUMERICOID)
-    {
-        /* numeric (oid: 1700) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(numeric_out, parmVal)));
-    }
-    else if (parmType == FLOAT4OID)
-    {
-        /* float4 (oid: 700) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(float4out, parmVal)));
-    }
-    else if (parmType == FLOAT8OID)
-    {
-        /* float8 (oid: 701) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(float8out, parmVal)));
-    }
-    else if (parmType == BOOLOID)
-    {
-        /* boolean (oid: 16) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(boolout, parmVal)));
-    }
-    else if (parmType == TIMESTAMPOID)
-    {
-        /* timestamp (oid: 1114) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(timestamp_out, parmVal)));
-    }
-    else if (parmType == TIMESTAMPTZOID)
-    {
-        /* timestamptz (oid: 1184) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(timestamptz_out, parmVal)));
-    }
-    else if (parmType == TIMEOID)
-    {
-        /* time (oid: 1083) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(time_out, parmVal)));
-    }
-    else if (parmType == TIMETZOID)
-    {
-        /* timetz (oid: 1266) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(timetz_out, parmVal)));
-    }
-    else if (parmType == DATEOID)
-    {
-        /* date (oid: 1082) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(date_out, parmVal)));
-    }
-    else if (parmType == BITOID)
-    {
-        /* date (oid: 1560) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(bit_out, parmVal)));
-    }
-    else if (parmType == VARBITOID)
-    {
-        /* date (oid: 1562) */
-        return CStringGetTextDatum(DatumGetCString(DirectFunctionCall1(varbit_out, parmVal)));
-    }
-    else 
-    {
-        elog(ERROR, "Invalid parameter tpye \"%d\" for \"anycompatibleEqBytea\" function.", parmType);
-    }
+	if (parmType == TEXTOID || parmType == VARCHAROID)
+		return parmVal;
+	if (parmType == BPCHAROID)
+		return DirectFunctionCall1(rtrim1, parmVal);
+	if (parmType == BOOLOID)
+	{
+		const char *s = DatumGetBool(parmVal) ? "1" : "0";
+
+		return PointerGetDatum(cstring_to_text_with_len(s, 1));
+	}
+	else
+	{
+		Oid			typOutput;
+		bool		typIsVarlena;
+		char	   *str;
+		text	   *res;
+
+		getTypeOutputInfo(parmType, &typOutput, &typIsVarlena);
+		str = OidOutputFunctionCall(typOutput, parmVal);
+		res = cstring_to_text(str);
+		pfree(str);
+		return PointerGetDatum(res);
+	}
+}
+
+static int64
+varbit_to_int64_checked(VarBit *vb)
+{
+	int32		bitLen = VARBITLEN(vb);
+	bits8	   *sp = VARBITS(vb);
+	uint64		acc = 0;
+	int32		k;
+
+	if (bitLen > 64)
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("bigint out of range")));
+
+	for (k = 0; k < bitLen; k++)
+	{
+		acc <<= 1;
+		if (sp[k / BITS_PER_BYTE] & (0x80 >> (k % BITS_PER_BYTE)))
+			acc |= 1;
+	}
+
+	if (acc > (uint64) PG_INT64_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("bigint out of range")));
+
+	return (int64) acc;
+}
+
+static Datum
+cstring_leading_to_numeric(const char *s, size_t len)
+{
+	char	   *numStr = NULL;
+	Datum		res;
+
+	extract_mysql_leading_number(s, len, &numStr);
+	res = DirectFunctionCall3(numeric_in,
+							  CStringGetDatum(numStr),
+							  ObjectIdGetDatum(InvalidOid),
+							  Int32GetDatum(-1));
+	pfree(numStr);
+	return res;
 }
 
 static Datum
 convertParameterToNumeric(Oid parmType, Datum parm)
 {
-    Datum result;
+	char		parmStr[MAXDATELEN + 1];
 
-    if (parmType == INT2OID)
-    {
-        /* int2 (oid: 21) */
-        result = NumericGetDatum(int64_to_numeric(DatumGetInt16(parm)));
-    }
-    else if (parmType == INT4OID)
-    {
-        /* int4 (oid: 23) */
-        result = NumericGetDatum(int64_to_numeric(DatumGetInt32(parm)));
-    }
-    else if (parmType == INT8OID)
-    {
-        /* int8 (oid: 20) */
-        result = NumericGetDatum(int64_to_numeric(DatumGetInt64(parm)));
-    }
-    else if (parmType == TEXTOID)
-    {
-        /* text (oid: 25) */
-        char *parmStr = TextDatumGetCString(parm);
-        size_t parmStrLen = strlen(parmStr);
-        truncateStrTailWhileSpacesForDigit(parmStrLen, parmStr);
-        result = DirectFunctionCall3(numeric_in,
-                                     CStringGetDatum(parmStr),
-                                     ObjectIdGetDatum(InvalidOid),
-                                     Int32GetDatum(-1));
-    }
-    else if (parmType == VARCHAROID)
-    {
-        /* varchar (oid: 1043) operator is same as float8 */
-        char *parmStr = TextDatumGetCString(parm);
-        size_t parmStrLen = strlen(parmStr);
-        truncateStrTailWhileSpacesForDigit(parmStrLen, parmStr);
-        result = DirectFunctionCall3(numeric_in,
-                                     CStringGetDatum(parmStr),
-                                     ObjectIdGetDatum(InvalidOid),
-                                     Int32GetDatum(-1));
-    }
-    else if (parmType == BPCHAROID)
-    {
-        /* char (oid: 1042) */
-        char *parmStr = TextDatumGetCString(parm);
-        size_t parmStrLen = strlen(parmStr);
-        truncateStrTailWhileSpacesForDigit(parmStrLen, parmStr);
-        result = DirectFunctionCall3(numeric_in,
-                                     CStringGetDatum(parmStr),
-                                     ObjectIdGetDatum(InvalidOid),
-                                     Int32GetDatum(-1));
-    }
-    else if (parmType == NUMERICOID)
-    {
-        /* numeric (oid: 1700) */
-        result = parm;
-    }
-    else if (parmType == FLOAT4OID)
-    {
-        /* float4 (oid: 700) */
-        result = DirectFunctionCall1(float4_numeric, parm);
-    }
-    else if (parmType == FLOAT8OID)
-    {
-        /* float8 (oid: 701) */
-        result = DirectFunctionCall1(float8_numeric, parm);
-    }
-    else if (parmType == BOOLOID)
-    {
-        /* boolean (oid: 16) */
-        char *parmStr;
-        bool parmBool = DatumGetBool(parm);
-        if (parmBool)
-        {
-            parmStr = "1";
-        }
-        else 
-        {
-            parmStr = "0";
-        }
-        result = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum(parmStr),
-								     ObjectIdGetDatum(InvalidOid),
-								     Int32GetDatum(-1));
-    }
-    else if (parmType == TIMESTAMPOID)
-    {
-        /* timestamp (oid: 1114) */
-        Timestamp parmTimestamp = DatumGetTimestamp(parm);
-        struct pg_tm tt;
-        struct pg_tm *tm = &tt;
-        fsec_t fsec;
-        char parmStr[MAXDATELEN + 1];
+	switch (parmType)
+	{
+		case INT2OID:
+			return DirectFunctionCall1(int2_numeric, parm);
+		case INT4OID:
+			return DirectFunctionCall1(int4_numeric, parm);
+		case INT8OID:
+			return DirectFunctionCall1(int8_numeric, parm);
+		case FLOAT4OID:
+			return DirectFunctionCall1(float4_numeric, parm);
+		case FLOAT8OID:
+			return DirectFunctionCall1(float8_numeric, parm);
+		case NUMERICOID:
+			return parm;
+		case TEXTOID:
+		case VARCHAROID:
+		case BPCHAROID:
+			{
+				text	   *t = DatumGetTextPP(parm);
 
-        if (timestamp2tm(parmTimestamp, NULL, tm, &fsec, NULL, NULL) == 0)
-        {
-            char *strp = parmStr;
-            strp = pg_ultostr_zeropad(strp, (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 4);
-            strp = pg_ultostr_zeropad(strp, tm->tm_mon, 2);
-            strp = pg_ultostr_zeropad(strp, tm->tm_mday, 2);
-            strp = pg_ultostr_zeropad(strp, tm->tm_hour, 2);
-            strp = pg_ultostr_zeropad(strp, tm->tm_min, 2);
-            strp = AppendSeconds(strp, tm->tm_sec, fsec, MAX_TIMESTAMP_PRECISION, true);
-            *strp = '\0';
-        }		
-        else
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-                    errmsg("timestamp out of range")));
+				return cstring_leading_to_numeric(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t));
+			}
+		case DATEOID:
+			format_date_numeric_str(DatumGetDateADT(parm), parmStr);
+			return DirectFunctionCall3(numeric_in,
+									   CStringGetDatum(parmStr),
+									   ObjectIdGetDatum(InvalidOid),
+									   Int32GetDatum(-1));
+		case TIMEOID:
+			format_time_numeric_str(DatumGetTimeADT(parm), parmStr, sizeof(parmStr));
+			return DirectFunctionCall3(numeric_in,
+									   CStringGetDatum(parmStr),
+									   ObjectIdGetDatum(InvalidOid),
+									   Int32GetDatum(-1));
+		case TIMETZOID:
+			{
+				/* Copy TimeTzADT locally; never mutate pass-by-reference Datum! */
+				TimeTzADT	local_tz = *DatumGetTimeTzADTP(parm);
 
-        result = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum(parmStr),
-								     ObjectIdGetDatum(InvalidOid),
-								     Int32GetDatum(-1));
-    }
-    else if (parmType == TIMESTAMPTZOID)
-    {
-        /* timestamptz (oid: 1184) */
-        TimestampTz parmTimestamptz = DatumGetTimestampTz(parm);
-        int	tz;
-        struct pg_tm tt;
-        struct pg_tm *tm = &tt;
-        fsec_t fsec;
-        const char *tzn;
-        char parmStr[MAXDATELEN + 1];
+				format_time_numeric_str(local_tz.time, parmStr, sizeof(parmStr));
+				return DirectFunctionCall3(numeric_in,
+										   CStringGetDatum(parmStr),
+										   ObjectIdGetDatum(InvalidOid),
+										   Int32GetDatum(-1));
+			}
+		case TIMESTAMPOID:
+			format_timestamp_numeric_str(DatumGetTimestamp(parm), NULL, parmStr);
+			return DirectFunctionCall3(numeric_in,
+									   CStringGetDatum(parmStr),
+									   ObjectIdGetDatum(InvalidOid),
+									   Int32GetDatum(-1));
+		case TIMESTAMPTZOID:
+			{
+				int			tz = 0;
 
-        if (timestamp2tm(parmTimestamptz, &tz, tm, &fsec, &tzn, NULL) == 0)
-        {
-            char *strp = parmStr;
-            strp = pg_ultostr_zeropad(strp, (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 4);
-            strp = pg_ultostr_zeropad(strp, tm->tm_mon, 2);
-            strp = pg_ultostr_zeropad(strp, tm->tm_mday, 2);
-            strp = pg_ultostr_zeropad(strp, tm->tm_hour, 2);
-            strp = pg_ultostr_zeropad(strp, tm->tm_min, 2);
-            strp = AppendSeconds(strp, tm->tm_sec, fsec, MAX_TIMESTAMP_PRECISION, true);
-            *strp = '\0';
-        }
-        else
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-                    errmsg("timestamp out of range")));
-        
-        result = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum(parmStr),
-								     ObjectIdGetDatum(InvalidOid),
-								     Int32GetDatum(-1));
-    }
-    else if (parmType == TIMEOID)
-    {
-        /* time (oid: 1083) */
-        TimeADT parmTime = DatumGetTimeADT(parm);
-        char parmStr[MAXDATELEN + 1];
-        struct pg_tm tt;
-		struct pg_tm *tm = &tt;
-        fsec_t fsec;
-        char buf[MAXDATELEN + 1];
-        char *strp;
-        bool nega = false;
+				format_timestamp_numeric_str(DatumGetTimestampTz(parm), &tz, parmStr);
+				return DirectFunctionCall3(numeric_in,
+										   CStringGetDatum(parmStr),
+										   ObjectIdGetDatum(InvalidOid),
+										   Int32GetDatum(-1));
+			}
+		case BOOLOID:
+			return DirectFunctionCall1(int4_numeric,
+									   Int32GetDatum(DatumGetBool(parm) ? 1 : 0));
+		case BITOID:
+		case VARBITOID:
+			return DirectFunctionCall1(int8_numeric,
+									   Int64GetDatum(varbit_to_int64_checked(DatumGetVarBitP(parm))));
+		case BYTEAOID:
+			return bytea2numeric_internal(DatumGetByteaPP(parm));
+		default:
+			if (mys_binary_base_type(parmType) == BYTEAOID)
+				return bytea2numeric_internal(DatumGetByteaPP(parm));
+			{
+				Oid			typOutput;
+				bool		typIsVarlena;
+				char	   *str;
+				Datum		res;
 
-        if (parmTime < 0)
-        {
-            nega = true;
-            parmTime = parmTime * -1;
-        }
+				getTypeOutputInfo(parmType, &typOutput, &typIsVarlena);
+				str = OidOutputFunctionCall(typOutput, parm);
+				res = cstring_leading_to_numeric(str, strlen(str));
+				pfree(str);
+				return res;
+			}
+	}
+}
 
-        strp = buf;
-        time2tm(parmTime, tm, &fsec);
-        strp = pg_ultostr_zeropad(strp, tm->tm_hour, 2);
-        strp = pg_ultostr_zeropad(strp, tm->tm_min, 2);
-        strp = AppendSeconds(strp, tm->tm_sec, fsec, MAX_TIME_PRECISION, true);
-        *strp = '\0';
+static Datum
+numeric_datum_to_int8_rounded(Datum numDatum)
+{
+	Datum		rounded = DirectFunctionCall2(numeric_round, numDatum, Int32GetDatum(0));
 
-        if (nega)
-        {
-            pg_snprintf(parmStr, MAXDATELEN, "-%s", buf);
-        }
-        else
-        {
-            pg_snprintf(parmStr, MAXDATELEN, "%s", buf);
-        }
-
-        result = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum(parmStr),
-								     ObjectIdGetDatum(InvalidOid),
-								     Int32GetDatum(-1));
-    }
-    else if (parmType == TIMETZOID)
-    {
-        /* timetz (oid: 1266) */
-        TimeTzADT *parmTimetz = DatumGetTimeTzADTP(parm);
-        char parmStr[MAXDATELEN + 1];
-        struct pg_tm tt;
-		struct pg_tm *tm = &tt;
-        fsec_t fsec;
-        int tz;
-        char buf[MAXDATELEN + 1];
-        char *strp;
-        bool nega = false;
-
-        if (parmTimetz->time < 0)
-        {
-            nega = true;
-            parmTimetz->time = parmTimetz->time * -1;
-        }
-        
-        strp = buf;
-        timetz2tm(parmTimetz, tm, &fsec, &tz);
-        strp = pg_ultostr_zeropad(strp, tm->tm_hour, 2);
-        strp = pg_ultostr_zeropad(strp, tm->tm_min, 2);
-        strp = AppendSeconds(strp, tm->tm_sec, fsec, MAX_TIME_PRECISION, true);
-        *strp = '\0';
-
-        if (nega)
-        {
-            pg_snprintf(parmStr, MAXDATELEN, "-%s", buf);
-        }
-        else
-        {
-            pg_snprintf(parmStr, MAXDATELEN, "%s", buf);
-        }
-
-        result = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum(parmStr),
-								     ObjectIdGetDatum(InvalidOid),
-								     Int32GetDatum(-1));
-    }
-    else if (parmType == DATEOID)
-    {
-        /* date (oid: 1082) */
-        DateADT parmDate = DatumGetDateADT(parm);
-        struct pg_tm tt;
-        struct pg_tm *tm = &tt;
-        char parmStr[MAXDATELEN + 1];
-        char *strp;
-
-        strp = parmStr;
-        j2date(parmDate + POSTGRES_EPOCH_JDATE,
-			   &(tm->tm_year), &(tm->tm_mon), &(tm->tm_mday));
-        strp = pg_ultostr_zeropad(strp, (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 4);
-        strp = pg_ultostr_zeropad(strp, tm->tm_mon, 2);
-        strp = pg_ultostr_zeropad(strp, tm->tm_mday, 2);
-        *strp = '\0';
-
-        result = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum(parmStr),
-								     ObjectIdGetDatum(InvalidOid),
-								     Int32GetDatum(-1));
-    }
-    else if (parmType == BITOID)
-    {
-        /* bit (oid: 1560) */
-        int64 parmNum;
-        char parmStr[30 + 1];
-        parmNum = (int64)DirectFunctionCall1(bittoint8, parm);
-        pg_snprintf(parmStr, 30, "%lu", (uint64)parmNum);
-        result = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum(parmStr),
-								     ObjectIdGetDatum(InvalidOid),
-								     Int32GetDatum(-1));
-    }
-    else if (parmType == VARBITOID)
-    {
-        /* varbit (oid: 1562) */
-        //result = // convert to float8
-        int64 parmNum;
-        char parmStr[30 + 1];
-        parmNum = (int64)DirectFunctionCall1(bittoint8, parm);
-        pg_snprintf(parmStr, 30, "%lu", (uint64)parmNum);
-        result = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum(parmStr),
-								     ObjectIdGetDatum(InvalidOid),
-								     Int32GetDatum(-1));
-    }
-    else if (parmType == BYTEAOID)
-    {
-        result = bytea2numeric_internal(DatumGetByteaPP(parm));
-    }
-    else 
-    {
-        elog(ERROR, "Invalid parameter tpye \"%d\" for \"anycompatibleEqBytea\" function.", parmType);
-    }
-
-    return result;
+	return DirectFunctionCall1(numeric_int8, rounded);
 }
 
 static Datum
 convertParameterToInt8(Oid parmType, Datum parm)
 {
-    Datum result;
-
-    if (parmType == INT2OID)
-    {
-        /* int2 (oid: 21) */
-        int16 parmVal = DatumGetInt16(parm);
-
-        result = Int64GetDatum((int64)parmVal);
-    }
-    else if (parmType == INT4OID)
-    {
-        /* int4 (oid: 23) */
-        int32 parmVal = DatumGetInt32(parm);
-
-        result = Int64GetDatum((int64)parmVal);
-    }
-    else if (parmType == INT8OID)
-    {
-        /* int8 (oid: 20) */
-        result = parm;
-    }
-    else if (parmType == TEXTOID)
-    {
-        /* text (oid: 25) */
-        int64 resultTemp;
-        char *parmVal = TextDatumGetCString(parm);
-        scanint8(parmVal, false, &resultTemp);
-        result = Int64GetDatum(resultTemp);
-    }
-    else if (parmType == VARCHAROID)
-    {
-        /* varchar (oid: 1043) operator is same as text */
-        int64 resultTemp;
-        char *parmVal = TextDatumGetCString(parm);
-        scanint8(parmVal, false, &resultTemp);
-        result = Int64GetDatum(resultTemp);
-    }
-    else if (parmType == BPCHAROID)
-    {
-        /* char (oid: 1042) */
-        int64 resultTemp;
-        char *parmVal = TextDatumGetCString(parm);
-        /* TODO: 去掉尾部空格 */
-        scanint8(parmVal, false, &resultTemp);
-        result = Int64GetDatum(resultTemp);
-    }
-    else if (parmType == NUMERICOID)
-    {
-        /* numeric (oid: 1700) */
-        result = DirectFunctionCall1(numeric_int8, parm);
-    }
-    else if (parmType == FLOAT4OID)
-    {
-        /* float4 (oid: 700) */
-        result = DirectFunctionCall1(ftoi8, parm);
-    }
-    else if (parmType == FLOAT8OID)
-    {
-        /* float8 (oid: 701) */
-        result = DirectFunctionCall1(dtoi8, parm);
-    }
-    else if (parmType == BOOLOID)
-    {
-        /* boolean (oid: 16) */
-        bool parmVal = DatumGetBool(parm);
-        if (parmVal)
-        {
-            result = Int64GetDatum((int64)1);
-        }
-        else 
-        {
-            result = Int64GetDatum((int64)0);
-        }
-    }
-    else if (parmType == TIMESTAMPOID)
-    {
-        /* timestamp (oid: 1114) */
-        Timestamp parmTimestamp = DatumGetTimestamp(parm);
-        struct pg_tm tt;
-        struct pg_tm *tm = &tt;
-        fsec_t fsec;
-        char parmStr[MAXDATELEN + 1];
-        Datum numericTemp;
-
-        if (timestamp2tm(parmTimestamp, NULL, tm, &fsec, NULL, NULL) == 0)
-        {
-            char *strp = parmStr;
-            strp = pg_ultostr_zeropad(strp, (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 4);
-            strp = pg_ultostr_zeropad(strp, tm->tm_mon, 2);
-            strp = pg_ultostr_zeropad(strp, tm->tm_mday, 2);
-            strp = pg_ultostr_zeropad(strp, tm->tm_hour, 2);
-            strp = pg_ultostr_zeropad(strp, tm->tm_min, 2);
-            strp = AppendSeconds(strp, tm->tm_sec, fsec, MAX_TIMESTAMP_PRECISION, true);
-            *strp = '\0';
-        }		
-        else
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-                    errmsg("timestamp out of range")));
-        
-        numericTemp = DirectFunctionCall3(numeric_in,
-								          CStringGetDatum(parmStr),
-                                          ObjectIdGetDatum(InvalidOid),
-                                          Int32GetDatum(-1));
-        
-        result = DirectFunctionCall1(numeric_int8, numericTemp);
-    }
-    else if (parmType == TIMESTAMPTZOID)
-    {
-        /* timestamptz (oid: 1184) */
-        TimestampTz parmTimestamptz = DatumGetTimestampTz(parm);
-        int	tz;
-        struct pg_tm tt;
-        struct pg_tm *tm = &tt;
-        fsec_t fsec;
-        const char *tzn;
-        char parmStr[MAXDATELEN + 1];
-        Datum numericTemp;
-
-        if (timestamp2tm(parmTimestamptz, &tz, tm, &fsec, &tzn, NULL) == 0)
-        {
-            char *strp = parmStr;
-            strp = pg_ultostr_zeropad(strp, (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 4);
-            strp = pg_ultostr_zeropad(strp, tm->tm_mon, 2);
-            strp = pg_ultostr_zeropad(strp, tm->tm_mday, 2);
-            strp = pg_ultostr_zeropad(strp, tm->tm_hour, 2);
-            strp = pg_ultostr_zeropad(strp, tm->tm_min, 2);
-            strp = AppendSeconds(strp, tm->tm_sec, fsec, MAX_TIMESTAMP_PRECISION, true);
-            *strp = '\0';
-        }
-        else
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-                    errmsg("timestamp out of range")));
-        
-        numericTemp = DirectFunctionCall3(numeric_in,
-                                          CStringGetDatum(parmStr),
-                                          ObjectIdGetDatum(InvalidOid),
-                                          Int32GetDatum(-1));
-        
-        result = DirectFunctionCall1(numeric_int8, numericTemp);
-    }
-    else if (parmType == TIMEOID)
-    {
-        /* time (oid: 1083) */
-        TimeADT parmTime = DatumGetTimeADT(parm);
-        char parmStr[MAXDATELEN + 1];
-        struct pg_tm tt;
-		struct pg_tm *tm = &tt;
-        fsec_t fsec;
-        char buf[MAXDATELEN + 1];
-        char *strp;
-        Datum numericTemp;
-        bool nega = false;
-
-        if (parmTime < 0)
-        {
-            nega = true;
-            parmTime = parmTime * -1;
-        }
-
-        strp = buf;
-        time2tm(parmTime, tm, &fsec);
-        strp = pg_ultostr_zeropad(strp, tm->tm_hour, 2);
-        strp = pg_ultostr_zeropad(strp, tm->tm_min, 2);
-        strp = AppendSeconds(strp, tm->tm_sec, fsec, MAX_TIME_PRECISION, true);
-        *strp = '\0';
-
-        if (nega)
-        {
-            pg_snprintf(parmStr, MAXDATELEN, "-%s", buf);
-        }
-        else
-        {
-            pg_snprintf(parmStr, MAXDATELEN, "%s", buf);
-        }
-
-        numericTemp = DirectFunctionCall3(numeric_in,
-                                          CStringGetDatum(parmStr),
-                                          ObjectIdGetDatum(InvalidOid),
-                                          Int32GetDatum(-1));
-        
-        result = DirectFunctionCall1(numeric_int8, numericTemp);
-    }
-    else if (parmType == TIMETZOID)
-    {
-        /* timetz (oid: 1266) */
-        TimeTzADT *parmTimetz = DatumGetTimeTzADTP(parm);
-        char parmStr[MAXDATELEN + 1];
-        struct pg_tm tt;
-		struct pg_tm *tm = &tt;
-        fsec_t fsec;
-        int tz;
-        char buf[MAXDATELEN + 1];
-        char *strp;
-        Datum numericTemp;
-        bool nega = false;
-
-        if (parmTimetz->time < 0)
-        {
-            nega = true;
-            parmTimetz->time = parmTimetz->time * -1;
-        }
-        
-        strp = buf;
-        timetz2tm(parmTimetz, tm, &fsec, &tz);
-        strp = pg_ultostr_zeropad(strp, tm->tm_hour, 2);
-        strp = pg_ultostr_zeropad(strp, tm->tm_min, 2);
-        strp = AppendSeconds(strp, tm->tm_sec, fsec, MAX_TIME_PRECISION, true);
-        *strp = '\0';
-
-        if (nega)
-        {
-            pg_snprintf(parmStr, MAXDATELEN, "-%s", buf);
-        }
-        else
-        {
-            pg_snprintf(parmStr, MAXDATELEN, "%s", buf);
-        }
-
-        numericTemp = DirectFunctionCall3(numeric_in,
-								     CStringGetDatum(parmStr),
-								     ObjectIdGetDatum(InvalidOid),
-								     Int32GetDatum(-1));
-        
-        result = DirectFunctionCall1(numeric_int8, numericTemp);
-    }
-    else if (parmType == DATEOID)
-    {
-        /* date (oid: 1082) */
-        DateADT parmDate = DatumGetDateADT(parm);
-        struct pg_tm tt;
-        struct pg_tm *tm = &tt;
-        char parmStr[MAXDATELEN + 1];
-        char *strp;
-
-        strp = parmStr;
-        j2date(parmDate + POSTGRES_EPOCH_JDATE,
-			   &(tm->tm_year), &(tm->tm_mon), &(tm->tm_mday));
-        strp = pg_ultostr_zeropad(strp, (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 4);
-        strp = pg_ultostr_zeropad(strp, tm->tm_mon, 2);
-        strp = pg_ultostr_zeropad(strp, tm->tm_mday, 2);
-        *strp = '\0';
-
-        result = DirectFunctionCall1(int8in,
-								     CStringGetDatum(parmStr));
-    }
-    else if (parmType == BITOID)
-    {
-        /* date (oid: 1560) */
-        result = DirectFunctionCall1(bittoint8,
-                                     parm);
-    }
-    else if (parmType == VARBITOID)
-    {
-        /* date (oid: 1562) */
-        result = DirectFunctionCall1(bittoint8,
-                                     parm);
-    }
-    else 
-    {
-        elog(ERROR, "Invalid parameter tpye \"%d\" for \"anycompatibleEqBytea\" function.", parmType);
-    }
-
-    return result;
+	switch (parmType)
+	{
+		case INT2OID:
+			return DirectFunctionCall1(int28, parm);
+		case INT4OID:
+			return DirectFunctionCall1(int48, parm);
+		case INT8OID:
+			return parm;
+		case FLOAT4OID:
+			return DirectFunctionCall1(ftoi8, parm);
+		case FLOAT8OID:
+			return DirectFunctionCall1(dtoi8, parm);
+		case NUMERICOID:
+			return numeric_datum_to_int8_rounded(parm);
+		case BOOLOID:
+			return Int64GetDatum(DatumGetBool(parm) ? 1 : 0);
+		case BITOID:
+		case VARBITOID:
+			return Int64GetDatum(varbit_to_int64_checked(DatumGetVarBitP(parm)));
+		case BYTEAOID:
+			return bytea2int8_internal(DatumGetByteaPP(parm));
+		default:
+			if (mys_binary_base_type(parmType) == BYTEAOID)
+				return bytea2int8_internal(DatumGetByteaPP(parm));
+			return numeric_datum_to_int8_rounded(convertParameterToNumeric(parmType, parm));
+	}
 }
 
-/*
- * Append seconds and fractional seconds (if any) at *cp.
- *
- * precision is the max number of fraction digits, fillzeros says to
- * pad to two integral-seconds digits.
- *
- * Returns a pointer to the new end of string.  No NUL terminator is put
- * there; callers are responsible for NUL terminating str themselves.
- *
- * Note that any sign is stripped from the input seconds values.
- */
+static Datum
+bytea2int8_internal(bytea *vlena)
+{
+	return numeric_datum_to_int8_rounded(bytea2numeric_internal(vlena));
+}
+
+static Datum
+bytea2numeric_internal(bytea *vlena)
+{
+	return cstring_leading_to_numeric(VARDATA_ANY(vlena), VARSIZE_ANY_EXHDR(vlena));
+}
+
 static char *
 AppendSeconds(char *cp, int sec, fsec_t fsec, int precision, bool fillzeros)
 {
-    Assert(precision >= 0);
+	Assert(precision >= 0);
 
-    if (fillzeros)
-        cp = pg_ultostr_zeropad(cp, Abs(sec), 2);
-    else
-        cp = pg_ultostr(cp, Abs(sec));
+	if (fillzeros)
+		cp = pg_ultostr_zeropad(cp, sec, 2);
+	else
+		cp = pg_ultostr(cp, sec);
 
-    /* fsec_t is just an int32 */
-    if (fsec != 0)
-    {
-        int32		value = Abs(fsec);
-        char	   *end = &cp[precision + 1];
-        bool		gotnonzero = false;
+	if (fsec != 0)
+	{
+		int32		value = Abs(fsec);
+		char	   *end = &cp[precision + 1];
+		bool		gotnonzero = false;
 
-        *cp++ = '.';
+		*cp++ = '.';
 
-        /*
-         * Append the fractional seconds part.  Note that we don't want any
-         * trailing zeros here, so since we're building the number in reverse
-         * we'll skip appending zeros until we've output a non-zero digit.
-         */
-        while (precision--)
-        {
-            int32		oldval = value;
-            int32		remainder;
+		while (precision--)
+		{
+			int32		oldval = value;
+			int32		remainder;
 
-            value /= 10;
-            remainder = oldval - value * 10;
+			value /= 10;
+			remainder = oldval - value * 10;
 
-            /* check if we got a non-zero */
-            if (remainder)
-                gotnonzero = true;
+			if (remainder)
+				gotnonzero = true;
 
-            if (gotnonzero)
-                cp[precision] = '0' + remainder;
-            else
-                end = &cp[precision];
-        }
-
-        /*
-         * If we still have a non-zero value then precision must have not been
-		 * enough to print the number.  We punt the problem to pg_ltostr(),
-		 * which will generate a correct answer in the minimum valid width.
-		 */
-		if (value)
-			return pg_ultostr(cp, Abs(fsec));
+			if (gotnonzero)
+				cp[precision] = '0' + remainder;
+			else
+				end = &cp[precision];
+		}
 
 		return end;
 	}
 	else
 		return cp;
 }
-
-//static Datum 
-//convertByteaToInt2(Datum val)
-//{
-//    // TODO:
-//    return NULL;
-//}
-//
-//static Datum 
-//convertByteaToInt4(Datum val)
-//{
-//    // TODO:
-//    return NULL;
-//}
-//
-//static Datum 
-//convertByteaToInt8(Datum val)
-//{
-//    // TODO:
-//    return NULL;
-//}
-//
-//static Datum
-//convertByteaToText(Datum val)
-//{
-//    // TODO:
-//    return NULL;
-//}
-//
-//static Datum
-//convertByteaToVarchar(Datum val)
-//{
-//    // TODO:
-//    return NULL;
-//}
-//
-//static Datum
-//convertByteaToChar(Datum val)
-//{
-//    // TODO:
-//    return NULL;
-//}
-

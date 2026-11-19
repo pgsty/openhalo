@@ -1,13 +1,18 @@
 /*-------------------------------------------------------------------------
+ *
  * mys_uservar.c
+ *	  MySQL session user-defined variable (@var) storage
  *
  * Copyright (c) 2026, PGSTY PTE. LTD.
  * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  *-------------------------------------------------------------------------
  */
+
 #include "postgres.h"
 #include "mysm_compat.h"
+#include "halo_mysql.h"
 
 #include "catalog/pg_type.h"
 #include "commands/mysql/mys_uservar.h"
@@ -15,431 +20,418 @@
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/varbit.h"
 
-#include "halo_mysql.h"
-
-#define VAR_VALUE_EXTEND_BYTES 1
+/*
+ * MySQL user variable names are case-insensitive and allow up to 64 UTF-8
+ * characters (<= 256 bytes plus NUL).
+ */
+#define MYS_USERVAR_KEYSIZE		257
 
 typedef struct MysqlUserVariableItem
 {
-    /* dynahash.c requires key to be first field */
-    char varName[NAMEDATALEN];
-    bytea *varValue;
-    bool isnull;
+	char		varName[MYS_USERVAR_KEYSIZE];
+	bytea	   *varValue;
+	bool		isDigit;
+	bool		isnull;
 } MysqlUserVariableItem;
 
+/*
+ * Track bytea* values returned by mysGetUserVarValueInternal() whose stored
+ * variable has isDigit = true, using a memory-context reset callback rather
+ * than writing out-of-bounds past VARSIZE_ANY().
+ */
+typedef struct DigitByteaTag
+{
+	MemoryContextCallback cb;
+	const bytea *ptr;
+	struct DigitByteaTag *prev;
+	struct DigitByteaTag *next;
+} DigitByteaTag;
+
 static HTAB *mysql_user_variables = NULL;
+static DigitByteaTag *digit_bytea_head = NULL;
 
-static void initMysqlUserVariableHashTable(void);
-static Datum byteastring2bytea(char *byteastring, bool isDigit);
-static Datum bitstring2bytea(char *bitstring, bool isDigit);
-static Datum boolstring2bytea(char *boolstring, bool isDigit);
-static Datum cstring2bytea(char *cstring, bool isDigit);
-static bytea *copyUserVarValue(bytea *varValue);
-
-
-void 
-clearUserVars(void)
+static void
+unlink_digit_bytea_tag(void *arg)
 {
-    HASH_SEQ_STATUS seq;
-    MysqlUserVariableItem *entry;
+	DigitByteaTag *tag = (DigitByteaTag *) arg;
 
-    if (mysql_user_variables == NULL)
-        return;
-    hash_seq_init(&seq, mysql_user_variables);
-    while ((entry = hash_seq_search(&seq)) != NULL)
-        if (!entry->isnull)
-            pfree(entry->varValue);
-    hash_destroy(mysql_user_variables);
-    mysql_user_variables = NULL;
+	if (tag->prev)
+		tag->prev->next = tag->next;
+	else
+		digit_bytea_head = tag->next;
+
+	if (tag->next)
+		tag->next->prev = tag->prev;
+
+	tag->prev = NULL;
+	tag->next = NULL;
+	tag->ptr = NULL;
 }
 
-
-bool
-varValueIsDigit(Datum varValue, Oid varValueType)
+static void
+register_digit_bytea(const bytea *ptr)
 {
-    bool isDigit = false;
+	DigitByteaTag *tag = (DigitByteaTag *) palloc(sizeof(DigitByteaTag));
 
-    if (varValueType == BYTEAOID)
-    {
-        /*
-         * 确保传入的varValue，内存使用palloc分配
-         */
-        bytea *vlena = DatumGetByteaPP(varValue);
-        size_t userVarValueExtendByteOffset = VARSIZE_ANY(vlena);
+	tag->ptr = ptr;
+	tag->prev = NULL;
+	tag->next = digit_bytea_head;
+	if (digit_bytea_head)
+		digit_bytea_head->prev = tag;
+	digit_bytea_head = tag;
 
-        isDigit = (((char *)vlena)[userVarValueExtendByteOffset] == '1') ? true : false;
-    }
-    else if (varValueType == BOOLOID)
-    {
-        isDigit = true;
-    }
-    else if (varValueType == BITOID || varValueType == VARBITOID)
-    {
-        isDigit = true;
-    }
-    else
-    {
-        char ncategory;
-		bool nispreferred;
-
-        get_type_category_preferred(varValueType, &ncategory, &nispreferred);
-
-        isDigit = (ncategory == TYPCATEGORY_NUMERIC) ? true : false;
-    }
-
-    return isDigit;
+	tag->cb.func = unlink_digit_bytea_tag;
+	tag->cb.arg = tag;
+	MemoryContextRegisterResetCallback(CurrentMemoryContext, &tag->cb);
 }
 
-
-void
-mysSetUserVarInternal(char *userVarName, char *userVarValue, Oid varValueType, bool isDigit, bool isNull)
+static bool
+is_registered_digit_bytea(const bytea *ptr)
 {
-    MysqlUserVariableItem *entry;
-    bool found;
-    MemoryContext oldContext;
+	const DigitByteaTag *cur;
 
-    /* Initialize the hash table, if necessary */
-	if (!mysql_user_variables)
-		initMysqlUserVariableHashTable();
-
-    entry = (MysqlUserVariableItem *) hash_search(mysql_user_variables,
-                                                  userVarName,
-                                                  HASH_ENTER,
-                                                  &found);
-
-    
-    if (found)
-    {
-        if (!entry->isnull)
-        {
-            pfree(entry->varValue);
-            entry->varValue = NULL;
-        }
-    }
-    else
-    {
-        /* Nothing to do */
-    }
-
-    oldContext = MemoryContextSwitchTo(TopMemoryContext);
-
-    if (!isNull)
-    {
-		Oid baseVarValueType = mys_binary_base_type(varValueType);
-        bytea *result = NULL;
-
-        if (baseVarValueType == BYTEAOID)
-        {
-            result = DatumGetByteaPP(byteastring2bytea(userVarValue, isDigit));
-        }
-        else if (baseVarValueType == BITOID || baseVarValueType == VARBITOID)
-        {
-            result = DatumGetByteaPP(bitstring2bytea(userVarValue, isDigit));
-        }
-        else if (baseVarValueType == BOOLOID)
-        {
-            result = DatumGetByteaPP(boolstring2bytea(userVarValue, isDigit));
-        }
-        else
-        {
-            result = DatumGetByteaPP(cstring2bytea(userVarValue, isDigit));
-        }
-
-        entry->varValue = result;
-        entry->isnull = false;
-    }
-    else
-    {
-        entry->isnull = true;
-    }
-
-    MemoryContextSwitchTo(oldContext);
+	for (cur = digit_bytea_head; cur != NULL; cur = cur->next)
+	{
+		if (cur->ptr == ptr)
+			return true;
+	}
+	return false;
 }
-
-
-void
-mysSetUserVarForPl(char *userVarName, Datum userVarValue, Oid varValueType, bool isNull)
-{
-    MysqlUserVariableItem *entry;
-    bool found;
-    MemoryContext oldContext;
-
-    /* Initialize the hash table, if necessary */
-	if (!mysql_user_variables)
-		initMysqlUserVariableHashTable();
-
-    entry = (MysqlUserVariableItem *) hash_search(mysql_user_variables,
-                                                  userVarName,
-                                                  HASH_ENTER,
-                                                  &found);
-
-    
-    if (found)
-    {
-        if (!entry->isnull)
-        {
-            pfree(entry->varValue);
-            entry->varValue = NULL;
-        }
-    }
-    else
-    {
-        /* Nothing to do */
-    }
-
-    oldContext = MemoryContextSwitchTo(TopMemoryContext);
-
-    if (!isNull)
-    {
-		Oid baseVarValueType = mys_binary_base_type(varValueType);
-        Oid typOutput = InvalidOid;
-        bool typIsVarlena;
-        bool isDigit;
-        char *varValue;
-        bytea *result = NULL;
-
-        getTypeOutputInfo(varValueType, &typOutput, &typIsVarlena);
-		varValue = baseVarValueType == BPCHAROID ?
-			text_to_cstring((text *) mys_bpchar_bytes(userVarValue)) :
-			OidOutputFunctionCall(typOutput, userVarValue);
-        isDigit = varValueIsDigit(userVarValue, varValueType);
-
-        if (baseVarValueType == BYTEAOID)
-        {
-            result = DatumGetByteaPP(byteastring2bytea(varValue, isDigit));
-        }
-        else if (baseVarValueType == BITOID || baseVarValueType == VARBITOID)
-        {
-            result = DatumGetByteaPP(bitstring2bytea(varValue, isDigit));
-        }
-        else if (baseVarValueType == BOOLOID)
-        {
-            result = DatumGetByteaPP(boolstring2bytea(varValue, isDigit));
-        }
-        else
-        {
-            result = DatumGetByteaPP(cstring2bytea(varValue, isDigit));
-        }
-
-        entry->varValue = result;
-        entry->isnull = false;
-    }
-    else
-    {
-        entry->isnull = true;
-    }
-
-    MemoryContextSwitchTo(oldContext);
-}
-
-
-bytea *
-mysGetUserVarValueInternal(char *userVarName)
-{
-    MysqlUserVariableItem *entry;
-    bool found;
-    bytea *result;
-
-    /* Initialize the hash table, if necessary */
-	if (!mysql_user_variables)
-		initMysqlUserVariableHashTable();
-    
-    entry = (MysqlUserVariableItem *) hash_search(mysql_user_variables,
-                                                  userVarName,
-                                                  HASH_FIND,
-                                                  &found);
-    
-    result = NULL;
-
-    if (found)
-    {
-        if (entry->isnull == false)
-        {
-            result = copyUserVarValue(entry->varValue);
-        }
-    }
-
-    return result;
-}
-
 
 static void
 initMysqlUserVariableHashTable(void)
 {
 	HASHCTL		hash_ctl;
 
-	hash_ctl.keysize = NAMEDATALEN;
+	memset(&hash_ctl, 0, sizeof(hash_ctl));
+	hash_ctl.keysize = MYS_USERVAR_KEYSIZE;
 	hash_ctl.entrysize = sizeof(MysqlUserVariableItem);
-    
-	mysql_user_variables = hash_create("MySQL User Variables",
-                                       1024,
-                                       &hash_ctl,
-                                       HASH_ELEM | HASH_STRINGS);
+	hash_ctl.hcxt = TopMemoryContext;
+
+	mysql_user_variables = hash_create("Mysql User Variables",
+									   64,
+									   &hash_ctl,
+									   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
 }
 
-
-static Datum
-byteastring2bytea(char *byteastring, bool isDigit)
+static void
+normalize_uservar_key(const char *userVarName, char key[MYS_USERVAR_KEYSIZE])
 {
-    bytea *result;
+	size_t		len;
+	size_t		i;
 
-    if ((byteastring[0] == '\\') && (byteastring[1] == 'x'))
-    {
-        /* 
-         * bytea_output == BYTEA_OUTPUT_HEX
-         * "\x3135"
-         */
-        size_t len = strlen(byteastring);
-        int bc;
+	if (userVarName == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("User variable name cannot be NULL")));
 
-		bc = (len - 2) / 2 + VARHDRSZ + VAR_VALUE_EXTEND_BYTES;	/* maximum possible length */
-		result = palloc(bc);
-		bc = hex_decode(byteastring + 2, len - 2, VARDATA(result));
-		SET_VARSIZE(result, bc + VARHDRSZ); /* actual length */
-        
-        if (isDigit)
-        {
-            ((char *)result)[bc + VARHDRSZ] = '1';
-        }
-        else
-        {
-            ((char *)result)[bc + VARHDRSZ] = '\0';
-        }
-    }
-    else
-    {
-        elog(ERROR, "Invalid string format for bytea_output(BYTEA_OUTPUT_ESCAPE)");
-    }
+	len = strlen(userVarName);
+	if (len >= MYS_USERVAR_KEYSIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("User variable name '%s' is illegal", userVarName)));
 
-    PG_RETURN_BYTEA_P(result);
+	for (i = 0; i < len; i++)
+		key[i] = pg_ascii_tolower((unsigned char) userVarName[i]);
+	key[len] = '\0';
 }
 
-
-static Datum
-bitstring2bytea(char *bitstring, bool isDigit)
+void
+clearUserVars(void)
 {
-    int bitLen = strlen(bitstring);
-    int byteLen = (bitLen + BITS_PER_BYTE - 1) / BITS_PER_BYTE;
-    int needPrePadBitNum = byteLen * BITS_PER_BYTE - bitLen;
-    char *rp;
-    int i;
-    int j;
-    bytea *result;
+	HASH_SEQ_STATUS seq;
+	MysqlUserVariableItem *entry;
 
-    result = (bytea *) palloc0(byteLen + VARHDRSZ + VAR_VALUE_EXTEND_BYTES);
-    SET_VARSIZE(result, byteLen + VARHDRSZ);
+	if (mysql_user_variables == NULL)
+		return;
 
-    rp = VARDATA(result);
-
-    for (i = 0; i < (BITS_PER_BYTE - needPrePadBitNum); i++)
-    {
-        rp[0] = rp[0] * 2 + (bitstring[i] - '0');
-    }
-
-    for (j = 1; j < byteLen; j++)
-    {
-        int end = i + BITS_PER_BYTE;
-        for (; i < end; i++)
-        {
-            rp[j] = rp[j] * 2 + (bitstring[i] - '0');
-        }
-    }
-
-    if (isDigit)
-    {
-        ((char *)result)[byteLen + VARHDRSZ] = '1';
-    }
-    else
-    {
-        ((char *)result)[byteLen + VARHDRSZ] = '\0';
-    }
-
-    PG_RETURN_BYTEA_P(result);
+	hash_seq_init(&seq, mysql_user_variables);
+	while ((entry = hash_seq_search(&seq)) != NULL)
+	{
+		if (!entry->isnull && entry->varValue != NULL)
+		{
+			pfree(entry->varValue);
+			entry->varValue = NULL;
+		}
+	}
+	hash_destroy(mysql_user_variables);
+	mysql_user_variables = NULL;
 }
 
-
-static Datum
-boolstring2bytea(char *boolstring, bool isDigit)
+bool
+varValueIsDigit(Datum varValue, Oid varValueType)
 {
-    char *p;
-    bytea *result;
+	char		ncategory;
+	bool		nispreferred;
 
-    result = (bytea *) palloc(1 + VARHDRSZ + VAR_VALUE_EXTEND_BYTES);
-    SET_VARSIZE(result, 1 + VARHDRSZ);
+	if (!OidIsValid(varValueType))
+		return false;
 
-    p = VARDATA(result);
-    *p = (boolstring[0] == '1') ? '1' : '0';
+	if (varValueType == BYTEAOID)
+		return is_registered_digit_bytea((const bytea *) DatumGetPointer(varValue));
 
-    if (isDigit)
-    {
-        ((char *)result)[1 + VARHDRSZ] = '1';
-    }
-    else
-    {
-        ((char *)result)[1 + VARHDRSZ] = '\0';
-    }
+	if (varValueType == BOOLOID)
+		return true;
 
-    PG_RETURN_BYTEA_P(result);
+	/*
+	 * BIT / VARBIT and binary-string domains (hexlit, binary, varbinary, blob)
+	 * store raw binary bytes rather than ASCII decimal digits.
+	 */
+	if (varValueType == BITOID || varValueType == VARBITOID ||
+		mys_binary_base_type(varValueType) == BYTEAOID)
+		return false;
+
+	get_type_category_preferred(varValueType, &ncategory, &nispreferred);
+	return (ncategory == TYPCATEGORY_NUMERIC);
 }
 
-
-static Datum
-cstring2bytea(char *cstring, bool isDigit)
+void
+mysSetUserVarBytes(const char *userVarName, const char *bytes,
+				   size_t byteLen, bool isDigit, bool isNull)
 {
-    int cstringLen = strlen(cstring);
-    char *tp;
-    char *rp;
-    bytea *result;
+	char		key[MYS_USERVAR_KEYSIZE];
+	MysqlUserVariableItem *entry;
+	bool		found;
+	bytea	   *newVal = NULL;
 
-    result = (bytea *) palloc(cstringLen + VARHDRSZ + VAR_VALUE_EXTEND_BYTES);
-    SET_VARSIZE(result, cstringLen + VARHDRSZ);
+	normalize_uservar_key(userVarName, key);
 
-    tp = cstring;
-    rp = VARDATA(result);
+	if (!mysql_user_variables)
+		initMysqlUserVariableHashTable();
 
-    while (*tp != '\0')
-    {
-        *rp++ = *tp++;
-    }
+	if (!isNull)
+	{
+		newVal = (bytea *) MemoryContextAlloc(TopMemoryContext, VARHDRSZ + byteLen);
+		SET_VARSIZE(newVal, VARHDRSZ + byteLen);
+		if (byteLen > 0)
+			memcpy(VARDATA(newVal), bytes, byteLen);
+	}
 
-    if (isDigit)
-    {
-        ((char *)result)[cstringLen + VARHDRSZ] = '1';
-    }
-    else
-    {
-        ((char *)result)[cstringLen + VARHDRSZ] = '\0';
-    }
+	entry = (MysqlUserVariableItem *) hash_search(mysql_user_variables,
+												  key,
+												  HASH_ENTER,
+												  &found);
+	if (found && !entry->isnull && entry->varValue != NULL)
+	{
+		pfree(entry->varValue);
+		entry->varValue = NULL;
+	}
 
-    PG_RETURN_BYTEA_P(result);
+	if (!isNull)
+	{
+		entry->varValue = newVal;
+		entry->isDigit = isDigit;
+		entry->isnull = false;
+	}
+	else
+	{
+		entry->varValue = NULL;
+		entry->isDigit = false;
+		entry->isnull = true;
+	}
 }
 
-
-static bytea *
-copyUserVarValue(bytea *varValue)
+/*
+ * Convert a PostgreSQL VarBit (left-aligned MSB-first) into MySQL's
+ * right-aligned big-endian byte representation.
+ */
+static void
+varbit_to_mysql_bytes(VarBit *vb, char **out_bytes, size_t *out_len)
 {
-    bytea *vlena = varValue;
-    char *byte = VARDATA_ANY(vlena);
-    size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-    bool isDigit = varValueIsDigit(PointerGetDatum(varValue), BYTEAOID);
-    char *p;
-    bytea *result;
+	int32		bitlen = VARBITLEN(vb);
+	size_t		nbytes = (size_t) ((bitlen + 7) / 8);
+	bits8	   *inbits = VARBITS(vb);
+	uint8	   *buf;
+	size_t		pad;
+	int32		k;
 
-    result = palloc(byteLen + VARHDRSZ + VAR_VALUE_EXTEND_BYTES);
-    SET_VARSIZE(result, byteLen + VARHDRSZ);
+	if (nbytes == 0)
+	{
+		*out_bytes = NULL;
+		*out_len = 0;
+		return;
+	}
 
-    p = VARDATA(result);
-    memcpy(p, byte, byteLen);
+	buf = (uint8 *) palloc0(nbytes);
+	pad = nbytes * BITS_PER_BYTE - (size_t) bitlen;
+	for (k = 0; k < bitlen; k++)
+	{
+		if (inbits[k / BITS_PER_BYTE] & (0x80 >> (k % BITS_PER_BYTE)))
+		{
+			size_t		pos = pad + (size_t) k;
 
-    if (isDigit)
-    {
-        ((char *)result)[byteLen + VARHDRSZ] = '1';
-    }
-    else
-    {
-        ((char *)result)[byteLen + VARHDRSZ] = '\0';
-    }
+			buf[pos / BITS_PER_BYTE] |= (uint8) (0x80 >> (pos % BITS_PER_BYTE));
+		}
+	}
 
-    return result;
+	*out_bytes = (char *) buf;
+	*out_len = nbytes;
+}
+
+void
+mysSetUserVarDatum(const char *userVarName, Datum datumValue,
+				   Oid varValueType, FmgrInfo *foutcache, bool isNull)
+{
+	Oid			baseType;
+	bool		isDigit;
+
+	if (isNull)
+	{
+		mysSetUserVarBytes(userVarName, NULL, 0, false, true);
+		return;
+	}
+
+	baseType = mys_binary_base_type(varValueType);
+	isDigit = varValueIsDigit(datumValue, varValueType);
+
+	if (baseType == BYTEAOID)
+	{
+		bytea	   *bv = DatumGetByteaPP(datumValue);
+
+		mysSetUserVarBytes(userVarName, VARDATA_ANY(bv), VARSIZE_ANY_EXHDR(bv),
+						   isDigit, false);
+	}
+	else if (getBaseType(varValueType) == BPCHAROID)
+	{
+		bytea	   *bv = mys_bpchar_bytes(datumValue);
+
+		mysSetUserVarBytes(userVarName, VARDATA_ANY(bv), VARSIZE_ANY_EXHDR(bv),
+						   false, false);
+	}
+	else if (baseType == BITOID || baseType == VARBITOID)
+	{
+		VarBit	   *vb = DatumGetVarBitP(datumValue);
+		char	   *bitbytes = NULL;
+		size_t		bitlen = 0;
+
+		varbit_to_mysql_bytes(vb, &bitbytes, &bitlen);
+		mysSetUserVarBytes(userVarName, bitbytes, bitlen, false, false);
+		if (bitbytes)
+			pfree(bitbytes);
+	}
+	else if (baseType == BOOLOID)
+	{
+		char		bch = DatumGetBool(datumValue) ? '1' : '0';
+
+		mysSetUserVarBytes(userVarName, &bch, 1, true, false);
+	}
+	else
+	{
+		char	   *str;
+
+		if (foutcache != NULL)
+			str = OutputFunctionCall(foutcache, datumValue);
+		else
+		{
+			Oid			typOutput;
+			bool		typIsVarlena;
+
+			getTypeOutputInfo(varValueType, &typOutput, &typIsVarlena);
+			str = OidOutputFunctionCall(typOutput, datumValue);
+		}
+		mysSetUserVarBytes(userVarName, str, strlen(str), isDigit, false);
+		pfree(str);
+	}
+}
+
+void
+mysSetUserVarInternal(char *userVarName, char *userVarValue,
+					  Oid varValueType, bool isDigit, bool isNull)
+{
+	Oid			baseVarValueType;
+
+	if (isNull || userVarValue == NULL)
+	{
+		mysSetUserVarBytes(userVarName, NULL, 0, false, true);
+		return;
+	}
+
+	baseVarValueType = mys_binary_base_type(varValueType);
+	if (baseVarValueType == BYTEAOID)
+	{
+		Datum		d = DirectFunctionCall1(byteain, CStringGetDatum(userVarValue));
+		bytea	   *bv = DatumGetByteaPP(d);
+
+		mysSetUserVarBytes(userVarName, VARDATA_ANY(bv), VARSIZE_ANY_EXHDR(bv),
+						   isDigit, false);
+	}
+	else if (baseVarValueType == BITOID || baseVarValueType == VARBITOID)
+	{
+		size_t		slen = strlen(userVarValue);
+		size_t		nbytes = (slen + 7) / 8;
+		uint8	   *buf = nbytes > 0 ? (uint8 *) palloc0(nbytes) : NULL;
+		size_t		pad = nbytes * 8 - slen;
+		size_t		i;
+
+		for (i = 0; i < slen; i++)
+		{
+			if (userVarValue[i] == '1')
+			{
+				size_t		pos = pad + i;
+
+				buf[pos / 8] |= (uint8) (0x80 >> (pos % 8));
+			}
+			else if (userVarValue[i] != '0')
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("Invalid input syntax for type bit")));
+		}
+		mysSetUserVarBytes(userVarName, (const char *) buf, nbytes, false, false);
+		if (buf)
+			pfree(buf);
+	}
+	else if (baseVarValueType == BOOLOID)
+	{
+		char		bch = (userVarValue[0] == '1' ||
+						   userVarValue[0] == 't' ||
+						   userVarValue[0] == 'T') ? '1' : '0';
+
+		mysSetUserVarBytes(userVarName, &bch, 1, true, false);
+	}
+	else
+	{
+		mysSetUserVarBytes(userVarName, userVarValue, strlen(userVarValue),
+						   isDigit, false);
+	}
+}
+
+void
+mysSetUserVarForPl(char *userVarName, Datum userVarValue,
+				   Oid varValueType, bool isNull)
+{
+	mysSetUserVarDatum(userVarName, userVarValue, varValueType, NULL, isNull);
+}
+
+bytea *
+mysGetUserVarValueInternal(char *userVarName)
+{
+	char		key[MYS_USERVAR_KEYSIZE];
+	MysqlUserVariableItem *entry;
+	bool		found;
+	size_t		byteLen;
+	bytea	   *result;
+
+	if (userVarName == NULL || !mysql_user_variables)
+		return NULL;
+
+	normalize_uservar_key(userVarName, key);
+	entry = (MysqlUserVariableItem *) hash_search(mysql_user_variables,
+												  key,
+												  HASH_FIND,
+												  &found);
+	if (!found || entry->isnull || entry->varValue == NULL)
+		return NULL;
+
+	byteLen = VARSIZE_ANY_EXHDR(entry->varValue);
+	result = (bytea *) palloc(VARHDRSZ + byteLen);
+	SET_VARSIZE(result, VARHDRSZ + byteLen);
+	if (byteLen > 0)
+		memcpy(VARDATA(result), VARDATA_ANY(entry->varValue), byteLen);
+
+	if (entry->isDigit)
+		register_digit_bytea(result);
+
+	return result;
 }

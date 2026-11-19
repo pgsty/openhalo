@@ -30,6 +30,7 @@
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/partition.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -211,6 +212,20 @@ column_changed(HeapTuple oldt, HeapTuple newt, TupleDesc desc, int attnum)
 
 	if (oldnull || newnull)
 		return oldnull != newnull;
+	if (att->attlen == -1)
+	{
+		struct varlena *va = PG_DETOAST_DATUM_PACKED(oldv);
+		struct varlena *vb = PG_DETOAST_DATUM_PACKED(newv);
+		Size		la = VARSIZE_ANY_EXHDR(va);
+		Size		lb = VARSIZE_ANY_EXHDR(vb);
+		bool		diff = (la != lb) || (la > 0 && memcmp(VARDATA_ANY(va), VARDATA_ANY(vb), la) != 0);
+
+		if ((Pointer) va != DatumGetPointer(oldv))
+			pfree(va);
+		if ((Pointer) vb != DatumGetPointer(newv))
+			pfree(vb);
+		return diff;
+	}
 	return !datumIsEqual(oldv, newv, att->attbyval, att->attlen);
 }
 
@@ -458,6 +473,38 @@ mys_autoinc_trigger(PG_FUNCTION_ARGS)
 				cache->typid = att->atttypid;
 				cache->seqoid = getIdentitySequence(rel, att->attnum, true);
 				break;
+			}
+		}
+		if (!OidIsValid(cache->seqoid) && rel->rd_rel->relispartition)
+		{
+			List	   *ancestors = get_partition_ancestors(RelationGetRelid(rel));
+
+			foreach_oid(anc_oid, ancestors)
+			{
+				Relation	anc_rel = relation_open(anc_oid, AccessShareLock);
+				TupleDesc	anc_desc = RelationGetDescr(anc_rel);
+
+				for (int i = 0; i < anc_desc->natts; i++)
+				{
+					Form_pg_attribute anc_att = TupleDescAttr(anc_desc, i);
+
+					if (!anc_att->attisdropped && anc_att->attidentity)
+					{
+						AttrNumber	part_attnum = get_attnum(RelationGetRelid(rel),
+															 NameStr(anc_att->attname));
+
+						if (part_attnum > 0)
+						{
+							cache->attnum = part_attnum;
+							cache->typid = TupleDescAttr(desc, part_attnum - 1)->atttypid;
+							cache->seqoid = getIdentitySequence(anc_rel, anc_att->attnum, true);
+						}
+						break;
+					}
+				}
+				relation_close(anc_rel, AccessShareLock);
+				if (OidIsValid(cache->seqoid))
+					break;
 			}
 		}
 		fcinfo->flinfo->fn_extra = cache;

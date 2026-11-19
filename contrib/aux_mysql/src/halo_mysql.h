@@ -18,10 +18,8 @@
 
 #include "fmgr.h"
 #include "nodes/pg_list.h"
-#include "mys_binary.h"
-#ifndef HALO_BABELFISH_API
 #include "postmaster/protocol_extension.h"
-#endif
+#include "mys_binary.h"
 
 /* GUC variables */
 extern int	halo_mysql_port;
@@ -42,13 +40,14 @@ typedef enum
 extern int	halo_mysql_protocol_id;
 
 /* mysql_proto.c */
-#ifdef HALO_BABELFISH_API
-extern void mysql_babelfish_register(void);	/* Babelfish's protocol API */
-#else
 extern const ProtocolExtensionConfig mysql_protocol_config;
-#endif
 extern void mysql_listen_init(void);
 extern bool mys_is_mysql_session(void);
+extern bool mys_select_database(const char *db, bool raise);
+extern const char *mys_selected_database(void);
+extern const char *mys_catalog_schema_name(const char *db);
+extern void mys_clear_selected_database_if_matches(const char *db);
+extern void mys_sync_selected_database(void);
 extern void halo_mysql_ensure_extension(void);
 extern void halo_mysql_lock_setup(void);
 extern bool mys_foreign_key_checks(void);
@@ -77,12 +76,15 @@ extern Node *mys_name_keys(Node *stmt);
 
 /*
  * SQLSTATEs for MySQL errors that no PostgreSQL SQLSTATE maps to: "M" and the
- * MySQL error number (mys_errno()).  The client gets SQLSTATE 42000, which
- * MySQL sends for each of them.
+ * MySQL error number (mys_errno()).
  */
+#define MYS_ERRCODE_DBACCESS_DENIED		MAKE_SQLSTATE('M','1','0','4','4')
+#define MYS_ERRCODE_NO_DB_ERROR			MAKE_SQLSTATE('M','1','0','4','6')
 #define MYS_ERRCODE_DUP_KEYNAME			MAKE_SQLSTATE('M','1','0','6','1')
+#define MYS_ERRCODE_PACKET_TOO_LARGE	MAKE_SQLSTATE('M','1','1','5','3')
 #define MYS_ERRCODE_KEY_DOES_NOT_EXIST	MAKE_SQLSTATE('M','1','1','7','6')
 #define MYS_ERRCODE_WRONG_NAME_FOR_INDEX	MAKE_SQLSTATE('M','1','2','8','0')
+#define MYS_ERRCODE_PS_MANY_PARAM		MAKE_SQLSTATE('M','1','3','9','0')
 #define MYS_ERRCODE_TXN_CHARACTERISTICS	MAKE_SQLSTATE('M','1','5','6','8')
 
 /* how a MySQL statement interacts with transactions (mys_txn.c) */
@@ -103,7 +105,7 @@ typedef enum MysTxnOp
 	MYS_TXNOP_NONE = 0,
 	MYS_TXNOP_BEGIN,
 	MYS_TXNOP_COMMIT,
-	MYS_TXNOP_COMMIT_IDLE,	/* finish an unused autocommit=0 block */
+	MYS_TXNOP_COMMIT_IDLE,		/* finish an unused autocommit=0 block */
 	MYS_TXNOP_SAVEPOINT,		/* statement-level rollback point */
 	MYS_TXNOP_RELEASE
 } MysTxnOp;
@@ -143,7 +145,7 @@ typedef struct MysStmtInfo
 	int8		set_autocommit;		/* SET autocommit = 0 / 1, -1 unknown */
 	bool		is_commit;			/* the client's COMMIT */
 	bool		is_write;			/* INSERT / UPDATE (strict mode rules) */
-	bool		ignore;				/* INSERT IGNORE: lenient assignments */
+	bool		ignore;				/* INSERT/UPDATE/DELETE IGNORE */
 	bool		diagnostic;			/* SHOW WARNINGS / ERRORS preserves diagnostics */
 	List	   *update_cols;		/* columns assigned by UPDATE / ON DUPLICATE KEY */
 	List	   *rewrite_warnings;	/* diagnostics belonging to this statement */
@@ -153,7 +155,7 @@ typedef struct MysStmtInfo
 extern MysStmtInfo *mys_current_stmt_info(void);
 extern void mys_add_warning(uint16 code, const char *message);
 extern uint64 mys_upsert_row(struct TupleTableSlot *oldslot,
-						   struct TupleTableSlot *newslot, uint64 deleted);
+							 struct TupleTableSlot *newslot, uint64 deleted);
 
 /*
  * MySQL errors that have no PostgreSQL SQLSTATE: mys_errno() maps these
@@ -212,6 +214,7 @@ extern void mys_txn_recover(void);
 extern List *mys_txn_deferred_error(ErrorData *edata);
 extern bool mys_txn_is_deferred_error(Node *stmt);
 extern void mys_txn_raise_deferred_error(void);
+extern void mys_txn_reset_deferred_error(void);
 
 /* authentication plugin announced in the greeting */
 typedef enum
@@ -264,8 +267,6 @@ extern void mys_queue_query(const char *query, const MysTextMap *map, const char
 
 /* SHOW CREATE metadata, called by mys_rewrite_raw_stmts inside a transaction. */
 extern Node *mys_rewrite_show_create(Node *stmt);
-/* Implemented by the binary worker; includes the new bytea-layout base types. */
-extern Oid mys_binary_base_type(Oid type);
 
 /* mys_rewrite.c */
 extern List *mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string,
@@ -274,7 +275,7 @@ extern List *mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string,
 /* mys_utility.c */
 extern void mysql_utility_init(void);
 
-/* mysql_parser.c */
+/* mys_parser.c */
 extern List *mysql_raw_parser(const char *str);
 extern char *mys_normalize_query(const char *query, int len);
 

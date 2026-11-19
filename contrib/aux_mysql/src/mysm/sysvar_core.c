@@ -1,50 +1,11 @@
 /*-------------------------------------------------------------------------
  *
- * systemVar.c
- *	  MySQL adapter systemVar routines
+ * sysvar_core.c
+ *	  MySQL session and global system variable management
  *
- * 
- * 版权所有 (c) 2019-2025, 易景科技保留所有权利。
- * Copyright (c) 2019-2025, Halo Tech Co.,Ltd. All rights reserved.
- * 版权所有 (c) 2026, PGSTY PTE. LTD. 保留所有权利。
- * Copyright (c) 2026, PGSTY PTE. LTD. All rights reserved.
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
- * 
- * 易景科技是Halo Database、Halo Database Management System、羲和数据
- * 库、羲和数据库管理系统（后面简称 Halo ）、openHalo软件的发明人同时也为
- * 知识产权权利人。Halo 软件的知识产权，以及与本软件相关的所有信息内容（包括
- * 但不限于文字、图片、音频、视频、图表、界面设计、版面框架、有关数据或电子文
- * 档等）均受中华人民共和国法律法规和相应的国际条约保护，易景科技享有上述知识
- * 产权，但相关权利人依照法律规定应享有的权利除外。未免疑义，本条所指的“知识
- * 产权”是指任何及所有基于 Halo 软件产生的：（a）版权、商标、商号、域名、与
- * 商标和商号相关的商誉、设计和专利；与创新、技术诀窍、商业秘密、保密技术、非
- * 技术信息相关的权利；（b）人身权、掩模作品权、署名权和发表权；以及（c）在
- * 本协议生效之前已存在或此后出现在世界任何地方的其他工业产权、专有权、与“知
- * 识产权”相关的权利，以及上述权利的所有续期和延长，无论此类权利是否已在相
- * 关法域内的相关机构注册。
- *
- * This software and related documentation are provided under a license
- * agreement containing restrictions on use and disclosure and are 
- * protected by intellectual property laws. Except as expressly permitted
- * in your license agreement or allowed by law, you may not use, copy, 
- * reproduce, translate, broadcast, modify, license, transmit, distribute,
- * exhibit, perform, publish, or display any part, in any form, or by any
- * means. Reverse engineering, disassembly, or decompilation of this 
- * software, unless required by law for interoperability, is prohibited.
- * 
- * This software is developed for general use in a variety of
- * information management applications. It is not developed or intended
- * for use in any inherently dangerous applications, including applications
- * that may create a risk of personal injury. If you use this software or
- * in dangerous applications, then you shall be responsible to take all
- * appropriate fail-safe, backup, redundancy, and other measures to ensure
- * its safe use. Halo Corporation and its affiliates disclaim any 
- * liability for any damages caused by use of this software in dangerous
- * applications.
- * 
- *
- * IDENTIFICATION
- *	  src/backend/adapter/mysql/systemVar.c
  *
  *-------------------------------------------------------------------------
  */
@@ -52,21 +13,27 @@
 #include "postgres.h"
 #include "mysm_compat.h"
 #include "halo_mysql.h"
-#include "access/xact.h"
-#include "access/xlog.h"
-#include "miscadmin.h"
-#include "mb/pg_wchar.h"
+
+#include <time.h>
+
 #include "access/relscan.h"
 #include "access/sdir.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/xact.h"
+#include "access/xlog.h"
+#include "adapter/mysql/adapter.h"
+#include "adapter/mysql/systemVar.h"
 #include "catalog/namespace.h"
 #include "commands/trigger.h"
 #include "executor/tuptable.h"
+#include "lib/stringinfo.h"
+#include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/lockdefs.h"
+#include "storage/lwlock.h"
 #include "storage/shmem.h"
-#include "storage/spin.h"
 #include "utils/elog.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
@@ -76,150 +43,159 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
-#include "adapter/mysql/adapter.h"
-#include "adapter/mysql/systemVar.h"
-#include <time.h>
 
+#define SYSTEM_VAR_NAME_MAX_LEN			128
+#define SYSTEM_VAR_VALUE_MAX_LEN		512
+#define SYSTEM_VAR_INT_NUM				512
+#define SYSTEM_VAR_MAX_NUM				1024
+#define SYSTEM_VAR_RESULT_RULE_NUM		16
+#define SYSTEM_VAR_RESULT_RULE_LEN		64
+#define SYSVAR_LWLOCK_TRANCHE			"aux_mysql_sysvar"
 
-#define SYSTEM_VAR_NAME_MAX_LEN 128
-#define SYSTEM_VAR_VALUE_MAX_LEN 512
-#define SYSTEM_VAR_INT_NUM 512
-#define SYSTEM_VAR_MAX_NUM 1024
-#define SYSTEM_VAR_RESULT_RULE_NUM 16
-#define SYSTEM_VAR_RESULT_RULE_LEN 64
+uint64		mys_sqlMode = MYS_MODE_ONLY_FULL_GROUP_BY |
+	MYS_MODE_STRICT_TRANS_TABLES |
+	MYS_MODE_NO_ZERO_IN_DATE |
+	MYS_MODE_NO_ZERO_DATE |
+	MYS_MODE_ERROR_FOR_DIVISION_BY_ZERO |
+	MYS_MODE_NO_AUTO_CREATE_USER |
+	MYS_MODE_NO_ENGINE_SUBSTITUTION;
+int			autoCommit = 2;
+int			default_week_format = 0;
 
-uint64 mys_sqlMode = MYS_MODE_ONLY_FULL_GROUP_BY | MYS_MODE_STRICT_TRANS_TABLES | MYS_MODE_NO_ZERO_IN_DATE |
-                     MYS_MODE_NO_ZERO_DATE | MYS_MODE_ERROR_FOR_DIVISION_BY_ZERO | MYS_MODE_NO_AUTO_CREATE_USER |
-                     MYS_MODE_NO_ENGINE_SUBSTITUTION;
-int autoCommit = 2;
-int default_week_format = 0;
-extern bool needCommitTrx;
-extern bool needStartNewTrx;
-extern bool isStrictTransTablesOn;
+HTAB	   *globalSystemVars = NULL;
+static LWLock *sysvar_lwlock = NULL;
 
-HTAB *globalSystemVars = NULL;
-HTAB *globalSystemVarsLock = NULL;
-
-typedef struct 
+typedef struct SystemVar
 {
-    char lockName[SYSTEM_VAR_NAME_MAX_LEN];   /* hash key must be first */
-    slock_t mutex;
-} GlobalSystemVarsMutex;
-GlobalSystemVarsMutex *globalSystemVarsMutex;
-
-typedef struct 
-{
-    char varName[SYSTEM_VAR_NAME_MAX_LEN];   /* hash key must be first */
-    char varDefValue[SYSTEM_VAR_VALUE_MAX_LEN];
-    char varConfValue[SYSTEM_VAR_VALUE_MAX_LEN];
-    int sessionGlobalType;  /* 0:global & session, 1:global, 2:session, 3:sess-global */
-    bool sessionDefValueFromGlobal;
-    bool isReadWrite;
-    int resultNum;
-    char result[SYSTEM_VAR_RESULT_RULE_NUM][SYSTEM_VAR_RESULT_RULE_LEN];
-    int selectResultNum;
-    char selectResult[SYSTEM_VAR_RESULT_RULE_NUM][SYSTEM_VAR_RESULT_RULE_LEN];
-    int showResultNum;
-    char showResult[SYSTEM_VAR_RESULT_RULE_NUM][SYSTEM_VAR_RESULT_RULE_LEN];
+	char		varName[SYSTEM_VAR_NAME_MAX_LEN];	/* hash key must be first */
+	char		varDefValue[SYSTEM_VAR_VALUE_MAX_LEN];
+	char		varConfValue[SYSTEM_VAR_VALUE_MAX_LEN];
+	int			sessionGlobalType;	/* 0:global & session, 1:global, 2:session, 3:sess-global */
+	bool		sessionDefValueFromGlobal;
+	bool		isReadWrite;
+	int			resultNum;
+	char		result[SYSTEM_VAR_RESULT_RULE_NUM][SYSTEM_VAR_RESULT_RULE_LEN];
+	int			selectResultNum;
+	char		selectResult[SYSTEM_VAR_RESULT_RULE_NUM][SYSTEM_VAR_RESULT_RULE_LEN];
+	int			showResultNum;
+	char		showResult[SYSTEM_VAR_RESULT_RULE_NUM][SYSTEM_VAR_RESULT_RULE_LEN];
 } SystemVar;
 
 static SystemVar *baseSystemVars[SYSTEM_VAR_MAX_NUM];
-static int baseSystemVarsNum = 0;
+static int	baseSystemVarsNum = 0;
 static HTAB *sessionSystemVars = NULL;
 
 static List *readBaseVariableRecord(TupleTableSlot *slot);
-static List *readBaseVariablesTable();
+static List *readBaseVariablesTable(void);
 static bool add2BaseSystemVars(SystemVar *systemVar);
-static void add2GlobalSystemVars(SystemVar *systemVar);
+static void add2GlobalSystemVarsLocked(SystemVar *systemVar);
 static void add2SessionSystemVars(SystemVar *systemVar, bool at_init);
-static SystemVar *initBaseSystemVar(List *systemVarColumnVals);
+static SystemVar *initBaseSystemVar(List *systemVarColumnVals, MemoryContext targetCxt);
 static void initSystemVariables(void);
 static void initBaseSystemVars(void);
-static void initGlobalSystemVars(SystemVar *systemVars[], int systemVarsNum);
-static void initSessionSystemVars(SystemVar *systemVars[], int systemVarsNum);
-static SystemVar *dynAddSystemVar(char *varName);
-static void lockGlobalSystemVars(void);
-static void unlockGlobalSystemVars(void);
+static void initGlobalSystemVarsLocked(SystemVar *systemVars[], int systemVarsNum);
+static void initSessionSystemVarsLocked(SystemVar *systemVars[], int systemVarsNum);
+static SystemVar *dynAddSystemVar(const char *varName);
 static void lowerSystemVarName(char *varName);
-static bool asignSystemVar(const char *varDefValue, 
-                           const char* varConfValue, 
-                           int sessionGlobalType, 
-                           bool sessionDefValueFromGlobal,
-                           bool isReadWrite, 
-                           const char* result, 
-                           const char* selectResult, 
-                           const char* showResult,
-                           SystemVar *systemVar);
-static bool asignSystemVarResult(const char *srcResult, 
-                                 int *resultNum,
-                                 char *result);
-static void splitStr(const char *str, char separator, int itemSize, 
-                     char *items, int *itemsNum);
-static void copySystemVar(SystemVar *srcSystemVar, SystemVar *destSystemVar);
-static void setSystemVarValueByVarName(const char *varName, 
-                                       const char *value, char *varValue);
-static void setSystemVarValueForOptimizerSwitch(const char *value, 
-                                                char *varValue);
-static void setSystemVarValue(const char* value, char *varValue);
-static void rectifySystemVarValue(const char *varName, char **varValue, 
-                                  bool isSessionSystemVar);
-static void getDefaultValue(const char *varName, bool isSessionSystemVar, 
-                            char **varValue);
+static bool assignSystemVar(const char *varDefValue,
+							const char *varConfValue,
+							int sessionGlobalType,
+							bool sessionDefValueFromGlobal,
+							bool isReadWrite,
+							const char *result,
+							const char *selectResult,
+							const char *showResult,
+							SystemVar *systemVar);
+static bool assignSystemVarResult(const char *srcResult,
+								  int *resultNum,
+								  char result[SYSTEM_VAR_RESULT_RULE_NUM][SYSTEM_VAR_RESULT_RULE_LEN]);
+static void copySystemVar(const SystemVar *srcSystemVar, SystemVar *destSystemVar);
+static void setSystemVarValueByVarName(const char *varName,
+									   const char *value,
+									   char *varValue);
+static void setSystemVarValueForOptimizerSwitch(const char *value,
+												char *varValue);
+static void setSystemVarValue(const char *value, char *varValue);
+static void rectifySystemVarValue(const char *varName, char **varValue,
+								  bool isSessionSystemVar);
+static void getDefaultValue(const char *varName, bool isSessionSystemVar,
+							char **varValue);
 static void applySystemVarValue(const char *varName, const char *varValue);
-static void setSystemVariableValueOne(char *varName, char *varValue, bool isSessionSystemVar);
-static int getSystemVariableValueImpl(char *varName, 
-                                      bool isSessionSystemVar, 
-                                      int selectShowType, 
-                                      char **varValue);
-static char *getConfValue(SystemVar *systemVar, int selectShowType);
-static Node *makeStringConst(char *str, int location);
-static char *getOSTimeZone(void);
+static void setSystemVariableValueOne(const char *rawVarName, const char *rawVarValue,
+									  bool isSessionSystemVar);
+static int	getSystemVariableValueImpl(const char *rawVarName,
+									   bool isSessionSystemVar,
+									   int selectShowType,
+									   char **varValue);
+static char *getConfValue(const SystemVar *systemVar, int selectShowType);
+static char *resolveMysqlTimeZoneForPG(const char *tzVal);
 
+/* ----------------------------------------------------------------
+ *	Shared-memory initialization (LWLock-protected, no spinlocks)
+ * ----------------------------------------------------------------
+ */
 
 Size
 GlobalSystemVariablesShmemSize(void)
 {
-	Size size = 0;
-
-	size = sizeof(GlobalSystemVarsMutex) + SYSTEM_VAR_MAX_NUM * sizeof(SystemVar);
-
-	return size;
+	return hash_estimate_size(SYSTEM_VAR_MAX_NUM, sizeof(SystemVar));
 }
 
+void
+GlobalSystemVariablesShmemRequest(void)
+{
+	RequestNamedLWLockTranche(SYSVAR_LWLOCK_TRANCHE, 1);
+}
 
-void 
+void
 GlobalSystemVariablesShmemInit(void)
 {
-    HASHCTL hashctlLock;
-    HASHCTL hashctl;
+	HASHCTL		hashctl;
 
-    hashctlLock.keysize = SYSTEM_VAR_NAME_MAX_LEN;
-    hashctlLock.entrysize = sizeof(GlobalSystemVarsMutex);
-    globalSystemVarsLock = ShmemInitHash("MySQL Global System Variables lock (914)",   
-                                         1,  
-                                         1,  
-                                         &hashctlLock,                
-                                         HASH_ELEM | HASH_STRINGS);
+	sysvar_lwlock = &(GetNamedLWLockTranche(SYSVAR_LWLOCK_TRANCHE))->lock;
 
-    hashctl.keysize = SYSTEM_VAR_NAME_MAX_LEN;
-    hashctl.entrysize = sizeof(SystemVar);
-    globalSystemVars = ShmemInitHash("MySQL Global System Variables (914)",   
-                                     SYSTEM_VAR_INT_NUM,  
-                                     SYSTEM_VAR_MAX_NUM,  
-                                     &hashctl,                
-                                     HASH_ELEM | HASH_STRINGS);
+	memset(&hashctl, 0, sizeof(hashctl));
+	hashctl.keysize = SYSTEM_VAR_NAME_MAX_LEN;
+	hashctl.entrysize = sizeof(SystemVar);
+	globalSystemVars = ShmemInitHash("MySQL Global System Variables",
+									 SYSTEM_VAR_INT_NUM,
+									 SYSTEM_VAR_MAX_NUM,
+									 &hashctl,
+									 HASH_ELEM | HASH_STRINGS);
 }
 
+static inline bool
+global_shmem_ready(void)
+{
+	return (globalSystemVars != NULL && sysvar_lwlock != NULL);
+}
 
-/*
- * @@version follows mysql.halo_mysql_version (openHalo answered it in its
- * protocol adapter from that setting).
+static bool
+lookup_global_system_var(const char *varName, SystemVar *out_copy)
+{
+	SystemVar  *found_var;
+	bool		found = false;
+
+	if (!global_shmem_ready())
+		return false;
+
+	LWLockAcquire(sysvar_lwlock, LW_SHARED);
+	found_var = (SystemVar *) hash_search(globalSystemVars, varName, HASH_FIND, &found);
+	if (found && out_copy != NULL)
+		*out_copy = *found_var;
+	LWLockRelease(sysvar_lwlock);
+
+	return found;
+}
+
+/* ----------------------------------------------------------------
+ *	Special pseudo / GUC-backed MySQL system variables
+ * ----------------------------------------------------------------
  */
+
 static bool
 getVersionVariable(const char *varName, char **varValue)
 {
-	/* PostgreSQL WAL is not a MySQL GTID stream. In particular mysqldump
-	 * treats any value other than the exact enum OFF as GTIDs enabled. */
 	if (pg_strcasecmp(varName, "gtid_mode") == 0)
 	{
 		*varValue = pstrdup("OFF");
@@ -231,105 +207,100 @@ getVersionVariable(const char *varName, char **varValue)
 		*varValue = pstrdup("");
 		return true;
 	}
-    if (pg_strcasecmp(varName, "max_allowed_packet") == 0)
-    {
-        *varValue = psprintf("%d", halo_mysql_max_allowed_packet);
-        return true;
-    }
-    if (halo_mysql_version != NULL && pg_strcasecmp(varName, "version") == 0)
-    {
-        *varValue = pstrdup(halo_mysql_version);
-        return true;
-    }
-    return false;
+	if (pg_strcasecmp(varName, "max_allowed_packet") == 0)
+	{
+		*varValue = psprintf("%d", halo_mysql_max_allowed_packet);
+		return true;
+	}
+	if (halo_mysql_version != NULL && pg_strcasecmp(varName, "version") == 0)
+	{
+		*varValue = pstrdup(halo_mysql_version);
+		return true;
+	}
+	return false;
 }
 
 void
-getSystemVariableValueForSelect(char *varName, 
-                                bool isSessionSystemVar, 
-                                char **varValue)
+getSystemVariableValueForSelect(char *varName,
+								bool isSessionSystemVar,
+								char **varValue)
 {
-    int getRet;
+	int			getRet;
 
-    if (getVersionVariable(varName, varValue))
-        return;
+	if (varName != NULL && getVersionVariable(varName, varValue))
+		return;
 
-    getRet = getSystemVariableValueImpl(varName, 
-                                        isSessionSystemVar, 
-                                        1, 
-                                        varValue);
-    if (getRet == 0)
-    {
-        return;
-    }
-    else if (getRet == 1)
-    {
-        elog(ERROR, "Unknown system variable '%s'", varName);
-    }
-    else 
-    {
-        elog(ERROR, "Variable '%s' is a SESSION variable", varName);
-    }
+	getRet = getSystemVariableValueImpl(varName,
+										isSessionSystemVar,
+										1,
+										varValue);
+	if (getRet == 0)
+		return;
+	else if (getRet == 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("Unknown system variable '%s'", varName ? varName : "")));
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Variable '%s' is a SESSION variable", varName)));
 }
-
 
 bool
-getSystemVariableValueForShow(char *varName, 
-                              bool isSessionSystemVar, 
-                              char **varValue)
+getSystemVariableValueForShow(char *varName,
+							  bool isSessionSystemVar,
+							  char **varValue)
 {
-    int getRet;
+	int			getRet;
 
-    if (getVersionVariable(varName, varValue))
-        return true;
+	if (varName != NULL && getVersionVariable(varName, varValue))
+		return true;
 
-    getRet = getSystemVariableValueImpl(varName, 
-                                        isSessionSystemVar, 
-                                        2, 
-                                        varValue);
-    if (getRet == 0)
-    {
-        return true;
-    }
-    else if (getRet == 1)
-    {
-        elog(ERROR, "Unknown system variable '%s'", varName);
-    }
-    else 
-    {
-        elog(ERROR, "Variable '%s' is a SESSION variable", varName);
-    }
+	getRet = getSystemVariableValueImpl(varName,
+										isSessionSystemVar,
+										2,
+										varValue);
+	if (getRet == 0)
+		return true;
+	else if (getRet == 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("Unknown system variable '%s'", varName ? varName : "")));
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Variable '%s' is a SESSION variable", varName)));
+	return false;
 }
 
-
-/*
- * MySQL transaction characteristics.  The session values live in the system
- * variable hash (transaction_isolation / tx_isolation, transaction_read_only /
- * tx_read_only); SET TRANSACTION without a scope arrives as next_<name> and
- * applies to the next transaction only.
+/* ----------------------------------------------------------------
+ *	MySQL transaction characteristics & read_only tracking
+ * ----------------------------------------------------------------
  */
-static char pending_isolation[32];		/* canonical level, "" for none */
-static int	pending_read_only = -1;		/* -1 none, else 0 / 1 */
-static bool pending_armed = false;	/* the running transaction got them */
-static bool txn_used = false;		/* a statement of it touched a table */
-static bool txn_explicit = false;	/* START TRANSACTION / BEGIN started it */
-static bool txn_started = false;	/* real PG BEGIN, including our lazy BEGIN */
-static bool stmt_touched = false;	/* the running statement touched a table */
-bool		mys_server_read_only = false;	/* GLOBAL read_only applies now */
+
+static char pending_isolation[32];
+static int	pending_read_only = -1;
+static bool pending_armed = false;
+static bool txn_used = false;
+static bool txn_explicit = false;
+static bool txn_started = false;
+static bool stmt_touched = false;
+bool		mys_server_read_only = false;
 
 static bool
 is_isolation_var(const char *name)
 {
-	return strcmp(name, "transaction_isolation") == 0 || strcmp(name, "tx_isolation") == 0;
+	return strcmp(name, "transaction_isolation") == 0 ||
+		strcmp(name, "tx_isolation") == 0;
 }
 
 static bool
 is_tx_read_only_var(const char *name)
 {
-	return strcmp(name, "transaction_read_only") == 0 || strcmp(name, "tx_read_only") == 0;
+	return strcmp(name, "transaction_read_only") == 0 ||
+		strcmp(name, "tx_read_only") == 0;
 }
 
-/* "repeatable read", "REPEATABLE-READ", 2, ... -> "REPEATABLE-READ"; NULL if none */
 static const char *
 canonical_isolation(const char *value)
 {
@@ -344,7 +315,8 @@ canonical_isolation(const char *value)
 	if (value[0] >= '0' && value[0] <= '3' && value[1] == '\0')
 		return levels[value[0] - '0'];
 	for (i = 0; value[i]; i++)
-		buf[i] = (value[i] == ' ' || value[i] == '_') ? '-' : pg_toupper((unsigned char) value[i]);
+		buf[i] = (value[i] == ' ' || value[i] == '_') ?
+			'-' : pg_toupper((unsigned char) value[i]);
 	buf[i] = '\0';
 	for (i = 0; i < lengthof(levels); i++)
 		if (strcmp(buf, levels[i]) == 0)
@@ -352,7 +324,6 @@ canonical_isolation(const char *value)
 	return NULL;
 }
 
-/* ON / OFF style value -> "1" / "0"; NULL if none */
 static const char *
 canonical_flag(const char *value)
 {
@@ -367,7 +338,6 @@ canonical_flag(const char *value)
 	return NULL;
 }
 
-/* a session variable's value, copied into buf ("" when unknown) */
 static void
 session_value(const char *name, char *buf, size_t len)
 {
@@ -382,31 +352,25 @@ session_value(const char *name, char *buf, size_t len)
 		strlcpy(buf, var->varConfValue, len);
 }
 
-/* a GLOBAL variable's value, copied under the spinlock: nothing allocated */
 static void
 global_value(const char *name, char *buf, size_t len)
 {
-	SystemVar  *var;
-	bool		found;
+	SystemVar	copy;
 
 	buf[0] = '\0';
-	if (globalSystemVars == NULL)
-		return;
-	lockGlobalSystemVars();
-	var = (SystemVar *) hash_search(globalSystemVars, name, HASH_FIND, &found);
-	if (found)
-		strlcpy(buf, var->varConfValue, len);
-	unlockGlobalSystemVars();
+	if (lookup_global_system_var(name, &copy))
+		strlcpy(buf, copy.varConfValue, len);
 }
 
-/* a GLOBAL ON/OFF variable */
 static bool
 global_flag(const char *name)
 {
 	char		value[16];
+	const char *cf;
 
 	global_value(name, value, sizeof(value));
-	return canonical_flag(value) && strcmp(canonical_flag(value), "1") == 0;
+	cf = canonical_flag(value);
+	return cf != NULL && strcmp(cf, "1") == 0;
 }
 
 static void
@@ -416,13 +380,6 @@ set_guc(const char *name, const char *value)
 							 GUC_ACTION_SET, true, 0, false);
 }
 
-/*
- * PostgreSQL level for a MySQL level.  MySQL's REPEATABLE READ reads a
- * snapshot but updates the latest row versions without serialization
- * failures; PostgreSQL's READ COMMITTED is closest for read-write work, so it
- * runs RU, RC and RR.  A read-only REPEATABLE READ transaction, which cannot
- * fail serialization in PostgreSQL, gets the real snapshot.
- */
 static int
 pg_isolation(const char *level, bool read_only)
 {
@@ -440,24 +397,24 @@ pg_isolation_name(int level)
 		level == XACT_REPEATABLE_READ ? "repeatable read" : "read committed";
 }
 
-/*
- * The MySQL isolation level and access mode the next transaction gets: SET
- * TRANSACTION's one-shot values, or else the session's.
- */
 static const char *
 next_transaction(bool *read_only)
 {
 	static char level[32];
 	char		session_level[32];
 	char		ro[16];
+	const char *canon_sess;
+	const char *canon_ro;
 
 	session_value("transaction_isolation", session_level, sizeof(session_level));
 	session_value("transaction_read_only", ro, sizeof(ro));
+	canon_sess = canonical_isolation(session_level);
+	canon_ro = canonical_flag(ro);
+
 	strlcpy(level, pending_isolation[0] ? pending_isolation :
-			canonical_isolation(session_level) ? canonical_isolation(session_level) :
-			"REPEATABLE-READ", sizeof(level));
+			canon_sess ? canon_sess : "REPEATABLE-READ", sizeof(level));
 	*read_only = pending_read_only >= 0 ? pending_read_only == 1 :
-		(canonical_flag(ro) && strcmp(canonical_flag(ro), "1") == 0);
+		(canon_ro != NULL && strcmp(canon_ro, "1") == 0);
 	return level;
 }
 
@@ -467,15 +424,6 @@ have_pending(void)
 	return pending_isolation[0] != '\0' || pending_read_only >= 0;
 }
 
-/*
- * A transaction begins.  As in MySQL, SET TRANSACTION's one-shot values were
- * spent by the previous one if it was explicit (COMMIT / ROLLBACK reset them)
- * or one of its statements touched a table (InnoDB had a statement
- * transaction to end); its last statement may have failed and so not reached
- * mys_statement_done().  A SELECT without tables, SET or SHOW, or a statement
- * that failed before opening its tables (a write in a read-only transaction),
- * leaves them for the next transaction.
- */
 static void
 spend_one_shot(void)
 {
@@ -493,15 +441,12 @@ new_transaction(void)
 	pending_armed = have_pending();
 }
 
-/* the executor opened one of the application's tables */
 void
 mys_statement_touched_tables(void)
 {
 	stmt_touched = true;
 }
 
-/* PG's COM_QUERY implicit block is not a MySQL transaction.  A hidden
- * BEGIN only becomes visible when an application table has been opened. */
 bool
 mys_transaction_has_block(void)
 {
@@ -514,7 +459,6 @@ mys_transaction_active(void)
 	return mys_transaction_has_block() && (txn_explicit || txn_used || stmt_touched);
 }
 
-/* default_transaction_isolation / _read_only: what the next transaction gets */
 static void
 sync_transaction_defaults(void)
 {
@@ -532,10 +476,6 @@ sync_transaction_defaults(void)
 		set_guc("default_transaction_read_only", read_only ? "on" : "off");
 }
 
-/*
- * Before each MySQL packet.  A new connection loads its variables (and so the
- * GLOBAL transaction defaults) now rather than at its first variable access.
- */
 void
 mys_sync_session_state(void)
 {
@@ -545,14 +485,6 @@ mys_sync_session_state(void)
 	sync_transaction_defaults();
 }
 
-/*
- * After parsing a packet that does not open with START TRANSACTION / BEGIN:
- * its first statement's transaction has begun, normally with the defaults
- * that mys_statement_done() set.  Make sure of it (a new connection, an error
- * that ended the previous packet) before the first snapshot.  ddl: the
- * statement is one MySQL commits implicitly, which also resets SET
- * TRANSACTION's one-shot values first: it runs with the session's.
- */
 void
 mys_start_implicit_transaction(bool ddl)
 {
@@ -573,13 +505,6 @@ mys_start_implicit_transaction(bool ddl)
 		set_guc("transaction_read_only", read_only ? "on" : "off");
 }
 
-/*
- * START TRANSACTION / BEGIN, as it executes (so a SET earlier in the same
- * packet counts): the PostgreSQL isolation level and access mode of the
- * transaction it starts; explicit_read_only is READ ONLY / READ WRITE or -1.
- * WITH CONSISTENT SNAPSHOT (*snapshot) applies under REPEATABLE READ only; as
- * in MySQL it is ignored with warning 138 otherwise.
- */
 const char *
 mys_transaction_start(int explicit_read_only, bool *snapshot, bool *read_only,
 					  bool explicit_begin)
@@ -601,15 +526,6 @@ mys_transaction_start(int explicit_read_only, bool *snapshot, bool *read_only,
 	return *snapshot ? "repeatable read" : pg_isolation_name(pg_isolation(level, *read_only));
 }
 
-/*
- * After each statement (end_command), hidden ones included.  Once the
- * transaction has ended, set what the next one starts with, outside any
- * transaction so that no rollback undoes it: this also restores session
- * values a rolled back SET took with it.  end: a COMMIT / ROLLBACK of the
- * client's, which resets SET TRANSACTION's values in MySQL even with no
- * transaction to end.  next_ddl: the next statement of the packet is one
- * MySQL commits implicitly (see mys_start_implicit_transaction()).
- */
 void
 mys_statement_done(bool end, bool next_ddl)
 {
@@ -625,11 +541,6 @@ mys_statement_done(bool end, bool next_ddl)
 	sync_transaction_defaults();
 }
 
-/*
- * GLOBAL read_only (except for superusers, MySQL's SUPER) and
- * super_read_only (for everyone) apply to the statement about to run.  Read
- * per statement: SET GLOBAL in another session takes effect at once.
- */
 bool
 mys_server_read_only_applies(void)
 {
@@ -646,7 +557,6 @@ foreign_key_checks_off(const char *value)
 		 pg_strcasecmp(value, "false") == 0 || pg_strcasecmp(value, "f") == 0);
 }
 
-/* @@foreign_key_checks of this session */
 bool
 mys_foreign_key_checks(void)
 {
@@ -660,50 +570,67 @@ mys_foreign_key_checks(void)
 	return !found || !foreign_key_checks_off(var->varConfValue);
 }
 
-/* RI trigger and TRUNCATE hooks consult the session variable directly. */
 void
 mys_sync_foreign_key_checks(void)
 {
-	/* Kept for callers across transaction/reset paths; no global GUC mutation. */
+	/* RI trigger and TRUNCATE hooks consult the session variable directly. */
 }
 
+/* ----------------------------------------------------------------
+ *	SET [SESSION | GLOBAL] system variable implementation
+ * ----------------------------------------------------------------
+ */
+
 static void
-setSystemVariableValueOne(char *varName, char *varValue, bool isSessionSystemVar)
+setSystemVariableValueOne(const char *rawVarName, const char *rawVarValue,
+						  bool isSessionSystemVar)
 {
-    SystemVar *systemVar;
-    bool found;
+	char		varName[SYSTEM_VAR_NAME_MAX_LEN];
+	char	   *varValue;
 
-    if (pg_strcasecmp(varName, "max_allowed_packet") == 0)
-        ereport(ERROR, (errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
-                       errmsg("set mysql.max_allowed_packet in postgresql.conf and reload")));
+	if (rawVarName == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Invalid system variable name(NULL)")));
 
-    if (sessionSystemVars == NULL)
-    {
-        initSystemVariables();
-    }
+	if (strlen(rawVarName) >= sizeof(varName))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("Unknown system variable '%s'", rawVarName)));
 
-    if (varName == NULL)
-    {
-        elog(ERROR, "Invalid system variable name(NULL)");
-        return;
-    }
+	strlcpy(varName, rawVarName, sizeof(varName));
+	lowerSystemVarName(varName);
 
-    lowerSystemVarName(varName);
+	/* SET GLOBAL requires SUPER / superuser privilege (MySQL 1227). */
+	if (!isSessionSystemVar && !superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("Access denied; you need (at least one of) the SUPER or SYSTEM_VARIABLES_ADMIN privilege(s) for this operation")));
 
-	/* Never advertise successful GTID tracking without a binlog. Accept
-	 * the disabled setting used by migration tools, and reject activation
-	 * because it would make replication/backup positions untrustworthy. */
+	if (strcmp(varName, "max_allowed_packet") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
+				 errmsg("set mysql.max_allowed_packet in postgresql.conf and reload")));
+
+	if (sessionSystemVars == NULL)
+		initSystemVariables();
+
+	varValue = rawVarValue ? pstrdup(rawVarValue) : NULL;
+
 	if (strcmp(varName, "gtid_mode") == 0)
 	{
 		if (varValue && (pg_strcasecmp(varValue, "OFF") == 0 ||
-						strcmp(varValue, "0") == 0 || pg_strcasecmp(varValue, "DEFAULT") == 0))
+						 strcmp(varValue, "0") == 0 ||
+						 pg_strcasecmp(varValue, "DEFAULT") == 0))
 			return;
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("MySQL GTID replication is unavailable; transactions have no MySQL GTID")));
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("MySQL GTID replication is unavailable; transactions have no MySQL GTID")));
 	}
 	if (strcmp(varName, "gtid_executed") == 0 || strcmp(varName, "gtid_purged") == 0)
-		ereport(ERROR, (errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
-						errmsg("Variable '%s' is read only", varName)));
+		ereport(ERROR,
+				(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
+				 errmsg("Variable '%s' is read only", varName)));
 
 	/* SET TRANSACTION without a scope: the next transaction only */
 	if (strncmp(varName, "next_", 5) == 0 &&
@@ -717,8 +644,10 @@ setSystemVariableValueOne(char *varName, char *varValue, bool isSessionSystemVar
 					(errcode(MYS_ERRCODE_TXN_CHARACTERISTICS),
 					 errmsg("Transaction characteristics can't be changed while a transaction is in progress")));
 		if (value == NULL)
-			elog(ERROR, "Variable '%s' can't be set to the value of '%s'",
-				 varName + 5, varValue ? varValue : "NULL");
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Variable '%s' can't be set to the value of '%s'",
+							varName + 5, varValue ? varValue : "NULL")));
 		if (is_isolation_var(varName + 5))
 			strlcpy(pending_isolation, value, sizeof(pending_isolation));
 		else
@@ -726,581 +655,519 @@ setSystemVariableValueOne(char *varName, char *varValue, bool isSessionSystemVar
 		return;
 	}
 
-    rectifySystemVarValue(varName, &varValue, isSessionSystemVar);
+	/*
+	 * In MySQL, character_set_results is the only system variable that may be
+	 * set to NULL; every other system variable rejects NULL with 1231.
+	 */
+	if (varValue == NULL && strcmp(varName, "character_set_results") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Variable '%s' can't be set to the value of 'NULL'", varName)));
 
-	/* MySQL spells these READ-COMMITTED and 0 / 1, whatever the input */
+	rectifySystemVarValue(varName, &varValue, isSessionSystemVar);
+
 	if (is_isolation_var(varName) || is_tx_read_only_var(varName))
 	{
 		const char *value = is_isolation_var(varName) ?
 			canonical_isolation(varValue) : canonical_flag(varValue);
 
 		if (value == NULL)
-			elog(ERROR, "Variable '%s' can't be set to the value of '%s'",
-				 varName, varValue ? varValue : "NULL");
-		varValue = (char *) value;
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Variable '%s' can't be set to the value of '%s'",
+							varName, varValue ? varValue : "NULL")));
+		varValue = pstrdup(value);
 	}
 
-	if (varValue == NULL && strcmp(varName, "foreign_key_checks") == 0)
-		elog(ERROR, "Variable '%s' can't be set to the value of 'NULL'", varName);
+	if (isSessionSystemVar)
+	{
+		SystemVar  *systemVar;
+		bool		found;
+		char		candidate[SYSTEM_VAR_VALUE_MAX_LEN];
 
-    if (isSessionSystemVar)
-    {
-        systemVar = (SystemVar *)hash_search(sessionSystemVars, 
-                                             varName, 
-                                             HASH_FIND, 
-                                             &found);
-        if (found || (NULL != (systemVar = dynAddSystemVar(varName))))
-        {
-            if ((systemVar->sessionGlobalType == 0) || 
-                (systemVar->sessionGlobalType == 2) ||
-                (systemVar->sessionGlobalType == 3))
-            {
-                if (systemVar->isReadWrite)
-                {
-                    setSystemVarValueByVarName(varName, 
-                                               varValue, 
-                                               systemVar->varConfValue);
-                    applySystemVarValue(varName, varValue);
-                }
-                else 
-                {
-                    elog(ERROR, 
-                         "Variable '%s' is a read only variable",
-                         varName);
-                }
-            }
-            else
-            {
-                elog(ERROR, 
-                     "Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL",
-                     varName);
-            }
-        }
-        else
-        {
-            elog(ERROR, "Unknown system variable '%s'", varName);
-        }
-    }
-    else 
-    {
-        lockGlobalSystemVars();
-        systemVar = (SystemVar *)hash_search(globalSystemVars, 
-                                             varName, 
-                                             HASH_FIND, 
-                                             &found);
-        if (found || (NULL != (systemVar = dynAddSystemVar(varName))))
-        {
-            if ((systemVar->sessionGlobalType == 0) || 
-                (systemVar->sessionGlobalType == 1))
-            {
-                if (systemVar->isReadWrite)
-                {
-                    setSystemVarValueByVarName(varName, 
-                                               varValue, 
-                                               systemVar->varConfValue);
-                    unlockGlobalSystemVars();
+		systemVar = (SystemVar *) hash_search(sessionSystemVars,
+											  varName,
+											  HASH_FIND,
+											  &found);
+		if (!found && (systemVar = dynAddSystemVar(varName)) == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("Unknown system variable '%s'", varName)));
 
-                    if ((systemVar->sessionGlobalType == 1) && 
-                        systemVar->sessionDefValueFromGlobal)
-                    {
-                        systemVar = (SystemVar *)hash_search(sessionSystemVars, 
-                                                             varName, 
-                                                             HASH_FIND, 
-                                                             &found);
-                        if (found)
-                        {
-                            setSystemVarValueByVarName(varName, 
-                                                       varValue, 
-                                                       systemVar->varConfValue);
-                        }
-                        else
-                        {
-                            elog(ERROR, 
-                                 "System session variable '%s' does not exists(set)", 
-                                 varName);
-                        }
-                    }
-                }
-                else 
-                {
-                    unlockGlobalSystemVars();
-                    elog(ERROR, 
-                         "Variable '%s' is a read only variable",
-                         varName);
-                }
-            }
-            else 
-            {
-                unlockGlobalSystemVars();
-                elog(ERROR, 
-                     "Variable '%s' is a SESSION variable and can't be used with SET GLOBAL",
-                     varName);
-            }
-        }
-        else
-        {
-            unlockGlobalSystemVars();
-            elog(ERROR, "Unknown system variable '%s'", varName);
-        }
-    }
+		if (systemVar->sessionGlobalType != 0 &&
+			systemVar->sessionGlobalType != 2 &&
+			systemVar->sessionGlobalType != 3)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL",
+							varName)));
+
+		if (!systemVar->isReadWrite)
+			ereport(ERROR,
+					(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
+					 errmsg("Variable '%s' is a read only variable", varName)));
+
+		/*
+		 * Validate and apply side effects against a stack copy BEFORE mutating
+		 * TopMemoryContext state so a failed SET leaves @@var untouched.
+		 */
+		strlcpy(candidate, systemVar->varConfValue, sizeof(candidate));
+		setSystemVarValueByVarName(varName, varValue, candidate);
+		applySystemVarValue(varName, varValue ? candidate : NULL);
+		strlcpy(systemVar->varConfValue, candidate, sizeof(systemVar->varConfValue));
+	}
+	else
+	{
+		SystemVar	globalCopy;
+		bool		found;
+		char		candidate[SYSTEM_VAR_VALUE_MAX_LEN];
+
+		found = lookup_global_system_var(varName, &globalCopy);
+		if (!found)
+		{
+			if (dynAddSystemVar(varName) == NULL ||
+				!lookup_global_system_var(varName, &globalCopy))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("Unknown system variable '%s'", varName)));
+		}
+
+		if (globalCopy.sessionGlobalType != 0 &&
+			globalCopy.sessionGlobalType != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL",
+							varName)));
+
+		if (!globalCopy.isReadWrite)
+			ereport(ERROR,
+					(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
+					 errmsg("Variable '%s' is a read only variable", varName)));
+
+		strlcpy(candidate, globalCopy.varConfValue, sizeof(candidate));
+		setSystemVarValueByVarName(varName, varValue, candidate);
+
+		if (global_shmem_ready())
+		{
+			SystemVar  *gvar;
+			bool		gfound;
+
+			LWLockAcquire(sysvar_lwlock, LW_EXCLUSIVE);
+			gvar = (SystemVar *) hash_search(globalSystemVars, varName, HASH_FIND, &gfound);
+			if (gfound)
+				strlcpy(gvar->varConfValue, candidate, sizeof(gvar->varConfValue));
+			LWLockRelease(sysvar_lwlock);
+		}
+
+		if (globalCopy.sessionGlobalType == 1 && globalCopy.sessionDefValueFromGlobal)
+		{
+			SystemVar  *svar;
+			bool		sfound;
+
+			svar = (SystemVar *) hash_search(sessionSystemVars, varName, HASH_FIND, &sfound);
+			if (sfound)
+				strlcpy(svar->varConfValue, candidate, sizeof(svar->varConfValue));
+		}
+	}
 }
 
 void
 setSystemVariableValue(char *varName, char *varValue, bool isSessionSystemVar)
 {
 	const char *also = NULL;
+	char		normName[SYSTEM_VAR_NAME_MAX_LEN];
 	char		value[SYSTEM_VAR_VALUE_MAX_LEN];
 
 	setSystemVariableValueOne(varName, varValue, isSessionSystemVar);
-	if (strncmp(varName, "next_", 5) == 0)
-		return;
-	/* a SESSION value replaces SET TRANSACTION's for the same characteristic */
-	if (isSessionSystemVar && is_isolation_var(varName))
-		pending_isolation[0] = '\0';
-	else if (isSessionSystemVar && is_tx_read_only_var(varName))
-		pending_read_only = -1;
-	if (isSessionSystemVar)
-		session_value(varName, value, sizeof(value));
-	else
-		global_value(varName, value, sizeof(value));
 
-	/* MySQL keeps each pair of aliases equal (DEFAULT is resolved by now) */
-	if (strcmp(varName, "transaction_isolation") == 0)
+	strlcpy(normName, varName, sizeof(normName));
+	lowerSystemVarName(normName);
+
+	if (strncmp(normName, "next_", 5) == 0)
+		return;
+	if (isSessionSystemVar && is_isolation_var(normName))
+		pending_isolation[0] = '\0';
+	else if (isSessionSystemVar && is_tx_read_only_var(normName))
+		pending_read_only = -1;
+
+	if (isSessionSystemVar)
+		session_value(normName, value, sizeof(value));
+	else
+		global_value(normName, value, sizeof(value));
+
+	if (strcmp(normName, "transaction_isolation") == 0)
 		also = "tx_isolation";
-	else if (strcmp(varName, "tx_isolation") == 0)
+	else if (strcmp(normName, "tx_isolation") == 0)
 		also = "transaction_isolation";
-	else if (strcmp(varName, "transaction_read_only") == 0)
+	else if (strcmp(normName, "transaction_read_only") == 0)
 		also = "tx_read_only";
-	else if (strcmp(varName, "tx_read_only") == 0)
+	else if (strcmp(normName, "tx_read_only") == 0)
 		also = "transaction_read_only";
-	/* super_read_only = 1 sets read_only, read_only = 0 clears super_read_only */
-	else if (strcmp(varName, "super_read_only") == 0 && strcmp(value, "1") == 0)
+	else if (strcmp(normName, "super_read_only") == 0 && strcmp(value, "1") == 0)
 		also = "read_only";
-	else if (strcmp(varName, "read_only") == 0 && strcmp(value, "0") == 0)
+	else if (strcmp(normName, "read_only") == 0 && strcmp(value, "0") == 0)
 		also = "super_read_only";
+
 	if (also)
-		setSystemVariableValueOne(pstrdup(also), pstrdup(value), isSessionSystemVar);
+		setSystemVariableValueOne(also, value, isSessionSystemVar);
 }
 
-
 void
-setSystemVariableDatum(char *varName, Datum varConfValue, 
-                       Oid varValueType, bool isNull, 
-                       bool isSessionSystemVar) 
+setSystemVariableDatum(char *varName, Datum varConfValue,
+					   Oid varValueType, bool isNull,
+					   bool isSessionSystemVar)
 {
-    char *varValue;
+	char	   *varValue = NULL;
 
-    if (!isNull)
-    {
-        Oid	typoutput;
-	    bool typIsVarlena;
-
+	if (!isNull)
+	{
 		if (mys_is_mysql_session() && mys_binary_base_type(varValueType) == BYTEAOID)
 		{
-			bytea *b = DatumGetByteaPP(varConfValue);
+			bytea	   *b = DatumGetByteaPP(varConfValue);
 
 			pg_verifymbstr(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), false);
 			varValue = pnstrdup(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b));
 		}
 		else
 		{
+			Oid			typoutput;
+			bool		typIsVarlena;
+
 			getTypeOutputInfo(varValueType, &typoutput, &typIsVarlena);
 			varValue = OidOutputFunctionCall(typoutput, varConfValue);
 		}
-    }
-    else 
-    {
-        varValue = NULL;
-    }
-    setSystemVariableValue(varName, varValue, isSessionSystemVar);
+	}
+
+	setSystemVariableValue(varName, varValue, isSessionSystemVar);
+	if (varValue)
+		pfree(varValue);
 }
 
-
-bool 
+bool
 isSystemVariable(char *varName)
 {
-    bool found;
+	char		normName[SYSTEM_VAR_NAME_MAX_LEN];
+	bool		found = false;
 
-    if (sessionSystemVars == NULL)
-    {
-        initSystemVariables();
-    }
+	if (varName == NULL || strlen(varName) >= sizeof(normName))
+		return false;
 
-    lowerSystemVarName(varName);
+	if (sessionSystemVars == NULL)
+		initSystemVariables();
 
-    (SystemVar *)hash_search(sessionSystemVars, 
-                             varName, 
-                             HASH_FIND, 
-                             &found);
+	strlcpy(normName, varName, sizeof(normName));
+	lowerSystemVarName(normName);
 
-    return found;
+	(void) hash_search(sessionSystemVars, normName, HASH_FIND, &found);
+	return found;
 }
 
+/* ----------------------------------------------------------------
+ *	Catalog loading and session / global initialization
+ * ----------------------------------------------------------------
+ */
 
-static void 
+static void
 initSystemVariables(void)
 {
-    MemoryContext oldContext;
+	/* Load base_variables in a short-lived context, keeping only SystemVar structs in TopMemoryContext */
+	initBaseSystemVars();
 
-    oldContext = MemoryContextSwitchTo(TopMemoryContext);
+	if (global_shmem_ready())
+	{
+		LWLockAcquire(sysvar_lwlock, LW_EXCLUSIVE);
+		initGlobalSystemVarsLocked(baseSystemVars, baseSystemVarsNum);
+		LWLockRelease(sysvar_lwlock);
 
-    initBaseSystemVars();
+		LWLockAcquire(sysvar_lwlock, LW_SHARED);
+		initSessionSystemVarsLocked(baseSystemVars, baseSystemVarsNum);
+		LWLockRelease(sysvar_lwlock);
+	}
+	else
+	{
+		initSessionSystemVarsLocked(baseSystemVars, baseSystemVarsNum);
+	}
 
-    lockGlobalSystemVars();
-    initGlobalSystemVars(baseSystemVars, baseSystemVarsNum);
-    initSessionSystemVars(baseSystemVars, baseSystemVarsNum);
-    unlockGlobalSystemVars();
-
-	/* outside the spinlock: applying a value can allocate or fail */
+	/* Apply outside any LWLock: applying a value may invoke GUC routines or allocate */
 	for (int i = 0; i < baseSystemVarsNum; i++)
 	{
 		SystemVar  *var = (SystemVar *) hash_search(sessionSystemVars,
-												  baseSystemVars[i]->varName,
-												  HASH_FIND, NULL);
+													baseSystemVars[i]->varName,
+													HASH_FIND, NULL);
 
 		if (var)
 			applySystemVarValue(var->varName, var->varConfValue);
 	}
-
-    MemoryContextSwitchTo(oldContext);
 }
-
 
 static bool
 add2BaseSystemVars(SystemVar *systemVar)
 {
-    if (baseSystemVarsNum < SYSTEM_VAR_MAX_NUM)
-    {
-        baseSystemVars[baseSystemVarsNum] = systemVar;
-        ++baseSystemVarsNum;
-        return true;
-    }
-    else
-    {
-        return false;
-    }
+	if (baseSystemVarsNum < SYSTEM_VAR_MAX_NUM)
+	{
+		baseSystemVars[baseSystemVarsNum++] = systemVar;
+		return true;
+	}
+	return false;
 }
 
-
-static SystemVar * 
-initBaseSystemVar(List *systemVarDatas)
+static SystemVar *
+initBaseSystemVar(List *systemVarDatas, MemoryContext targetCxt)
 {
-    SystemVar *systemVar;
-    char *varName;
-    char *varDefValue;
-    char *varConfValue;
-    int sessionGlobalType;
-    bool sessionDefValueFromGlobal;
-    bool isReadWrite;
-    char *result;
-    char *selectResult;
-    char *showResult;
-    ListCell *lc;
-    int ind;
+	SystemVar  *systemVar;
+	char	   *varName = NULL;
+	char	   *varDefValue = NULL;
+	char	   *varConfValue = NULL;
+	int			sessionGlobalType = 0;
+	bool		sessionDefValueFromGlobal = true;
+	bool		isReadWrite = true;
+	char	   *result = NULL;
+	char	   *selectResult = NULL;
+	char	   *showResult = NULL;
+	ListCell   *lc;
+	int			ind = 0;
 
-    systemVar = NULL;
-    varName = NULL;
-    varDefValue = NULL;
-    varConfValue = NULL;
-    sessionGlobalType = 0;
-    sessionDefValueFromGlobal = true;
-    isReadWrite= true;
-    result = NULL;
-    selectResult = NULL;
-    showResult = NULL;
-    ind = 0;
+	foreach(lc, systemVarDatas)
+	{
+		Node	   *nd = lfirst(lc);
 
-    foreach (lc, systemVarDatas)
-    {
-        Node *nd = lfirst(lc);
-        if (NULL != nd)
-        {
-            char *val = strVal(nd);
-            if (ind == 0)
-            {
-                varName = val;
-                lowerSystemVarName(varName);
-            }
-            else if (ind == 1)
-            {
-                varDefValue = val;
-            }
-            else if (ind == 2)
-            {
-                varConfValue = val;
-            }
-            else if (ind == 3)
-            {
-                if (val[0] == '0')
-                {
-                    sessionGlobalType = 0;
-                }
-                else if (val[0] == '1')
-                {
-                    sessionGlobalType = 1;
-                }
-                else if (val[0] == '2')
-                {
-                    sessionGlobalType = 2;
-                }
-                else if (val[0] == '3')
-                {
-                    sessionGlobalType = 3;
-                }
-                else 
-                {
-                    return NULL;
-                }
-            }
-            else if (ind == 4)
-            {
-                /* openHalo printed booleans as 1/0 on MySQL connections; PG18 prints t/f */
-                if (val[0] == '1' || val[0] == 't')
-                {
-                    sessionDefValueFromGlobal = true;
-                }
-                else 
-                {
-                    sessionDefValueFromGlobal = false;
-                }
-            }
-            else if (ind == 5)
-            {
-                if (val[0] == '1' || val[0] == 't')
-                {
-                    isReadWrite = true;
-                }
-                else 
-                {
-                    isReadWrite = false;
-                }
-            }
-            else if (ind == 6)
-            {
-                result = val;
-            }
-            else if (ind == 7)
-            {
-                selectResult = val;
-            }
-            else
-            {
-                showResult = val;
-            }
-        }
-        else 
-        {
-            if (ind == 6)
-            {
-                result = NULL;
-            }
-            else if (ind == 7)
-            {
-                selectResult = NULL;
-            }
-            else if (ind == 8)
-            {
-                showResult = NULL;
-            }
-        }
-        ++ind;
-    }
+		if (nd != NULL)
+		{
+			char	   *val = strVal(nd);
 
-    systemVar = (SystemVar *)palloc0(sizeof(SystemVar));
-    snprintf(systemVar->varName, SYSTEM_VAR_NAME_MAX_LEN, "%s", varName);
-    if (!asignSystemVar(varDefValue, 
-                        varConfValue, 
-                        sessionGlobalType, 
-                        sessionDefValueFromGlobal, 
-                        isReadWrite, 
-                        result, 
-                        selectResult, 
-                        showResult, 
-                        systemVar))
-    {
-        return NULL;
-    }
+			if (ind == 0)
+			{
+				varName = val;
+				lowerSystemVarName(varName);
+			}
+			else if (ind == 1)
+				varDefValue = val;
+			else if (ind == 2)
+				varConfValue = val;
+			else if (ind == 3)
+			{
+				if (val[0] >= '0' && val[0] <= '3')
+					sessionGlobalType = val[0] - '0';
+				else
+					return NULL;
+			}
+			else if (ind == 4)
+				sessionDefValueFromGlobal = (val[0] == '1' || val[0] == 't');
+			else if (ind == 5)
+				isReadWrite = (val[0] == '1' || val[0] == 't');
+			else if (ind == 6)
+				result = val;
+			else if (ind == 7)
+				selectResult = val;
+			else
+				showResult = val;
+		}
+		++ind;
+	}
 
-    return systemVar;
+	if (varName == NULL)
+		return NULL;
+
+	systemVar = (SystemVar *) MemoryContextAllocZero(targetCxt, sizeof(SystemVar));
+	strlcpy(systemVar->varName, varName, sizeof(systemVar->varName));
+	if (!assignSystemVar(varDefValue,
+						 varConfValue,
+						 sessionGlobalType,
+						 sessionDefValueFromGlobal,
+						 isReadWrite,
+						 result,
+						 selectResult,
+						 showResult,
+						 systemVar))
+	{
+		pfree(systemVar);
+		return NULL;
+	}
+
+	return systemVar;
 }
 
-
-static List * 
+static List *
 readBaseVariableRecord(TupleTableSlot *slot)
 {
-    List *columnVals;
-    int columnCount;
+	List	   *columnVals = NIL;
+	TupleDesc	tupleDesc = slot->tts_tupleDescriptor;
+	int			columnCount = tupleDesc->natts;
 
-    columnVals = NIL;
-    columnCount = slot->tts_tupleDescriptor->natts;
-    for (int i = 0; i < columnCount; i++)
-    {
-        TupleDesc tupleDesc;
-        Form_pg_attribute att;
-        Datum attr;
-        bool is_null;
-        Oid typoutput;
-        bool typisvarlena;
+	for (int i = 0; i < columnCount; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
+		bool		is_null;
+		Datum		attr = slot_getattr(slot, i + 1, &is_null);
 
-        tupleDesc = slot->tts_tupleDescriptor;
-        att = TupleDescAttr(tupleDesc, i);
-        attr = slot_getattr(slot, (i + 1), &is_null);
-        if (!is_null)
-        {
-            char *columnVal;
-            getTypeOutputInfo(att->atttypid, &typoutput, &typisvarlena);
-            columnVal = OidOutputFunctionCall(typoutput, attr);
-            columnVals = lappend(columnVals, makeString(columnVal));
-        }
-        else 
-        {
-            columnVals = lappend(columnVals, NULL);
-        }
-    }
+		if (!is_null)
+		{
+			Oid			typoutput;
+			bool		typisvarlena;
+			char	   *columnVal;
 
-    return columnVals;
+			getTypeOutputInfo(att->atttypid, &typoutput, &typisvarlena);
+			columnVal = OidOutputFunctionCall(typoutput, attr);
+			columnVals = lappend(columnVals, makeString(columnVal));
+		}
+		else
+		{
+			columnVals = lappend(columnVals, NULL);
+		}
+	}
+
+	return columnVals;
 }
 
-
-static List * 
-readBaseVariablesTable()
+static List *
+readBaseVariablesTable(void)
 {
-    List *systemVarsDatas;
-    Relation relation;
-    Snapshot snapshot;
-    TableScanDesc scan;
-    TupleTableSlot *slot;
-    Oid schemaId;
-    Oid tableId;
-    char *schemaName;
-    char *tableName;
+	List	   *systemVarsDatas = NIL;
+	Oid			schemaId;
+	Oid			tableId;
+	Relation	relation;
+	Snapshot	snapshot;
+	TableScanDesc scan;
+	TupleTableSlot *slot;
 
-    systemVarsDatas = NIL;
-    schemaId = InvalidOid;
-    tableId = InvalidOid;
-    schemaName = "mys_informa_schema";
-    tableName = "base_variables";
+	schemaId = get_namespace_oid("mys_informa_schema", true);
+	if (!OidIsValid(schemaId))
+		return NIL;
+	tableId = get_relname_relid("base_variables", schemaId);
+	if (!OidIsValid(tableId))
+		return NIL;
 
-    schemaId = get_namespace_oid(schemaName, false);
-    tableId = get_relname_relid(tableName, schemaId);
-    relation = table_open(tableId, AccessShareLock);
-    snapshot = RegisterSnapshot(GetLatestSnapshot());
-    scan = table_beginscan(relation, snapshot, 0, NULL);
-    slot = table_slot_create(relation, NULL);
-    while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
-    {
-        List *systemVarDatas = readBaseVariableRecord(slot);
-        systemVarsDatas = lappend(systemVarsDatas, systemVarDatas);
-    }
-    table_endscan(scan);
-    UnregisterSnapshot(snapshot);
-    ExecDropSingleTupleTableSlot(slot);
-    table_close(relation, AccessShareLock);
+	relation = table_open(tableId, AccessShareLock);
+	snapshot = RegisterSnapshot(GetLatestSnapshot());
+	scan = table_beginscan(relation, snapshot, 0, NULL);
+	slot = table_slot_create(relation, NULL);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		List	   *systemVarDatas = readBaseVariableRecord(slot);
 
-    return systemVarsDatas;
+		systemVarsDatas = lappend(systemVarsDatas, systemVarDatas);
+	}
+	table_endscan(scan);
+	UnregisterSnapshot(snapshot);
+	ExecDropSingleTupleTableSlot(slot);
+	table_close(relation, AccessShareLock);
+
+	return systemVarsDatas;
 }
 
-
-static void 
+static void
 initBaseSystemVars(void)
 {
-    List *systemVarsColumnVals;
-    ListCell *lc;
+	MemoryContext scanCxt;
+	MemoryContext oldCxt;
+	List	   *systemVarsColumnVals;
+	ListCell   *lc;
 
-    baseSystemVarsNum = 0;
-    systemVarsColumnVals = readBaseVariablesTable();
-    foreach (lc, systemVarsColumnVals)
-    {
-        List *systemVarColumnVals = (List *)lfirst(lc);
-        SystemVar *systemVar = initBaseSystemVar(systemVarColumnVals);
-        if (NULL != systemVar)
-        {
-            if (!add2BaseSystemVars(systemVar))
-            {
-                elog(ERROR, 
-                     "There are too many MySQL system variables. Connection will be disconnect.");
-                proc_exit(1);
-            }
-        }
-        else 
-        {
-            char *varName = strVal(linitial(systemVarColumnVals));
-            elog(ERROR,
-                 "Invalid data '%s' in mys_informa_schema.base_variables table. Connection will be disconnect.",
-                 varName);
-            proc_exit(1);
-        }
-    }
+	for (int i = 0; i < baseSystemVarsNum; i++)
+	{
+		if (baseSystemVars[i] != NULL)
+		{
+			pfree(baseSystemVars[i]);
+			baseSystemVars[i] = NULL;
+		}
+	}
+	baseSystemVarsNum = 0;
+
+	scanCxt = AllocSetContextCreate(CurrentMemoryContext,
+									"aux_mysql base_variables scan",
+									ALLOCSET_DEFAULT_SIZES);
+	oldCxt = MemoryContextSwitchTo(scanCxt);
+
+	systemVarsColumnVals = readBaseVariablesTable();
+	foreach(lc, systemVarsColumnVals)
+	{
+		List	   *systemVarColumnVals = (List *) lfirst(lc);
+		SystemVar  *systemVar = initBaseSystemVar(systemVarColumnVals, TopMemoryContext);
+
+		if (systemVar != NULL)
+		{
+			if (!add2BaseSystemVars(systemVar))
+			{
+				pfree(systemVar);
+				MemoryContextSwitchTo(oldCxt);
+				MemoryContextDelete(scanCxt);
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("There are too many MySQL system variables.")));
+			}
+		}
+		else
+		{
+			const char *vname = (systemVarColumnVals != NIL && linitial(systemVarColumnVals) != NULL) ?
+				strVal(linitial(systemVarColumnVals)) : "<null>";
+			char	   *vnameCopy = MemoryContextStrdup(oldCxt, vname);
+
+			MemoryContextSwitchTo(oldCxt);
+			MemoryContextDelete(scanCxt);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("Invalid data '%s' in mys_informa_schema.base_variables table.",
+							vnameCopy)));
+		}
+	}
+
+	MemoryContextSwitchTo(oldCxt);
+	MemoryContextDelete(scanCxt);
 }
 
-
-static void 
-add2GlobalSystemVars(SystemVar *systemVar)
+static void
+add2GlobalSystemVarsLocked(SystemVar *systemVar)
 {
-    SystemVar *globalSystemVar;
-    bool found;
+	SystemVar  *globalSystemVar;
+	bool		found;
 
-    globalSystemVar = 
-        (SystemVar *)hash_search(globalSystemVars, 
-                                 &(systemVar->varName[0]),
-                                 HASH_ENTER, 
-                                 &found);
-    if (!found)
-    {
-        copySystemVar(systemVar, globalSystemVar);
-    }
+	if (!global_shmem_ready())
+		return;
+
+	globalSystemVar = (SystemVar *) hash_search(globalSystemVars,
+												systemVar->varName,
+												HASH_ENTER,
+												&found);
+	if (!found)
+		copySystemVar(systemVar, globalSystemVar);
 }
 
-
-static void 
-initGlobalSystemVars(SystemVar *systemVars[], int systemVarsNum)
+static void
+initGlobalSystemVarsLocked(SystemVar *systemVars[], int systemVarsNum)
 {
-    SystemVar *globalSystemVar;
-    bool found;
+	SystemVar  *globalSystemVar;
+	bool		found;
 
-    globalSystemVar = 
-        (SystemVar *)hash_search(globalSystemVars, 
-                                 "global_system_vars_init_flag",
-                                 HASH_ENTER, 
-                                 &found);
+	if (!global_shmem_ready())
+		return;
 
-    if (!found)
-    {
-        if (!asignSystemVar("1", "1", false, false, false, NULL, NULL, NULL, 
-                            globalSystemVar))
-        {
-            elog(NOTICE, 
-                 "Invalid data in mys_informa_schema.base_variables table");
-        }
-
-        for (int i = 0; i < systemVarsNum; i++)
-        {
-            SystemVar *systemVar = systemVars[i];
-            add2GlobalSystemVars(systemVar);
-        }
-    }
+	globalSystemVar = (SystemVar *) hash_search(globalSystemVars,
+												"global_system_vars_init_flag",
+												HASH_ENTER,
+												&found);
+	if (!found)
+	{
+		(void) assignSystemVar("1", "1", 0, false, false, NULL, NULL, NULL,
+							   globalSystemVar);
+		for (int i = 0; i < systemVarsNum; i++)
+			add2GlobalSystemVarsLocked(systemVars[i]);
+	}
 }
 
-
-/*
- * at_init: called by initSystemVariables() under the global spinlock, which
- * applies the values once the lock is released.
- */
-static void 
+static void
 add2SessionSystemVars(SystemVar *systemVar, bool at_init)
 {
-    SystemVar *sessionSystemVar;
-    bool found;
+	SystemVar  *sessionSystemVar;
+	bool		found;
 
-    sessionSystemVar = (SystemVar *)hash_search(sessionSystemVars, 
-                                                &(systemVar->varName), 
-                                                HASH_ENTER, 
-                                                &found);
-    if (!found)
-    {
-        copySystemVar(systemVar, sessionSystemVar);
-		/* as in MySQL, a new connection starts from the GLOBAL value */
-		if (at_init && sessionSystemVar->sessionDefValueFromGlobal)
+	sessionSystemVar = (SystemVar *) hash_search(sessionSystemVars,
+												 systemVar->varName,
+												 HASH_ENTER,
+												 &found);
+	if (!found)
+	{
+		copySystemVar(systemVar, sessionSystemVar);
+		if (at_init && sessionSystemVar->sessionDefValueFromGlobal && global_shmem_ready())
 		{
 			SystemVar  *global = (SystemVar *) hash_search(globalSystemVars,
 														   sessionSystemVar->varName,
@@ -1317,973 +1184,873 @@ add2SessionSystemVars(SystemVar *systemVar, bool at_init)
 							sessionSystemVar->varConfValue);
 }
 
-
-static void 
-initSessionSystemVars(SystemVar *systemVars[], int systemVarsNum)
+static void
+initSessionSystemVarsLocked(SystemVar *systemVars[], int systemVarsNum)
 {
-    HASHCTL hashctl;
+	HASHCTL		hashctl;
 
-    hashctl.keysize = SYSTEM_VAR_NAME_MAX_LEN;
-    hashctl.entrysize = sizeof(SystemVar);
-    sessionSystemVars = hash_create("Halo MySQL Session System Variables (914)", 
-                                    SYSTEM_VAR_MAX_NUM, 
-                                    &hashctl, 
-                                    HASH_ELEM | HASH_STRINGS);
+	memset(&hashctl, 0, sizeof(hashctl));
+	hashctl.keysize = SYSTEM_VAR_NAME_MAX_LEN;
+	hashctl.entrysize = sizeof(SystemVar);
+	hashctl.hcxt = TopMemoryContext;
+	sessionSystemVars = hash_create("Halo MySQL Session System Variables",
+									SYSTEM_VAR_MAX_NUM,
+									&hashctl,
+									HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
 
-    for (int i = 0; i < systemVarsNum; i++)
-    {
-        SystemVar *systemVar = systemVars[i];
-		add2SessionSystemVars(systemVar, true);
-    }
+	for (int i = 0; i < systemVarsNum; i++)
+		add2SessionSystemVars(systemVars[i], true);
 }
 
-/* Reset an authenticated connection to current global/default values. */
 void
 resetSessionSystemVariables(void)
 {
-    MemoryContext old;
-    HASH_SEQ_STATUS scan;
-    SystemVar *entry;
+	HASH_SEQ_STATUS scan;
+	SystemVar  *entry;
 
-	/* COM_RESET_CONNECTION also drops SET TRANSACTION's one-shot values */
 	pending_isolation[0] = '\0';
 	pending_read_only = -1;
 	pending_armed = txn_used = txn_explicit = txn_started = stmt_touched = false;
 	mys_server_read_only = false;
-    if (sessionSystemVars == NULL)
-        initSystemVariables();
-    old = MemoryContextSwitchTo(TopMemoryContext);
-    hash_seq_init(&scan, sessionSystemVars);
-    while ((entry = hash_seq_search(&scan)) != NULL)
-    {
-        SystemVar copy = *entry;
-        SystemVar *global;
 
-        lockGlobalSystemVars();
-        global = hash_search(globalSystemVars, entry->varName, HASH_FIND, NULL);
-        if (entry->sessionDefValueFromGlobal && global)
-            strlcpy(copy.varConfValue, global->varConfValue, sizeof(copy.varConfValue));
-        else
-            strlcpy(copy.varConfValue, copy.varDefValue, sizeof(copy.varConfValue));
-        unlockGlobalSystemVars();
-        *entry = copy;
-        /* Applying values can allocate or throw: never hold the spinlock. */
-        applySystemVarValue(entry->varName, entry->varConfValue);
-    }
-    needCommitTrx = needStartNewTrx = false;
-    MemoryContextSwitchTo(old);
+	if (sessionSystemVars == NULL)
+		initSystemVariables();
+
+	hash_seq_init(&scan, sessionSystemVars);
+	while ((entry = hash_seq_search(&scan)) != NULL)
+	{
+		SystemVar	globalCopy;
+
+		if (entry->sessionDefValueFromGlobal &&
+			lookup_global_system_var(entry->varName, &globalCopy))
+			strlcpy(entry->varConfValue, globalCopy.varConfValue,
+					sizeof(entry->varConfValue));
+		else
+			strlcpy(entry->varConfValue, entry->varDefValue,
+					sizeof(entry->varConfValue));
+
+		applySystemVarValue(entry->varName, entry->varConfValue);
+	}
+	needCommitTrx = needStartNewTrx = false;
 }
 
-
-static SystemVar * 
-dynAddSystemVar(char *varName)
+static SystemVar *
+dynAddSystemVar(const char *varName)
 {
-    SystemVar *systemVar;
-    List *systemVarsColumnVals;
-    ListCell *lc;
-    List *systemVarColumnVals;
-    int varNameLen;
-    MemoryContext oldContext;
+	MemoryContext scanCxt;
+	MemoryContext oldCxt;
+	List	   *systemVarsColumnVals;
+	ListCell   *lc;
+	List	   *matchedRow = NIL;
+	SystemVar  *systemVar = NULL;
+	SystemVar  *sessionEntry = NULL;
 
-    oldContext = MemoryContextSwitchTo(TopMemoryContext);
+	if (!IsTransactionState())
+		return NULL;
 
-    systemVar = NULL;
-    systemVarsColumnVals = readBaseVariablesTable();
-    systemVarColumnVals = NIL;
-    varNameLen = strlen(varName);
-    foreach (lc, systemVarsColumnVals)
-    {
-        List *curSystemVarsColumnVals = (List *)lfirst(lc);
-        char *variableName = strVal(linitial(curSystemVarsColumnVals));
-        if ((varNameLen == strlen(variableName)) && 
-            (strncasecmp(varName, variableName, strlen(varName)) == 0))
-        {
-            systemVarColumnVals = curSystemVarsColumnVals;
-            break;
-        }
-    }
-    if (NIL == systemVarColumnVals)
-    {
-        MemoryContextSwitchTo(oldContext);
-        return NULL;
-    }
+	scanCxt = AllocSetContextCreate(CurrentMemoryContext,
+									"aux_mysql dynAddSystemVar scan",
+									ALLOCSET_DEFAULT_SIZES);
+	oldCxt = MemoryContextSwitchTo(scanCxt);
 
-    systemVar = initBaseSystemVar(systemVarColumnVals);
-    if (NULL == systemVar)
-    {
-        MemoryContextSwitchTo(oldContext);
-        return NULL;
-    }
+	systemVarsColumnVals = readBaseVariablesTable();
+	foreach(lc, systemVarsColumnVals)
+	{
+		List	   *curRow = (List *) lfirst(lc);
 
-    if (!add2BaseSystemVars(systemVar))
-    {
-        MemoryContextSwitchTo(oldContext);
-        return NULL;
-    }
+		if (curRow != NIL && linitial(curRow) != NULL)
+		{
+			const char *variableName = strVal(linitial(curRow));
 
-    add2GlobalSystemVars(systemVar);
+			if (pg_strcasecmp(varName, variableName) == 0)
+			{
+				matchedRow = curRow;
+				break;
+			}
+		}
+	}
+
+	if (matchedRow != NIL)
+		systemVar = initBaseSystemVar(matchedRow, TopMemoryContext);
+
+	MemoryContextSwitchTo(oldCxt);
+	MemoryContextDelete(scanCxt);
+
+	if (systemVar == NULL)
+		return NULL;
+
+	if (!add2BaseSystemVars(systemVar))
+	{
+		pfree(systemVar);
+		return NULL;
+	}
+
+	if (global_shmem_ready())
+	{
+		LWLockAcquire(sysvar_lwlock, LW_EXCLUSIVE);
+		add2GlobalSystemVarsLocked(systemVar);
+		LWLockRelease(sysvar_lwlock);
+	}
+
 	add2SessionSystemVars(systemVar, false);
-
-    MemoryContextSwitchTo(oldContext);
-    return systemVar;
+	sessionEntry = (SystemVar *) hash_search(sessionSystemVars,
+											 systemVar->varName,
+											 HASH_FIND, NULL);
+	return sessionEntry;
 }
 
-
-static void 
-lockGlobalSystemVars(void)
-{
-    bool found;
-
-    globalSystemVarsMutex = 
-        (GlobalSystemVarsMutex *)hash_search(globalSystemVarsLock,                    
-                                             "mysql_global_system_vars_lock", 
-                                             HASH_ENTER, 
-                                             &found); 
-    if (!found)
-    {
-        SpinLockInit(&globalSystemVarsMutex->mutex);
-    }
-
-    SpinLockAcquire(&globalSystemVarsMutex->mutex);
-}
-
-
-static void 
-unlockGlobalSystemVars(void)
-{
-    SpinLockRelease(&globalSystemVarsMutex->mutex);
-}
-
-
-static void 
-lowerSystemVarName(char *varName)
-{
-    int varNameLen;
-
-    if (varName == NULL)
-    {
-        return;
-    }
-
-    varNameLen = strlen(varName);
-    for (int i = 0; i < varNameLen; i++)
-    {
-        if ((65 <= varName[i]) && (varName[i] <= 90))
-        {
-            varName[i] += 32;
-        }
-    }
-}
-
-
-static bool 
-asignSystemVar(const char *varDefValue, 
-               const char *varConfValue, 
-               int sessionGlobalType, 
-               bool sessionDefValueFromGlobal,
-               bool isReadWrite, 
-               const char *result, 
-               const char *selectResult, 
-               const char *showResult, 
-               SystemVar *systemVar)
-{
-    setSystemVarValue(varDefValue, systemVar->varDefValue);
-    setSystemVarValue(varConfValue, systemVar->varConfValue);
-    systemVar->sessionGlobalType = sessionGlobalType;
-    systemVar->sessionDefValueFromGlobal = sessionDefValueFromGlobal;
-    systemVar->isReadWrite = isReadWrite;
-    if (result != NULL)
-    {
-        if (!asignSystemVarResult(result,
-                                  &(systemVar->resultNum), 
-                                  &(systemVar->result[0][0])))
-        {
-            return false;
-        }
-    }
-    else 
-    {
-        systemVar->resultNum = 0;
-    }
-    if (selectResult != NULL)
-    {
-        if (!asignSystemVarResult(selectResult,
-                                  &(systemVar->selectResultNum), 
-                                  &(systemVar->selectResult[0][0])))
-        {
-            return false;
-        }
-    }
-    else 
-    {
-        systemVar->selectResultNum = 0;
-    }
-    if (showResult != NULL)
-    {
-        if (!asignSystemVarResult(showResult,
-                                  &(systemVar->showResultNum), 
-                                  &(systemVar->showResult[0][0])))
-        {
-            return false;
-        }
-    }
-    else 
-    {
-        systemVar->showResultNum = 0;
-    }
-
-    if ((0 == systemVar->resultNum) && 
-        ((0 < systemVar->selectResultNum) || 
-         (0 < systemVar->showResultNum)))
-    {
-        return false;
-    }
-
-    if ((0 < systemVar->resultNum) && 
-        (((systemVar->selectResultNum != systemVar->resultNum) && 
-          (systemVar->showResultNum != systemVar->resultNum)) || 
-         ((0 < systemVar->selectResultNum) && 
-          (0 < systemVar->showResultNum) && 
-          (systemVar->selectResultNum != systemVar->showResultNum))))
-    {
-        return false;
-    }
-
-    return true;
-}
-
-
-static bool 
-asignSystemVarResult(const char *srcResult, 
-                     int *resultNum,
-                     char *result)
-{
-    char items[SYSTEM_VAR_RESULT_RULE_NUM][SYSTEM_VAR_RESULT_RULE_LEN];
-    int itemsNum;
-
-    itemsNum = 0;
-    splitStr(srcResult, '|', SYSTEM_VAR_RESULT_RULE_LEN, 
-             &items[0][0], &itemsNum);
-    *resultNum = itemsNum;
-    for (int i = 0; i < itemsNum; i++)
-    {
-        if ((SYSTEM_VAR_RESULT_RULE_LEN - 1) <= (strlen(items[i])))
-        {
-            return false;
-        }
-
-        snprintf((result + (i * SYSTEM_VAR_RESULT_RULE_LEN)), 
-                 SYSTEM_VAR_RESULT_RULE_LEN, "%s", items[i]);
-    }
-
-    return true;
-}
-
-
-static void 
-splitStr(const char *str, char separator, 
-         int itemSize, char *items, int *itemsNum)
-{
-    int strLen;
-    int itemStartIndex;
-
-    if (str == NULL)
-    {
-        return;
-    }
-
-    strLen = strlen(str);
-    if (strLen == 0)
-    {
-        return;
-    }
-
-    *itemsNum = 0;
-    itemStartIndex = -1;
-    for (int i = 0; i <= strLen; i++)
-    {
-        if ((str[i] != separator) && (str[i] != '\0'))
-        {
-            if (itemStartIndex == -1)
-            {
-                itemStartIndex = i;
-            }
-        }
-        else 
-        {
-            if (itemStartIndex != -1)
-            {
-                int curItemLen = i - itemStartIndex;
-                char *curItemBuf = items + (*itemsNum * itemSize);
-                memcpy(curItemBuf, (str + itemStartIndex), curItemLen);
-                curItemBuf[curItemLen] = '\0';
-                (*itemsNum)++;
-                itemStartIndex = -1;
-            }
-        }
-    }
-}
-
-
-static void 
-copySystemVar(SystemVar *srcSystemVar, SystemVar *destSystemVar)
-{
-    setSystemVarValue(srcSystemVar->varDefValue, 
-                      destSystemVar->varDefValue);
-    setSystemVarValue(srcSystemVar->varConfValue, 
-                      destSystemVar->varConfValue);
-    destSystemVar->sessionGlobalType = srcSystemVar->sessionGlobalType;
-    destSystemVar->sessionDefValueFromGlobal = 
-        srcSystemVar->sessionDefValueFromGlobal;
-    destSystemVar->isReadWrite = srcSystemVar->isReadWrite;
-    destSystemVar->resultNum = srcSystemVar->resultNum;
-    for (int i = 0; i < destSystemVar->resultNum; i++)
-    {
-        setSystemVarValue(&(srcSystemVar->result[i][0]), 
-                          &(destSystemVar->result[i][0]));
-    }
-    destSystemVar->selectResultNum = srcSystemVar->selectResultNum;
-    for (int i = 0; i < destSystemVar->selectResultNum; i++)
-    {
-        setSystemVarValue(&(srcSystemVar->selectResult[i][0]), 
-                          &(destSystemVar->selectResult[i][0]));
-    }
-    destSystemVar->showResultNum = srcSystemVar->showResultNum;
-    for (int i = 0; i < destSystemVar->showResultNum; i++)
-    {
-        setSystemVarValue(&(srcSystemVar->showResult[i][0]), 
-                          &(destSystemVar->showResult[i][0]));
-    }
-}
-
-
-static void 
-setSystemVarValueByVarName(const char *varName, 
-                           const char *value, char *varValue)
-{
-    if (strncasecmp(varName, "optimizer_switch", 16) == 0)
-    {
-        setSystemVarValueForOptimizerSwitch(value, varValue);
-    }
-    else
-    {
-        setSystemVarValue(value, varValue);
-    }
-}
-
-
-static void 
-setSystemVarValueForOptimizerSwitch(const char *value, char *varValue)
-{
-    char newVarValue[SYSTEM_VAR_VALUE_MAX_LEN];
-    int valueLen;
-    int setItemStartIndex;
-
-    valueLen = strlen(value);
-    setItemStartIndex = 0;
-    for (int i = 0; i <= valueLen; i++)
-    {
-        if (value[i] == '=')
-        {
-            char *setItemName;
-            int setItemNameLen;
-            int setItemLen;
-
-            setItemNameLen = i - setItemStartIndex;
-            if (setItemNameLen == 0)
-            {
-                elog(ERROR, "Invalid value '%s' for 'optimizer_switch'", value);
-            }
-            setItemName = palloc0(setItemNameLen + 1);
-            memcpy(setItemName, (value + setItemStartIndex), setItemNameLen);
-
-            for (int j = (i + 1); j <= valueLen; j++)
-            {
-                if ((value[j] == ',') || (value[j] == '\0'))
-                {
-                    int itemIndexInVarValue;
-                    int nextItemIndexInVarValue;
-                    int varValueLen;
-
-                    setItemLen = j - setItemStartIndex;
-                    itemIndexInVarValue = 0;
-                    nextItemIndexInVarValue = 0;
-                    varValueLen = strlen(varValue);
-                    for (int k = 0; k < varValueLen; k++)
-                    {
-                        if (strncasecmp((varValue + k), setItemName, setItemNameLen) == 0)
-                        {
-                            itemIndexInVarValue = k;
-                            for (int l = itemIndexInVarValue; l <= varValueLen; l++)
-                            {
-                                if ((varValue[l] == ',') || (varValue[l] == '\0'))
-                                {
-                                    nextItemIndexInVarValue = l;
-                                    break;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    if ((itemIndexInVarValue == 0) && 
-                        (nextItemIndexInVarValue == 0))
-                    {
-                        elog(ERROR, "Invalid value '%s' for 'optimizer_switch'", value);
-                    }
-
-                    memcpy(newVarValue, varValue, itemIndexInVarValue);
-                    memcpy((newVarValue + itemIndexInVarValue), 
-                           (value + setItemStartIndex), setItemLen);
-                    memcpy((newVarValue + itemIndexInVarValue + setItemLen), 
-                           (varValue + nextItemIndexInVarValue), 
-                           (varValueLen - nextItemIndexInVarValue + 1));
-                    snprintf(varValue, SYSTEM_VAR_VALUE_MAX_LEN, "%s", newVarValue);
-
-                    i = j;
-                    setItemStartIndex = i + 1;
-
-                    break;
-                }
-            }
-        }
-    }
-}
-
-
-static void 
-setSystemVarValue(const char* value, char *varValue)
-{
-    if (value != NULL)
-    {
-        snprintf(varValue, SYSTEM_VAR_VALUE_MAX_LEN, "%s", value);
-    }
-    else 
-    {
-        varValue[0] = '\0';
-    }
-}
-
-
-static void 
-rectifySystemVarValue(const char *varName, char **varValue, 
-                      bool isSessionSystemVar)
-{
-    if (*varValue != NULL)
-    {
-        if (strncmp(*varValue, "halo_mysql_system_var_default", 29) == 0)
-        {
-            getDefaultValue(varName, isSessionSystemVar, varValue);
-            return;
-        }
-        else 
-        {
-            if (strncasecmp(varName, "query_cache_size", 16) == 0)
-            {
-                char buf[64];
-                int val = atoi(*varValue);
-                if (val < 0)
-                {
-                    elog(ERROR, 
-                         "Invalid value '%d' for query_cache_size", 
-                         val);
-                }
-
-                val = (val / 1048576) * 1048576;
-                snprintf(buf, 64, "%d", val);
-                *varValue = pstrdup(buf);
-                return;
-            }
-            else 
-            {
-                int varValueLen;
-                SystemVar *systemVar;
-                bool found;
-
-                varValueLen = strlen(*varValue);
-                systemVar = (SystemVar *)hash_search(sessionSystemVars, 
-                                                     varName, 
-                                                     HASH_FIND, 
-                                                     &found);
-                if (!found)
-                {
-                    elog(ERROR, "Unknown system variable '%s'", varName);
-                }
-
-                if (0 < systemVar->resultNum)
-                {
-                    /* aux_mysql: TRUE / FALSE for ON / OFF variables, as in MySQL */
-                    if (pg_strcasecmp(*varValue, "true") == 0 ||
-                        pg_strcasecmp(*varValue, "false") == 0)
-                    {
-                        *varValue = pstrdup(pg_strcasecmp(*varValue, "true") == 0 ? "1" : "0");
-                        varValueLen = 1;
-                    }
-
-                    for (int i = 0; i < systemVar->resultNum; i++)
-                    {
-                        int resultItemLen = strlen(systemVar->result[i]);
-                        if ((varValueLen == resultItemLen) && 
-                            (strncasecmp(*varValue,
-                                         systemVar->result[i], 
-                                         varValueLen) == 0))
-                        {
-                            /* do nothing; */
-                            return;
-                        }
-                        else 
-                        {
-                            int showResultItemLen = strlen(systemVar->showResult[i]);
-                            if ((varValueLen == showResultItemLen) && 
-                                (strncasecmp(*varValue,
-                                             systemVar->showResult[i], 
-                                             varValueLen) == 0))
-                            {
-                                *varValue = pstrdup(systemVar->result[i]);
-                                return;
-                            }
-                        }
-                    }
-
-                    elog(ERROR, 
-                         "Variable '%s' can't be set to the value of '%s'",
-                         varName,
-                         *varValue);
-                }
-                return;
-            }
-        }
-    }
-}
-
+/* ----------------------------------------------------------------
+ *	Formatting, validation, and side-effect helpers
+ * ----------------------------------------------------------------
+ */
 
 static void
-getDefaultValue(const char *varName, bool isSessionSystemVar, 
-                char **varValue)
+lowerSystemVarName(char *varName)
 {
-    bool sessionDefValueFromGlobal;
-
-    if (strncasecmp(varName, "last_insert_id", 14) == 0)
-    {
-        elog(ERROR, 
-             "Variable '%s' doesn't have a default value",
-             varName);
-    }
-
-    if (isSessionSystemVar)
-    {
-        SystemVar *systemVar;
-        bool found;
-
-        systemVar = (SystemVar *)hash_search(sessionSystemVars, 
-                                             varName,
-                                             HASH_FIND, 
-                                             &found);
-        if (found)
-        {
-            sessionDefValueFromGlobal = systemVar->sessionDefValueFromGlobal;
-        }
-        else
-        {
-            elog(ERROR, 
-                 "Can not find system variable \"%s\" from global.", 
-                 varName);
-        }
-    }
-
-    if (isSessionSystemVar && sessionDefValueFromGlobal)
-    {
-        SystemVar *systemVar;
-        bool found;
-
-        lockGlobalSystemVars();
-        systemVar = (SystemVar *)hash_search(globalSystemVars, 
-                                             varName,
-                                             HASH_FIND, 
-                                             &found);
-        if (found)
-        {
-            *varValue = pstrdup(systemVar->varConfValue);
-            unlockGlobalSystemVars();
-        }
-        else
-        {
-            unlockGlobalSystemVars();
-            elog(ERROR, 
-                 "Can not find system variable \"%s\" from global.", 
-                 varName);
-        }
-    }
-    else
-    {
-        int varNameLen = strlen(varName);
-        for (int i = 0; i < baseSystemVarsNum; i++)
-        {
-            SystemVar *systemVar = baseSystemVars[i];
-            int baseVarNameLen = strlen(systemVar->varName);
-            if ((varNameLen == baseVarNameLen) && 
-                (strncasecmp(varName, systemVar->varName, varNameLen) == 0))
-            {
-                *varValue = pstrdup(systemVar->varDefValue);
-                return;
-            }
-        }
-
-        elog(ERROR, 
-             "Can not find system variable \"%s\" from base.", 
-             varName);
-    }
+	if (varName == NULL)
+		return;
+	for (size_t i = 0; varName[i] != '\0'; i++)
+		varName[i] = pg_ascii_tolower((unsigned char) varName[i]);
 }
 
+static bool
+assignSystemVar(const char *varDefValue,
+				const char *varConfValue,
+				int sessionGlobalType,
+				bool sessionDefValueFromGlobal,
+				bool isReadWrite,
+				const char *result,
+				const char *selectResult,
+				const char *showResult,
+				SystemVar *systemVar)
+{
+	setSystemVarValue(varDefValue, systemVar->varDefValue);
+	setSystemVarValue(varConfValue, systemVar->varConfValue);
+	systemVar->sessionGlobalType = sessionGlobalType;
+	systemVar->sessionDefValueFromGlobal = sessionDefValueFromGlobal;
+	systemVar->isReadWrite = isReadWrite;
 
-static void 
+	if (result != NULL)
+	{
+		if (!assignSystemVarResult(result, &systemVar->resultNum, systemVar->result))
+			return false;
+	}
+	else
+		systemVar->resultNum = 0;
+
+	if (selectResult != NULL)
+	{
+		if (!assignSystemVarResult(selectResult, &systemVar->selectResultNum,
+								   systemVar->selectResult))
+			return false;
+	}
+	else
+		systemVar->selectResultNum = 0;
+
+	if (showResult != NULL)
+	{
+		if (!assignSystemVarResult(showResult, &systemVar->showResultNum,
+								   systemVar->showResult))
+			return false;
+	}
+	else
+		systemVar->showResultNum = 0;
+
+	if (systemVar->resultNum == 0 &&
+		(systemVar->selectResultNum > 0 || systemVar->showResultNum > 0))
+		return false;
+
+	if (systemVar->resultNum > 0 &&
+		((systemVar->selectResultNum != systemVar->resultNum &&
+		  systemVar->showResultNum != systemVar->resultNum) ||
+		 (systemVar->selectResultNum > 0 &&
+		  systemVar->showResultNum > 0 &&
+		  systemVar->selectResultNum != systemVar->showResultNum)))
+		return false;
+
+	return true;
+}
+
+static bool
+assignSystemVarResult(const char *srcResult,
+					  int *resultNum,
+					  char result[SYSTEM_VAR_RESULT_RULE_NUM][SYSTEM_VAR_RESULT_RULE_LEN])
+{
+	int			count = 0;
+	const char *p = srcResult;
+
+	*resultNum = 0;
+	if (srcResult == NULL || srcResult[0] == '\0')
+		return true;
+
+	while (*p != '\0')
+	{
+		const char *sep;
+		size_t		tokLen;
+
+		while (*p == '|')
+			p++;
+		if (*p == '\0')
+			break;
+
+		sep = strchr(p, '|');
+		tokLen = sep ? (size_t) (sep - p) : strlen(p);
+
+		if (count >= SYSTEM_VAR_RESULT_RULE_NUM ||
+			tokLen >= SYSTEM_VAR_RESULT_RULE_LEN)
+			return false;
+
+		memcpy(result[count], p, tokLen);
+		result[count][tokLen] = '\0';
+		count++;
+
+		if (!sep)
+			break;
+		p = sep + 1;
+	}
+
+	*resultNum = count;
+	return true;
+}
+
+static void
+copySystemVar(const SystemVar *srcSystemVar, SystemVar *destSystemVar)
+{
+	char		savedKey[SYSTEM_VAR_NAME_MAX_LEN];
+
+	strlcpy(savedKey, destSystemVar->varName, sizeof(savedKey));
+	*destSystemVar = *srcSystemVar;
+	strlcpy(destSystemVar->varName, savedKey, sizeof(destSystemVar->varName));
+}
+
+static void
+setSystemVarValueByVarName(const char *varName,
+						   const char *value,
+						   char *varValue)
+{
+	if (strcmp(varName, "optimizer_switch") == 0)
+		setSystemVarValueForOptimizerSwitch(value, varValue);
+	else
+		setSystemVarValue(value, varValue);
+}
+
+static void
+setSystemVarValueForOptimizerSwitch(const char *value, char *varValue)
+{
+	StringInfoData curBuf;
+	const char *p;
+
+	if (value == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Variable 'optimizer_switch' can't be set to the value of 'NULL'")));
+
+	if (pg_strcasecmp(value, "default") == 0)
+		return;
+
+	initStringInfo(&curBuf);
+	appendStringInfoString(&curBuf, varValue);
+
+	p = value;
+	while (*p != '\0')
+	{
+		const char *eq = strchr(p, '=');
+		const char *comma;
+		size_t		nameLen;
+		size_t		valLen;
+		const char *valStart;
+		char		canonVal[16];
+		bool		matched = false;
+		size_t		k = 0;
+
+		if (eq == NULL || eq == p)
+		{
+			pfree(curBuf.data);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Variable 'optimizer_switch' can't be set to the value of '%s'", value)));
+		}
+
+		nameLen = (size_t) (eq - p);
+		valStart = eq + 1;
+		comma = strchr(valStart, ',');
+		valLen = comma ? (size_t) (comma - valStart) : strlen(valStart);
+
+		if (valLen == 2 && pg_strncasecmp(valStart, "on", 2) == 0)
+			strlcpy(canonVal, "on", sizeof(canonVal));
+		else if (valLen == 3 && pg_strncasecmp(valStart, "off", 3) == 0)
+			strlcpy(canonVal, "off", sizeof(canonVal));
+		else if (valLen == 7 && pg_strncasecmp(valStart, "default", 7) == 0)
+			strlcpy(canonVal, "on", sizeof(canonVal));
+		else
+		{
+			pfree(curBuf.data);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Variable 'optimizer_switch' can't be set to the value of '%s'", value)));
+		}
+
+		while (k < (size_t) curBuf.len)
+		{
+			const char *entryEnd = strchr(curBuf.data + k, ',');
+			size_t		entryLen = entryEnd ? (size_t) (entryEnd - (curBuf.data + k)) : (size_t) curBuf.len - k;
+
+			if (entryLen > nameLen &&
+				curBuf.data[k + nameLen] == '=' &&
+				pg_strncasecmp(curBuf.data + k, p, nameLen) == 0)
+			{
+				StringInfoData nextBuf;
+
+				initStringInfo(&nextBuf);
+				appendBinaryStringInfo(&nextBuf, curBuf.data, (int) k);
+				appendBinaryStringInfo(&nextBuf, curBuf.data + k, (int) nameLen);
+				appendStringInfo(&nextBuf, "=%s", canonVal);
+				if (entryEnd != NULL)
+					appendStringInfoString(&nextBuf, entryEnd);
+
+				pfree(curBuf.data);
+				curBuf = nextBuf;
+				matched = true;
+				break;
+			}
+
+			if (entryEnd == NULL)
+				break;
+			k = (size_t) (entryEnd - curBuf.data) + 1;
+		}
+
+		if (!matched)
+		{
+			pfree(curBuf.data);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Variable 'optimizer_switch' can't be set to the value of '%s'", value)));
+		}
+
+		if (comma == NULL)
+			break;
+		p = comma + 1;
+		if (*p == '\0')
+		{
+			pfree(curBuf.data);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Variable 'optimizer_switch' can't be set to the value of '%s'", value)));
+		}
+	}
+
+	if (curBuf.len >= SYSTEM_VAR_VALUE_MAX_LEN)
+	{
+		pfree(curBuf.data);
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("optimizer_switch value exceeds maximum length")));
+	}
+
+	strlcpy(varValue, curBuf.data, SYSTEM_VAR_VALUE_MAX_LEN);
+	pfree(curBuf.data);
+}
+
+static void
+setSystemVarValue(const char *value, char *varValue)
+{
+	if (value != NULL)
+		strlcpy(varValue, value, SYSTEM_VAR_VALUE_MAX_LEN);
+	else
+		varValue[0] = '\0';
+}
+
+static void
+rectifySystemVarValue(const char *varName, char **varValue,
+					  bool isSessionSystemVar)
+{
+	SystemVar  *systemVar;
+	bool		found;
+	int			varValueLen;
+
+	if (*varValue == NULL)
+		return;
+
+	if (strcmp(*varValue, "halo_mysql_system_var_default") == 0)
+	{
+		getDefaultValue(varName, isSessionSystemVar, varValue);
+		return;
+	}
+
+	if (strcmp(varName, "query_cache_size") == 0)
+	{
+		ErrorSaveContext escontext = {T_ErrorSaveContext};
+		int64		val = pg_strtoint64_safe(*varValue, (Node *) &escontext);
+
+		if (escontext.error_occurred || val < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Incorrect argument type to variable 'query_cache_size'")));
+
+		val = (val / 1048576) * 1048576;
+		*varValue = psprintf(INT64_FORMAT, val);
+		return;
+	}
+
+	varValueLen = (int) strlen(*varValue);
+	systemVar = (SystemVar *) hash_search(sessionSystemVars,
+										  varName,
+										  HASH_FIND,
+										  &found);
+	if (!found && (systemVar = dynAddSystemVar(varName)) == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("Unknown system variable '%s'", varName)));
+
+	if (systemVar->resultNum > 0)
+	{
+		if (pg_strcasecmp(*varValue, "true") == 0 ||
+			pg_strcasecmp(*varValue, "false") == 0)
+		{
+			*varValue = pstrdup(pg_strcasecmp(*varValue, "true") == 0 ? "1" : "0");
+			varValueLen = 1;
+		}
+
+		for (int i = 0; i < systemVar->resultNum; i++)
+		{
+			int			resultItemLen = (int) strlen(systemVar->result[i]);
+
+			if (varValueLen == resultItemLen &&
+				pg_strncasecmp(*varValue, systemVar->result[i], varValueLen) == 0)
+				return;
+
+			if (i < systemVar->showResultNum)
+			{
+				int			showResultItemLen = (int) strlen(systemVar->showResult[i]);
+
+				if (varValueLen == showResultItemLen &&
+					pg_strncasecmp(*varValue, systemVar->showResult[i], varValueLen) == 0)
+				{
+					*varValue = pstrdup(systemVar->result[i]);
+					return;
+				}
+			}
+		}
+
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Variable '%s' can't be set to the value of '%s'",
+						varName, *varValue)));
+	}
+}
+
+static void
+getDefaultValue(const char *varName, bool isSessionSystemVar,
+				char **varValue)
+{
+	bool		sessionDefValueFromGlobal = false;
+
+	if (strcmp(varName, "last_insert_id") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Variable '%s' doesn't have a default value", varName)));
+
+	if (isSessionSystemVar)
+	{
+		SystemVar  *systemVar;
+		bool		found;
+
+		systemVar = (SystemVar *) hash_search(sessionSystemVars,
+											  varName,
+											  HASH_FIND,
+											  &found);
+		if (!found)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("Unknown system variable '%s'", varName)));
+		sessionDefValueFromGlobal = systemVar->sessionDefValueFromGlobal;
+	}
+
+	if (isSessionSystemVar && sessionDefValueFromGlobal)
+	{
+		SystemVar	globalCopy;
+
+		if (lookup_global_system_var(varName, &globalCopy))
+		{
+			*varValue = pstrdup(globalCopy.varConfValue);
+			return;
+		}
+	}
+
+	for (int i = 0; i < baseSystemVarsNum; i++)
+	{
+		if (strcmp(varName, baseSystemVars[i]->varName) == 0)
+		{
+			*varValue = pstrdup(baseSystemVars[i]->varDefValue);
+			return;
+		}
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_OBJECT),
+			 errmsg("Unknown system variable '%s'", varName)));
+}
+
+/*
+ * Convert a MySQL time_zone string ('SYSTEM', '+05:30', '-00:30', 'UTC',
+ * 'Asia/Shanghai', ...) into a PostgreSQL TimeZone GUC string without
+ * truncating half-hour offsets or flipping sign on '-00:30'.
+ */
+static char *
+resolveMysqlTimeZoneForPG(const char *tzVal)
+{
+	if (tzVal == NULL || tzVal[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Unknown or incorrect time zone: '%s'", tzVal ? tzVal : "")));
+
+	if (pg_strcasecmp(tzVal, "SYSTEM") == 0)
+	{
+		const char *logTz = GetConfigOption("log_timezone", true, false);
+		time_t		now;
+		struct tm	ltm;
+		long		gmtoff;
+		char		sign;
+
+		if (logTz != NULL && logTz[0] != '\0' && pg_tzset(logTz) != NULL)
+			return pstrdup(logTz);
+
+		now = time(NULL);
+		localtime_r(&now, &ltm);
+		gmtoff = ltm.tm_gmtoff;
+		sign = (gmtoff >= 0) ? '+' : '-';
+		if (gmtoff < 0)
+			gmtoff = -gmtoff;
+		return psprintf("INTERVAL '%c%02ld:%02ld'",
+						sign, gmtoff / 3600, (gmtoff % 3600) / 60);
+	}
+
+	if (tzVal[0] == '+' || tzVal[0] == '-')
+	{
+		char		sign = tzVal[0];
+		const char *p = tzVal + 1;
+		int			hh = 0;
+		int			mm = 0;
+		int			hdigits = 0;
+		int			total_mins;
+
+		while (isdigit((unsigned char) *p) && hdigits < 3)
+		{
+			hh = hh * 10 + (*p - '0');
+			p++;
+			hdigits++;
+		}
+		if (hdigits < 1 || hdigits > 2 || *p != ':')
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Unknown or incorrect time zone: '%s'", tzVal)));
+		p++;
+		if (!isdigit((unsigned char) p[0]) || !isdigit((unsigned char) p[1]) || p[2] != '\0')
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Unknown or incorrect time zone: '%s'", tzVal)));
+		mm = (p[0] - '0') * 10 + (p[1] - '0');
+		if (mm > 59)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Unknown or incorrect time zone: '%s'", tzVal)));
+
+		total_mins = hh * 60 + mm;
+		if ((sign == '+' && total_mins > 14 * 60) ||
+			(sign == '-' && total_mins > 13 * 60 + 59))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Unknown or incorrect time zone: '%s'", tzVal)));
+
+		return psprintf("INTERVAL '%c%02d:%02d'", sign, hh, mm);
+	}
+
+	if (pg_tzset(tzVal) == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Unknown or incorrect time zone: '%s'", tzVal)));
+
+	return pstrdup(tzVal);
+}
+
+static void
 applySystemVarValue(const char *varName, const char *varValue)
 {
-    if (strncasecmp(varName, "autocommit", 10) == 0)
-    {
-        if ((strncasecmp(varValue, "1", 1) == 0) || 
-            (strncasecmp(varValue, "on", 2) == 0))
-        {
-            if (autoCommit == 0)
-            {
-                /* 0 --> 1 */
-                needCommitTrx = true;
-                needStartNewTrx = false;
-            }
-            else 
-            {
-                /* 1 --> 1 */
-                needCommitTrx = false;
-                needStartNewTrx = false;
-            }
+	if (varValue == NULL)
+		return;
 
-            autoCommit = 2;
-        }
-        else 
-        {
-            if (autoCommit == 0)
-            {
-                /* 0 --> 0 */
-                needCommitTrx = false;
-                needStartNewTrx = false;
-            }
-            else 
-            {
-                /* 1 --> 0 */
-                needCommitTrx = false;
-                needStartNewTrx = true;
-            }
-
-            autoCommit = 0;
-        }
-    }
-	else if (pg_strcasecmp(varName, "foreign_key_checks") == 0)
+	if (strcmp(varName, "autocommit") == 0)
+	{
+		if (pg_strcasecmp(varValue, "1") == 0 ||
+			pg_strcasecmp(varValue, "on") == 0)
+		{
+			if (autoCommit == 0)
+			{
+				needCommitTrx = true;
+				needStartNewTrx = false;
+			}
+			else
+			{
+				needCommitTrx = false;
+				needStartNewTrx = false;
+			}
+			autoCommit = 2;
+		}
+		else
+		{
+			if (autoCommit == 0)
+			{
+				needCommitTrx = false;
+				needStartNewTrx = false;
+			}
+			else
+			{
+				needCommitTrx = false;
+				needStartNewTrx = true;
+			}
+			autoCommit = 0;
+		}
+	}
+	else if (strcmp(varName, "foreign_key_checks") == 0)
 		mys_sync_foreign_key_checks();
 	else if (is_isolation_var(varName) || is_tx_read_only_var(varName))
 		sync_transaction_defaults();
-    else if (strncasecmp(varName, "time_zone", 9) == 0)
-    {
-        VariableSetStmt *variableSetStmt;
-        char *newVarValue;
+	else if (strcmp(varName, "time_zone") == 0)
+	{
+		char	   *pgTz = resolveMysqlTimeZoneForPG(varValue);
 
-        if (strncasecmp(varValue, "system", 6) == 0)
-        {
-            newVarValue = getOSTimeZone();
-        }
-        else 
-        {
-            int newVarValueLen;
+		(void) set_config_option("timezone", pgTz, PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SET, true, ERROR, false);
+		pfree(pgTz);
+	}
+	else if (strcmp(varName, "sql_mode") == 0)
+	{
+		char	   *rawValue = pstrdup(varValue);
+		List	   *valueList = NIL;
+		uint64		tempSqlMode = 0;
 
-            newVarValue = pstrdup(varValue);
-            newVarValueLen = strlen(newVarValue);
-            for (int i = 0; i < newVarValueLen; i++)
-            {
-                if (newVarValue[i] == ':')
-                {
-                    newVarValue[i] = '\0';
-                    break;
-                }
-            }
-        }
-        variableSetStmt = makeNode(VariableSetStmt);
-        variableSetStmt->kind = VAR_SET_VALUE;
-        variableSetStmt->name = "timezone";
-        variableSetStmt->args = list_make1(makeStringConst(newVarValue, -1));
-        ExecSetVariableStmt(variableSetStmt, true);
-    }
-    else if (strncasecmp(varName, "sql_mode", 8) == 0)
-    {
-        char *rawValue;
-        List *valueList;
-        uint64 tempSqlMode = 0;
+		static const struct
+		{
+			const char *name;
+			uint64		bits;
+		}			modes[] = {
+			{"REAL_AS_FLOAT", MYS_MODE_REAL_AS_FLOAT},
+			{"PIPES_AS_CONCAT", MYS_MODE_PIPES_AS_CONCAT},
+			{"ANSI_QUOTES", MYS_MODE_ANSI_QUOTES},
+			{"IGNORE_SPACE", MYS_MODE_IGNORE_SPACE},
+			{"ONLY_FULL_GROUP_BY", MYS_MODE_ONLY_FULL_GROUP_BY},
+			{"NO_UNSIGNED_SUBTRACTION", MYS_MODE_NO_UNSIGNED_SUBTRACTION},
+			{"NO_DIR_IN_CREATE", MYS_MODE_NO_DIR_IN_CREATE},
+			{"POSTGRESQL", MYS_MODE_POSTGRESQL},
+			{"ORACLE", MYS_MODE_ORACLE},
+			{"MSSQL", MYS_MODE_MSSQL},
+			{"DB2", MYS_MODE_DB2},
+			{"MAXDB", MYS_MODE_MAXDB},
+			{"NO_KEY_OPTIONS", MYS_MODE_NO_KEY_OPTIONS},
+			{"NO_TABLE_OPTIONS", MYS_MODE_NO_TABLE_OPTIONS},
+			{"NO_FIELD_OPTIONS", MYS_MODE_NO_FIELD_OPTIONS},
+			{"MYSQL323", MYS_MODE_MYSQL323},
+			{"MYSQL40", MYS_MODE_MYSQL40},
+			{"ANSI", MYS_MODE_ANSI | MYS_MODE_REAL_AS_FLOAT | MYS_MODE_PIPES_AS_CONCAT |
+				MYS_MODE_ANSI_QUOTES | MYS_MODE_IGNORE_SPACE | MYS_MODE_ONLY_FULL_GROUP_BY},
+			{"NO_AUTO_VALUE_ON_ZERO", MYS_MODE_NO_AUTO_VALUE_ON_ZERO},
+			{"NO_BACKSLASH_ESCAPES", MYS_MODE_NO_BACKSLASH_ESCAPES},
+			{"STRICT_TRANS_TABLES", MYS_MODE_STRICT_TRANS_TABLES},
+			{"STRICT_ALL_TABLES", MYS_MODE_STRICT_ALL_TABLES},
+			{"NO_ZERO_IN_DATE", MYS_MODE_NO_ZERO_IN_DATE},
+			{"NO_ZERO_DATE", MYS_MODE_NO_ZERO_DATE},
+			{"ALLOW_INVALID_DATES", MYS_MODE_INVALID_DATES},
+			{"ERROR_FOR_DIVISION_BY_ZERO", MYS_MODE_ERROR_FOR_DIVISION_BY_ZERO},
+			{"TRADITIONAL", MYS_MODE_TRADITIONAL | MYS_MODE_STRICT_TRANS_TABLES |
+				MYS_MODE_STRICT_ALL_TABLES | MYS_MODE_NO_ZERO_IN_DATE |
+				MYS_MODE_NO_ZERO_DATE | MYS_MODE_ERROR_FOR_DIVISION_BY_ZERO |
+				MYS_MODE_NO_ENGINE_SUBSTITUTION},
+			{"NO_AUTO_CREATE_USER", MYS_MODE_NO_AUTO_CREATE_USER},
+			{"HIGH_NOT_PRECEDENCE", MYS_MODE_HIGH_NOT_PRECEDENCE},
+			{"NO_ENGINE_SUBSTITUTION", MYS_MODE_NO_ENGINE_SUBSTITUTION},
+			{"PAD_CHAR_TO_FULL_LENGTH", MYS_MODE_PAD_CHAR_TO_FULL_LENGTH},
+			{"TIME_TRUNCATE_FRACTIONAL", 0},
+			{NULL, 0}
+		};
 
-        isStrictTransTablesOn = false;
+		if (!SplitIdentifierString(rawValue, ',', &valueList))
+		{
+			pfree(rawValue);
+			list_free(valueList);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Variable 'sql_mode' can't be set to the value of '%s'", varValue)));
+		}
 
-        /* Need a modifiable copy of string */
-        rawValue = pstrdup(varValue);
-        if (SplitIdentifierString(rawValue, ',', &valueList))
-        {
-            ListCell *lc;
+		foreach_ptr(char, curValue, valueList)
+		{
+			bool		known = false;
 
-            /*
-             * aux_mysql: keep every mode bit (openHalo kept only the date
-             * modes), so that strict mode and ERROR_FOR_DIVISION_BY_ZERO can
-             * be honored by the extension.
-             */
-            static const struct
-            {
-                const char *name;
-                uint64      bits;
-            } modes[] = {
-                {"REAL_AS_FLOAT", MYS_MODE_REAL_AS_FLOAT},
-                {"PIPES_AS_CONCAT", MYS_MODE_PIPES_AS_CONCAT},
-                {"ANSI_QUOTES", MYS_MODE_ANSI_QUOTES},
-                {"IGNORE_SPACE", MYS_MODE_IGNORE_SPACE},
-                {"ONLY_FULL_GROUP_BY", MYS_MODE_ONLY_FULL_GROUP_BY},
-                {"NO_UNSIGNED_SUBTRACTION", MYS_MODE_NO_UNSIGNED_SUBTRACTION},
-                {"NO_DIR_IN_CREATE", MYS_MODE_NO_DIR_IN_CREATE},
-                {"ANSI", MYS_MODE_ANSI | MYS_MODE_REAL_AS_FLOAT | MYS_MODE_PIPES_AS_CONCAT |
-                         MYS_MODE_ANSI_QUOTES | MYS_MODE_IGNORE_SPACE | MYS_MODE_ONLY_FULL_GROUP_BY},
-                {"NO_AUTO_VALUE_ON_ZERO", MYS_MODE_NO_AUTO_VALUE_ON_ZERO},
-                {"NO_BACKSLASH_ESCAPES", MYS_MODE_NO_BACKSLASH_ESCAPES},
-                {"STRICT_TRANS_TABLES", MYS_MODE_STRICT_TRANS_TABLES},
-                {"STRICT_ALL_TABLES", MYS_MODE_STRICT_ALL_TABLES},
-                {"NO_ZERO_IN_DATE", MYS_MODE_NO_ZERO_IN_DATE},
-                {"NO_ZERO_DATE", MYS_MODE_NO_ZERO_DATE},
-                {"ALLOW_INVALID_DATES", MYS_MODE_INVALID_DATES},
-                {"ERROR_FOR_DIVISION_BY_ZERO", MYS_MODE_ERROR_FOR_DIVISION_BY_ZERO},
-                {"TRADITIONAL", MYS_MODE_TRADITIONAL | MYS_MODE_STRICT_TRANS_TABLES |
-                                MYS_MODE_STRICT_ALL_TABLES | MYS_MODE_NO_ZERO_IN_DATE |
-                                MYS_MODE_NO_ZERO_DATE | MYS_MODE_ERROR_FOR_DIVISION_BY_ZERO},
-                {"NO_AUTO_CREATE_USER", MYS_MODE_NO_AUTO_CREATE_USER},
-                {"HIGH_NOT_PRECEDENCE", MYS_MODE_HIGH_NOT_PRECEDENCE},
-                {"PAD_CHAR_TO_FULL_LENGTH", MYS_MODE_PAD_CHAR_TO_FULL_LENGTH},
-                {NULL, 0}
-            };
+			if (strcmp(curValue, "0") == 0)
+				continue;
 
-            foreach(lc, valueList)
-            {
-                char *curValue = (char *)lfirst(lc);
+			for (int m = 0; modes[m].name; m++)
+			{
+				if (pg_strcasecmp(curValue, modes[m].name) == 0)
+				{
+					tempSqlMode |= modes[m].bits;
+					known = true;
+					break;
+				}
+			}
+			if (!known)
+			{
+				pfree(rawValue);
+				list_free(valueList);
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("Variable 'sql_mode' can't be set to the value of '%s'", varValue)));
+			}
+		}
 
-                for (int m = 0; modes[m].name; m++)
-                {
-                    if (pg_strcasecmp(curValue, modes[m].name) == 0)
-                        tempSqlMode |= modes[m].bits;
-                }
-            }
-            isStrictTransTablesOn = (tempSqlMode & (MYS_MODE_STRICT_TRANS_TABLES |
-                                                    MYS_MODE_STRICT_ALL_TABLES)) != 0;
-
-            mys_sqlMode = tempSqlMode;
-        }
-        else
-        {
-            pfree(rawValue);
-		    list_free(valueList);
-            elog(ERROR, "List syntax is invalid.");
-        }
-
-        pfree(rawValue);
+		pfree(rawValue);
 		list_free(valueList);
-    }
-    else if (strncasecmp(varName, "default_week_format", 19) == 0)
-    {
-        char *endPtr;
-        int value;
 
-        errno = 0;
-        value = strtol(varValue, &endPtr, 10);
-        if (errno == ERANGE)
-        {
-            elog(ERROR, "incorrect default_week_format value: %s", varValue);
-        }
+		isStrictTransTablesOn = (tempSqlMode & (MYS_MODE_STRICT_TRANS_TABLES |
+												MYS_MODE_STRICT_ALL_TABLES)) != 0;
+		mys_sqlMode = tempSqlMode;
+	}
+	else if (strcmp(varName, "default_week_format") == 0)
+	{
+		char	   *endPtr;
+		long		value;
 
-        if (*endPtr != '\0')
-        {
-            elog(ERROR, "incorrect default_week_format value: %s", varValue);
-        }
+		errno = 0;
+		value = strtol(varValue, &endPtr, 10);
+		if (errno == ERANGE || endPtr == varValue || *endPtr != '\0' ||
+			value < 0 || value > 7)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("incorrect default_week_format value: %s", varValue)));
 
-        if (value > 7 || value < 0)
-        {
-            elog(ERROR, "incorrect default_week_format value: %s", varValue);
-        }
-        else
-        {
-            default_week_format = value;
-        }
-    }
-    else 
-    {
-        /* do nothing; */
-    }
+		default_week_format = (int) value;
+	}
 }
 
+/* ----------------------------------------------------------------
+ *	SELECT / SHOW variable lookup
+ * ----------------------------------------------------------------
+ */
 
 static int
-getSystemVariableValueImpl(char *varName, 
-                           bool isSessionSystemVar, 
-                           int selectShowType, 
-                           char **varValue)
+getSystemVariableValueImpl(const char *rawVarName,
+						   bool isSessionSystemVar,
+						   int selectShowType,
+						   char **varValue)
 {
-    int ret;
-    SystemVar *systemVar;
-    bool found;
+	char		varName[SYSTEM_VAR_NAME_MAX_LEN];
 
-    if (sessionSystemVars == NULL)
-    {
-        initSystemVariables();
-    }
+	if (rawVarName == NULL || strlen(rawVarName) >= sizeof(varName))
+		return 1;
 
-    if (varName == NULL)
-    {
-        return 1;
-    }
+	if (sessionSystemVars == NULL)
+		initSystemVariables();
 
-    lowerSystemVarName(varName);
+	strlcpy(varName, rawVarName, sizeof(varName));
+	lowerSystemVarName(varName);
 
-    ret = 0;
-    if (isSessionSystemVar)
-    {
-        systemVar = (SystemVar *)hash_search(sessionSystemVars, 
-                                             varName, 
-                                             HASH_FIND, 
-                                             &found);
-        if (found || (NULL != (systemVar = dynAddSystemVar(varName))))
-        {
-            *varValue = getConfValue(systemVar, selectShowType);
-            ret = 0;
-        }
-        else
-        {
-            *varValue = NULL;
-            ret = 1;
-        }
-    }
-    else 
-    {
-        lockGlobalSystemVars();
-        systemVar = (SystemVar *)hash_search(globalSystemVars, 
-                                             varName, 
-                                             HASH_FIND, 
-                                             &found);
-        if (found || (NULL != (systemVar = dynAddSystemVar(varName))))
-        {
-            if ((systemVar->sessionGlobalType == 0) || 
-                (systemVar->sessionGlobalType == 1) || 
-                (systemVar->sessionGlobalType == 3))
-            {
-                *varValue = getConfValue(systemVar, selectShowType);
-                unlockGlobalSystemVars();
-                ret = 0;
-            }
-            else 
-            {
-                unlockGlobalSystemVars();
-                *varValue = NULL;
-                ret = 2;
-            }
-        }
-        else
-        {
-            unlockGlobalSystemVars();
-            *varValue = NULL;
-            ret = 1;
-        }
-    }
+	if (isSessionSystemVar)
+	{
+		SystemVar  *systemVar;
+		bool		found;
 
-    return ret;
+		systemVar = (SystemVar *) hash_search(sessionSystemVars,
+											  varName,
+											  HASH_FIND,
+											  &found);
+		if (found || (systemVar = dynAddSystemVar(varName)) != NULL)
+		{
+			*varValue = getConfValue(systemVar, selectShowType);
+			return 0;
+		}
+		*varValue = NULL;
+		return 1;
+	}
+	else
+	{
+		SystemVar	globalCopy;
+		bool		found;
+
+		found = lookup_global_system_var(varName, &globalCopy);
+		if (!found)
+		{
+			if (dynAddSystemVar(varName) != NULL)
+				found = lookup_global_system_var(varName, &globalCopy);
+		}
+		if (!found)
+		{
+			/* Fallback to baseSystemVars if shared memory was not preloaded */
+			for (int i = 0; i < baseSystemVarsNum; i++)
+			{
+				if (strcmp(varName, baseSystemVars[i]->varName) == 0)
+				{
+					globalCopy = *baseSystemVars[i];
+					found = true;
+					break;
+				}
+			}
+		}
+
+		if (found)
+		{
+			if (globalCopy.sessionGlobalType == 0 ||
+				globalCopy.sessionGlobalType == 1 ||
+				globalCopy.sessionGlobalType == 3)
+			{
+				*varValue = getConfValue(&globalCopy, selectShowType);
+				return 0;
+			}
+			*varValue = NULL;
+			return 2;
+		}
+
+		*varValue = NULL;
+		return 1;
+	}
 }
-
 
 static char *
-getConfValue(SystemVar *systemVar, int selectShowType)
+getConfValue(const SystemVar *systemVar, int selectShowType)
 {
-    char *ret;
+	int			varConfValueLen = (int) strlen(systemVar->varConfValue);
 
-    ret = NULL;
-    if (selectShowType == 1)
-    {
-        if (systemVar->selectResultNum == 0)
-        {
-            ret = pstrdup(systemVar->varConfValue);
-        }
-        else 
-        {
-            int varConfValueLen = strlen(systemVar->varConfValue);
-            for (int i = 0; i < systemVar->selectResultNum; i++)
-            {
-                int resultItemLen = strlen(systemVar->result[i]);
-                if ((varConfValueLen == resultItemLen) && 
-                    (strncasecmp(systemVar->varConfValue, 
-                                 systemVar->result[i], 
-                                 varConfValueLen) == 0))
-                {
-                    ret = pstrdup(systemVar->selectResult[i]);
-                    break;
-                }
-            }
-        }
-    }
-    else 
-    {
-        if (systemVar->showResultNum == 0)
-        {
-            ret = pstrdup(systemVar->varConfValue);
-        }
-        else 
-        {
-            int varConfValueLen = strlen(systemVar->varConfValue);
-            for (int i = 0; i < systemVar->showResultNum; i++)
-            {
-                int resultItemLen = strlen(systemVar->result[i]);
-                if ((varConfValueLen == resultItemLen) && 
-                    (strncasecmp(systemVar->varConfValue, 
-                                 systemVar->result[i], 
-                                 varConfValueLen) == 0))
-                {
-                    ret = pstrdup(systemVar->showResult[i]);
-                    break;
-                }
-            }
-        }
-    }
+	if (selectShowType == 1)
+	{
+		if (systemVar->selectResultNum == 0)
+			return pstrdup(systemVar->varConfValue);
 
-    return ret;
+		for (int i = 0; i < systemVar->selectResultNum; i++)
+		{
+			int			resultItemLen = (int) strlen(systemVar->result[i]);
+
+			if (varConfValueLen == resultItemLen &&
+				pg_strncasecmp(systemVar->varConfValue,
+							   systemVar->result[i],
+							   varConfValueLen) == 0)
+				return pstrdup(systemVar->selectResult[i]);
+		}
+	}
+	else
+	{
+		if (systemVar->showResultNum == 0)
+			return pstrdup(systemVar->varConfValue);
+
+		for (int i = 0; i < systemVar->showResultNum; i++)
+		{
+			int			resultItemLen = (int) strlen(systemVar->result[i]);
+
+			if (varConfValueLen == resultItemLen &&
+				pg_strncasecmp(systemVar->varConfValue,
+							   systemVar->result[i],
+							   varConfValueLen) == 0)
+				return pstrdup(systemVar->showResult[i]);
+		}
+	}
+
+	return pstrdup(systemVar->varConfValue);
 }
-
-
-static Node *
-makeStringConst(char *str, int location)
-{
-	A_Const *n = makeNode(A_Const);
-
-	n->val.sval.type = T_String;
-	n->val.sval.sval = str;
-	n->location = location;
-
-	return (Node *)n;
-}
-
-
-static char *
-getOSTimeZone(void)
-{
-    char *ret;
-    int timezone = 0;
-    time_t localTime;
-    time_t utcTime;
-    time_t tt;
-    struct tm *localTm;
-    struct tm *utcTm;
-
-    time(&tt);
-    localTm = localtime(&tt);
-    localTime = mktime(localTm);
-    utcTm = gmtime(&tt);
-    utcTime = mktime(utcTm);
-    timezone = (localTime - utcTime) / 3600;
-    ret = palloc0(64);
-    snprintf(ret, 64, "%d", timezone);
-
-    return ret;
-}
-

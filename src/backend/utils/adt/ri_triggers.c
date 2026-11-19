@@ -25,7 +25,6 @@
 
 #include "postgres.h"
 #include "postmaster/protocol_extension.h"
-#include "utils/resowner.h"
 
 #include "access/htup_details.h"
 #include "access/sysattr.h"
@@ -196,6 +195,8 @@ static dclist_head ri_constraint_cache_valid_list;
 static bool ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
 							  TupleTableSlot *oldslot,
 							  const RI_ConstraintInfo *riinfo);
+static bool ri_restrict_ext(TriggerData *trigdata, bool is_no_action,
+							bool before_modify, bool warn_only);
 static Datum ri_restrict(TriggerData *trigdata, bool is_no_action);
 static Datum ri_set(TriggerData *trigdata, bool is_set_null, int tgkind);
 static void quoteOneName(char *buffer, const char *name);
@@ -236,22 +237,44 @@ static bool ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 							TupleTableSlot *oldslot, TupleTableSlot *newslot,
 							bool is_restrict,
 							bool detectNewRows, int expect_OK);
+static bool ri_PerformCheckExt(const RI_ConstraintInfo *riinfo,
+							   RI_QueryKey *qkey, SPIPlanPtr qplan,
+							   Relation fk_rel, Relation pk_rel,
+							   TupleTableSlot *oldslot, TupleTableSlot *newslot,
+							   bool is_restrict,
+							   bool detectNewRows, int expect_OK,
+							   bool warn_only);
 static void ri_ExtractValues(Relation rel, TupleTableSlot *slot,
 							 const RI_ConstraintInfo *riinfo, bool rel_is_pk,
 							 Datum *vals, char *nulls);
+static void ri_ReportViolationExt(const RI_ConstraintInfo *riinfo,
+								  Relation pk_rel, Relation fk_rel,
+								  TupleTableSlot *violatorslot, TupleDesc tupdesc,
+								  int queryno, bool is_restrict, bool partgone,
+								  bool warn_only);
 pg_noreturn static void ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 										   Relation pk_rel, Relation fk_rel,
 										   TupleTableSlot *violatorslot, TupleDesc tupdesc,
 										   int queryno, bool is_restrict, bool partgone);
 
 
+static bool
+ri_trigger_enabled(Trigger *trigger)
+{
+	if (trigger->tgenabled == TRIGGER_DISABLED)
+		return false;
+	if (SessionReplicationRole == SESSION_REPLICATION_ROLE_REPLICA)
+		return trigger->tgenabled != TRIGGER_FIRES_ON_ORIGIN;
+	return trigger->tgenabled != TRIGGER_FIRES_ON_REPLICA;
+}
+
 /*
  * RI_FKey_check -
  *
  * Check foreign key existence (combined for INSERT and UPDATE).
  */
-static Datum
-RI_FKey_check(TriggerData *trigdata, bool before_insert)
+static bool
+RI_FKey_check(TriggerData *trigdata, bool before_modify, bool warn_only)
 {
 	const RI_ConstraintInfo *riinfo;
 	Relation	fk_rel;
@@ -276,9 +299,9 @@ RI_FKey_check(TriggerData *trigdata, bool before_insert)
 	 * and lock on the buffer to call HeapTupleSatisfiesVisibility.  Caller
 	 * should be holding pin, but not lock.
 	 */
-	if (!before_insert &&
+	if (!before_modify &&
 		!table_tuple_satisfies_snapshot(trigdata->tg_relation, newslot, SnapshotSelf))
-		return PointerGetDatum(NULL);
+		return true;
 
 	/*
 	 * Get the relation descriptors of the FK and PK tables.
@@ -298,7 +321,7 @@ RI_FKey_check(TriggerData *trigdata, bool before_insert)
 			 * foreign key constraint.
 			 */
 			table_close(pk_rel, RowShareLock);
-			return PointerGetDatum(NULL);
+			return true;
 
 		case RI_KEYS_SOME_NULL:
 
@@ -314,7 +337,7 @@ RI_FKey_check(TriggerData *trigdata, bool before_insert)
 					 * Not allowed - MATCH FULL says either all or none of the
 					 * attributes can be NULLs
 					 */
-					ereport(ERROR,
+					ereport(warn_only ? WARNING : ERROR,
 							(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
 							 errmsg("insert or update on table \"%s\" violates foreign key constraint \"%s\"",
 									RelationGetRelationName(fk_rel),
@@ -323,7 +346,7 @@ RI_FKey_check(TriggerData *trigdata, bool before_insert)
 							 errtableconstraint(fk_rel,
 												NameStr(riinfo->conname))));
 					table_close(pk_rel, RowShareLock);
-					return PointerGetDatum(NULL);
+					return false;
 
 				case FKCONSTR_MATCH_SIMPLE:
 
@@ -332,7 +355,7 @@ RI_FKey_check(TriggerData *trigdata, bool before_insert)
 					 * the constraint.
 					 */
 					table_close(pk_rel, RowShareLock);
-					return PointerGetDatum(NULL);
+					return true;
 
 #ifdef NOT_USED
 				case FKCONSTR_MATCH_PARTIAL:
@@ -356,8 +379,8 @@ RI_FKey_check(TriggerData *trigdata, bool before_insert)
 			break;
 	}
 
-	/* A self-reference may be satisfied by the row about to be inserted. */
-	if (before_insert && riinfo->pk_relid == riinfo->fk_relid && !riinfo->hasperiod)
+	/* A self-reference may be satisfied by the row about to be inserted/updated. */
+	if (before_modify && riinfo->pk_relid == riinfo->fk_relid && !riinfo->hasperiod)
 	{
 		bool self_match = true;
 
@@ -380,7 +403,7 @@ RI_FKey_check(TriggerData *trigdata, bool before_insert)
 		if (self_match)
 		{
 			table_close(pk_rel, RowShareLock);
-			return PointerGetDatum(NULL);
+			return true;
 		}
 	}
 
@@ -482,85 +505,144 @@ RI_FKey_check(TriggerData *trigdata, bool before_insert)
 	 * referenced side.  The reason is that our snapshot must be fresh in
 	 * order for the hack in find_inheritance_children() to work.
 	 */
-	ri_PerformCheck(riinfo, &qkey, qplan,
-					fk_rel, pk_rel,
-					NULL, newslot,
-					false,
-					pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE,
-					SPI_OK_SELECT);
+	{
+		bool		ok;
 
-	if (SPI_finish() != SPI_OK_FINISH)
-		elog(ERROR, "SPI_finish failed");
+		ok = ri_PerformCheckExt(riinfo, &qkey, qplan,
+								fk_rel, pk_rel,
+								NULL, newslot,
+								false,
+								pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE,
+								SPI_OK_SELECT, warn_only);
 
-	table_close(pk_rel, RowShareLock);
+		if (SPI_finish() != SPI_OK_FINISH)
+			elog(ERROR, "SPI_finish failed");
 
-	return PointerGetDatum(NULL);
+		table_close(pk_rel, RowShareLock);
+
+		return ok;
+	}
 }
 
 
-/* INSERT IGNORE preflight.  The successful checks retain key-share locks;
- * a failed check unwinds only its own SPI work, before a heap tuple is written.
- * Normal AFTER triggers remain enabled as a final integrity check. */
+/*
+ * Zero-subxid IGNORE preflight checks for INSERT, UPDATE, and DELETE.
+ * Successful checks retain top-level key-share locks without allocating
+ * SubTransactionIds; failed checks emit a WARNING and skip the row before
+ * modifying the heap.  Normal AFTER triggers remain enabled as final checks.
+ */
 bool
 RI_FKey_check_insert(Relation rel, TupleTableSlot *slot)
 {
-	MemoryContext oldcontext = CurrentMemoryContext;
-	ResourceOwner oldowner = CurrentResourceOwner;
-	volatile bool valid = true;
-
 	if (!rel->trigdesc || !rel->trigdesc->trig_insert_after_row ||
 		(MyProtocolExtension && MyProtocolExtension->foreign_key_checks &&
 		 !MyProtocolExtension->foreign_key_checks()))
 		return true;
 
-	BeginInternalSubTransaction(NULL);
-	MemoryContextSwitchTo(oldcontext);
-	PG_TRY();
-	{
-		if (MyProtocolExtension && MyProtocolExtension->foreign_key_insert)
-			MyProtocolExtension->foreign_key_insert(rel, slot);
-		for (int i = 0; i < rel->trigdesc->numtriggers; i++)
-		{
-			Trigger *trigger = &rel->trigdesc->triggers[i];
-			TriggerData td = {0};
+	if (MyProtocolExtension && MyProtocolExtension->foreign_key_insert &&
+		!MyProtocolExtension->foreign_key_insert(rel, NULL, slot, true))
+		return false;
 
-			if (trigger->tgfoid != F_RI_FKEY_CHECK_INS ||
-				trigger->tgenabled == TRIGGER_DISABLED ||
-				(SessionReplicationRole == SESSION_REPLICATION_ROLE_REPLICA ?
-				 trigger->tgenabled == TRIGGER_FIRES_ON_ORIGIN :
-				 trigger->tgenabled == TRIGGER_FIRES_ON_REPLICA))
+	for (int i = 0; i < rel->trigdesc->numtriggers; i++)
+	{
+		Trigger	   *trigger = &rel->trigdesc->triggers[i];
+		TriggerData td = {0};
+
+		if (trigger->tgfoid != F_RI_FKEY_CHECK_INS ||
+			!ri_trigger_enabled(trigger))
+			continue;
+		td.type = T_TriggerData;
+		td.tg_event = TRIGGER_EVENT_INSERT | TRIGGER_EVENT_ROW;
+		td.tg_relation = rel;
+		td.tg_trigger = trigger;
+		td.tg_trigslot = slot;
+		if (!RI_FKey_check(&td, true, true))
+			return false;
+	}
+	return true;
+}
+
+bool
+RI_FKey_check_update(Relation rel, TupleTableSlot *oldslot, TupleTableSlot *newslot)
+{
+	if (!rel->trigdesc || !rel->trigdesc->trig_update_after_row ||
+		(MyProtocolExtension && MyProtocolExtension->foreign_key_checks &&
+		 !MyProtocolExtension->foreign_key_checks()))
+		return true;
+
+	if (MyProtocolExtension && MyProtocolExtension->foreign_key_insert &&
+		!MyProtocolExtension->foreign_key_insert(rel, oldslot, newslot, true))
+		return false;
+
+	for (int i = 0; i < rel->trigdesc->numtriggers; i++)
+	{
+		Trigger	   *trigger = &rel->trigdesc->triggers[i];
+		TriggerData td = {0};
+
+		if (!ri_trigger_enabled(trigger))
+			continue;
+
+		if (trigger->tgfoid == F_RI_FKEY_CHECK_UPD)
+		{
+			if (!RI_FKey_fk_upd_check_required(trigger, rel, oldslot, newslot))
 				continue;
 			td.type = T_TriggerData;
-			td.tg_event = TRIGGER_EVENT_INSERT | TRIGGER_EVENT_ROW;
+			td.tg_event = TRIGGER_EVENT_UPDATE | TRIGGER_EVENT_ROW;
 			td.tg_relation = rel;
 			td.tg_trigger = trigger;
-			td.tg_trigslot = slot;
-			RI_FKey_check(&td, true);
+			td.tg_trigslot = oldslot;
+			td.tg_newslot = newslot;
+			if (!RI_FKey_check(&td, true, true))
+				return false;
 		}
-		ReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(oldcontext);
-		CurrentResourceOwner = oldowner;
+		else if (trigger->tgfoid == F_RI_FKEY_RESTRICT_UPD ||
+				 trigger->tgfoid == F_RI_FKEY_NOACTION_UPD)
+		{
+			if (!RI_FKey_pk_upd_check_required(trigger, rel, oldslot, newslot))
+				continue;
+			td.type = T_TriggerData;
+			td.tg_event = TRIGGER_EVENT_UPDATE | TRIGGER_EVENT_ROW;
+			td.tg_relation = rel;
+			td.tg_trigger = trigger;
+			td.tg_trigslot = oldslot;
+			td.tg_newslot = newslot;
+			if (!ri_restrict_ext(&td, trigger->tgfoid == F_RI_FKEY_NOACTION_UPD,
+								 true, true))
+				return false;
+		}
 	}
-	PG_CATCH();
-	{
-		ErrorData *edata;
+	return true;
+}
 
-		MemoryContextSwitchTo(oldcontext);
-		edata = CopyErrorData();
-		FlushErrorState();
-		RollbackAndReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(oldcontext);
-		CurrentResourceOwner = oldowner;
-		if (edata->sqlerrcode != ERRCODE_FOREIGN_KEY_VIOLATION)
-			ReThrowError(edata);
-		ereport(WARNING, (errcode(edata->sqlerrcode),
-						  errmsg_internal("%s", edata->message),
-						  errdetail_internal("%s", edata->detail ? edata->detail : "")));
-		FreeErrorData(edata);
-		valid = false;
+bool
+RI_FKey_check_delete(Relation rel, TupleTableSlot *oldslot)
+{
+	if (!rel->trigdesc || !rel->trigdesc->trig_delete_after_row ||
+		(MyProtocolExtension && MyProtocolExtension->foreign_key_checks &&
+		 !MyProtocolExtension->foreign_key_checks()))
+		return true;
+
+	for (int i = 0; i < rel->trigdesc->numtriggers; i++)
+	{
+		Trigger	   *trigger = &rel->trigdesc->triggers[i];
+		TriggerData td = {0};
+
+		if ((trigger->tgfoid != F_RI_FKEY_RESTRICT_DEL &&
+			 trigger->tgfoid != F_RI_FKEY_NOACTION_DEL) ||
+			!ri_trigger_enabled(trigger))
+			continue;
+		if (!RI_FKey_pk_upd_check_required(trigger, rel, oldslot, NULL))
+			continue;
+		td.type = T_TriggerData;
+		td.tg_event = TRIGGER_EVENT_DELETE | TRIGGER_EVENT_ROW;
+		td.tg_relation = rel;
+		td.tg_trigger = trigger;
+		td.tg_trigslot = oldslot;
+		if (!ri_restrict_ext(&td, trigger->tgfoid == F_RI_FKEY_NOACTION_DEL,
+							 true, true))
+			return false;
 	}
-	PG_END_TRY();
-	return valid;
+	return true;
 }
 
 /*
@@ -575,7 +657,8 @@ RI_FKey_check_ins(PG_FUNCTION_ARGS)
 	ri_CheckTrigger(fcinfo, "RI_FKey_check_ins", RI_TRIGTYPE_INSERT);
 
 	/* Share code with UPDATE case. */
-	return RI_FKey_check((TriggerData *) fcinfo->context, false);
+	(void) RI_FKey_check((TriggerData *) fcinfo->context, false, false);
+	return PointerGetDatum(NULL);
 }
 
 
@@ -591,7 +674,8 @@ RI_FKey_check_upd(PG_FUNCTION_ARGS)
 	ri_CheckTrigger(fcinfo, "RI_FKey_check_upd", RI_TRIGTYPE_UPDATE);
 
 	/* Share code with INSERT case. */
-	return RI_FKey_check((TriggerData *) fcinfo->context, false);
+	(void) RI_FKey_check((TriggerData *) fcinfo->context, false, false);
+	return PointerGetDatum(NULL);
 }
 
 
@@ -809,12 +893,21 @@ RI_FKey_restrict_upd(PG_FUNCTION_ARGS)
 static Datum
 ri_restrict(TriggerData *trigdata, bool is_no_action)
 {
+	(void) ri_restrict_ext(trigdata, is_no_action, false, false);
+	return PointerGetDatum(NULL);
+}
+
+static bool
+ri_restrict_ext(TriggerData *trigdata, bool is_no_action,
+				bool before_modify, bool warn_only)
+{
 	const RI_ConstraintInfo *riinfo;
 	Relation	fk_rel;
 	Relation	pk_rel;
 	TupleTableSlot *oldslot;
 	RI_QueryKey qkey;
 	SPIPlanPtr	qplan;
+	bool		ok;
 
 	riinfo = ri_FetchConstraintInfo(trigdata->tg_trigger,
 									trigdata->tg_relation, true);
@@ -833,16 +926,104 @@ ri_restrict(TriggerData *trigdata, bool is_no_action)
 	 * If another PK row now exists providing the old key values, we should
 	 * not do anything.  However, this check should only be made in the NO
 	 * ACTION case; in RESTRICT cases we don't wish to allow another row to be
-	 * substituted.
+	 * substituted.  Skip when before_modify is true because oldslot itself is
+	 * still live in pk_rel.
 	 *
 	 * If the foreign key has PERIOD, we incorporate looking for replacement
 	 * rows in the main SQL query below, so we needn't do it here.
 	 */
-	if (is_no_action && !riinfo->hasperiod &&
+	if (!before_modify && is_no_action && !riinfo->hasperiod &&
 		ri_Check_Pk_Match(pk_rel, fk_rel, oldslot, riinfo))
 	{
 		table_close(fk_rel, RowShareLock);
-		return PointerGetDatum(NULL);
+		return true;
+	}
+
+	/*
+	 * Pre-modify self-referencing check: if oldslot's own FK columns match its
+	 * PK columns, exclude oldslot->tts_tid so a self-referencing row does not
+	 * block its own DELETE IGNORE / UPDATE IGNORE unless another row points to it.
+	 */
+	if (before_modify && riinfo->pk_relid == riinfo->fk_relid &&
+		!riinfo->hasperiod && ItemPointerIsValid(&oldslot->tts_tid))
+	{
+		bool		self_ref = true;
+
+		for (int i = 0; i < riinfo->nkeys; i++)
+		{
+			bool		pnull,
+						fnull;
+			Datum		pval = slot_getattr(oldslot, riinfo->pk_attnums[i], &pnull);
+			Datum		fval = slot_getattr(oldslot, riinfo->fk_attnums[i], &fnull);
+			Oid			ptype = RIAttType(pk_rel, riinfo->pk_attnums[i]);
+			Oid			ftype = RIAttType(fk_rel, riinfo->fk_attnums[i]);
+
+			if (pnull || fnull || ptype != ftype ||
+				!ri_CompareWithCast(riinfo->pf_eq_oprs[i], ptype,
+									RIAttCollation(pk_rel, riinfo->pk_attnums[i]), pval, fval))
+			{
+				self_ref = false;
+				break;
+			}
+		}
+		if (self_ref)
+		{
+			StringInfoData querybuf;
+			char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
+			char		attname[MAX_QUOTED_NAME_LEN];
+			char		paramname[16];
+			const char *querysep = "WHERE";
+			const char *fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ? "" : "ONLY ";
+			Oid			queryoids[RI_MAX_NUMKEYS + 1];
+			Datum		vals[RI_MAX_NUMKEYS + 1];
+			char		nulls[RI_MAX_NUMKEYS + 1];
+			Oid			save_userid;
+			int			save_sec_context;
+			int			spi_result;
+			bool		referenced;
+
+			SPI_connect();
+			initStringInfo(&querybuf);
+			quoteRelationName(fkrelname, fk_rel);
+			appendStringInfo(&querybuf, "SELECT 1 FROM %s%s x", fk_only, fkrelname);
+			for (int i = 0; i < riinfo->nkeys; i++)
+			{
+				Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
+				Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
+
+				quoteOneName(attname, RIAttName(fk_rel, riinfo->fk_attnums[i]));
+				sprintf(paramname, "$%d", i + 1);
+				ri_GenerateQual(&querybuf, querysep, paramname, pk_type,
+								riinfo->pf_eq_oprs[i], attname, fk_type);
+				querysep = "AND";
+				queryoids[i] = pk_type;
+			}
+			appendStringInfo(&querybuf, " AND x.ctid OPERATOR(pg_catalog.<>) $%d FOR KEY SHARE OF x",
+							 riinfo->nkeys + 1);
+			queryoids[riinfo->nkeys] = TIDOID;
+			ri_ExtractValues(pk_rel, oldslot, riinfo, true, vals, nulls);
+			vals[riinfo->nkeys] = ItemPointerGetDatum(&oldslot->tts_tid);
+			nulls[riinfo->nkeys] = ' ';
+
+			GetUserIdAndSecContext(&save_userid, &save_sec_context);
+			SetUserIdAndSecContext(RelationGetForm(fk_rel)->relowner,
+								   save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
+								   SECURITY_NOFORCE_RLS);
+			spi_result = SPI_execute_with_args(querybuf.data, riinfo->nkeys + 1,
+											   queryoids, vals, nulls, false, 1);
+			SetUserIdAndSecContext(save_userid, save_sec_context);
+			if (spi_result != SPI_OK_SELECT)
+				elog(ERROR, "SPI_execute_with_args returned %s", SPI_result_code_string(spi_result));
+			referenced = (SPI_processed != 0);
+			if (referenced)
+				ri_ReportViolationExt(riinfo, pk_rel, fk_rel, oldslot, NULL,
+									  is_no_action ? RI_PLAN_NO_ACTION : RI_PLAN_RESTRICT,
+									  !is_no_action, false, warn_only);
+			if (SPI_finish() != SPI_OK_FINISH)
+				elog(ERROR, "SPI_finish failed");
+			table_close(fk_rel, RowShareLock);
+			return !referenced;
+		}
 	}
 
 	SPI_connect();
@@ -988,19 +1169,19 @@ ri_restrict(TriggerData *trigdata, bool is_no_action)
 	/*
 	 * We have a plan now. Run it to check for existing references.
 	 */
-	ri_PerformCheck(riinfo, &qkey, qplan,
-					fk_rel, pk_rel,
-					oldslot, NULL,
-					!is_no_action,
-					true,		/* must detect new rows */
-					SPI_OK_SELECT);
+	ok = ri_PerformCheckExt(riinfo, &qkey, qplan,
+							fk_rel, pk_rel,
+							oldslot, NULL,
+							!is_no_action,
+							true,	/* must detect new rows */
+							SPI_OK_SELECT, warn_only);
 
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "SPI_finish failed");
 
 	table_close(fk_rel, RowShareLock);
 
-	return PointerGetDatum(NULL);
+	return ok;
 }
 
 
@@ -2586,6 +2767,20 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 				bool is_restrict,
 				bool detectNewRows, int expect_OK)
 {
+	return ri_PerformCheckExt(riinfo, qkey, qplan, fk_rel, pk_rel,
+							  oldslot, newslot, is_restrict,
+							  detectNewRows, expect_OK, false);
+}
+
+static bool
+ri_PerformCheckExt(const RI_ConstraintInfo *riinfo,
+				   RI_QueryKey *qkey, SPIPlanPtr qplan,
+				   Relation fk_rel, Relation pk_rel,
+				   TupleTableSlot *oldslot, TupleTableSlot *newslot,
+				   bool is_restrict,
+				   bool detectNewRows, int expect_OK,
+				   bool warn_only)
+{
 	Relation	query_rel,
 				source_rel;
 	bool		source_is_pk;
@@ -2702,13 +2897,20 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 
 	/* XXX wouldn't it be clearer to do this part at the caller? */
 	if (qkey->constr_queryno != RI_PLAN_CHECK_LOOKUPPK_FROM_PK &&
-		expect_OK == SPI_OK_SELECT &&
-		(SPI_processed == 0) == (qkey->constr_queryno == RI_PLAN_CHECK_LOOKUPPK))
-		ri_ReportViolation(riinfo,
-						   pk_rel, fk_rel,
-						   newslot ? newslot : oldslot,
-						   NULL,
-						   qkey->constr_queryno, is_restrict, false);
+		expect_OK == SPI_OK_SELECT)
+	{
+		if ((SPI_processed == 0) == (qkey->constr_queryno == RI_PLAN_CHECK_LOOKUPPK))
+		{
+			ri_ReportViolationExt(riinfo,
+								  pk_rel, fk_rel,
+								  newslot ? newslot : oldslot,
+								  NULL,
+								  qkey->constr_queryno, is_restrict, false,
+								  warn_only);
+			return false;
+		}
+		return true;
+	}
 
 	return SPI_processed != 0;
 }
@@ -2751,6 +2953,19 @@ ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 				   TupleTableSlot *violatorslot, TupleDesc tupdesc,
 				   int queryno, bool is_restrict, bool partgone)
 {
+	ri_ReportViolationExt(riinfo, pk_rel, fk_rel, violatorslot, tupdesc,
+						  queryno, is_restrict, partgone, false);
+	pg_unreachable();
+}
+
+static void
+ri_ReportViolationExt(const RI_ConstraintInfo *riinfo,
+					  Relation pk_rel, Relation fk_rel,
+					  TupleTableSlot *violatorslot, TupleDesc tupdesc,
+					  int queryno, bool is_restrict, bool partgone,
+					  bool warn_only)
+{
+	int			elevel = warn_only ? WARNING : ERROR;
 	StringInfoData key_names;
 	StringInfoData key_values;
 	bool		onfk;
@@ -2857,7 +3072,7 @@ ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 	}
 
 	if (partgone)
-		ereport(ERROR,
+		ereport(elevel,
 				(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
 				 errmsg("removing partition \"%s\" violates foreign key constraint \"%s\"",
 						RelationGetRelationName(pk_rel),
@@ -2867,7 +3082,7 @@ ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 						   RelationGetRelationName(fk_rel)),
 				 errtableconstraint(fk_rel, NameStr(riinfo->conname))));
 	else if (onfk)
-		ereport(ERROR,
+		ereport(elevel,
 				(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
 				 errmsg("insert or update on table \"%s\" violates foreign key constraint \"%s\"",
 						RelationGetRelationName(fk_rel),
@@ -2880,7 +3095,7 @@ ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 						   RelationGetRelationName(pk_rel)),
 				 errtableconstraint(fk_rel, NameStr(riinfo->conname))));
 	else if (is_restrict)
-		ereport(ERROR,
+		ereport(elevel,
 				(errcode(ERRCODE_RESTRICT_VIOLATION),
 				 errmsg("update or delete on table \"%s\" violates RESTRICT setting of foreign key constraint \"%s\" on table \"%s\"",
 						RelationGetRelationName(pk_rel),
@@ -2894,7 +3109,7 @@ ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 						   RelationGetRelationName(fk_rel)),
 				 errtableconstraint(fk_rel, NameStr(riinfo->conname))));
 	else
-		ereport(ERROR,
+		ereport(elevel,
 				(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
 				 errmsg("update or delete on table \"%s\" violates foreign key constraint \"%s\" on table \"%s\"",
 						RelationGetRelationName(pk_rel),

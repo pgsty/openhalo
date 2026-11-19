@@ -1,50 +1,11 @@
 /*-------------------------------------------------------------------------
  *
  * strfuncs.c
- *	  Extend strfuncs routines
+ *	  MySQL-compatible string, numeric conversion, and bit helper functions
  *
- * 
- * 版权所有 (c) 2019-2025, 易景科技保留所有权利。
- * Copyright (c) 2019-2025, Halo Tech Co.,Ltd. All rights reserved.
- * 版权所有 (c) 2026, PGSTY PTE. LTD. 保留所有权利。
- * Copyright (c) 2026, PGSTY PTE. LTD. All rights reserved.
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
- * 
- * 易景科技是Halo Database、Halo Database Management System、羲和数据
- * 库、羲和数据库管理系统（后面简称 Halo ）、openHalo软件的发明人同时也为
- * 知识产权权利人。Halo 软件的知识产权，以及与本软件相关的所有信息内容（包括
- * 但不限于文字、图片、音频、视频、图表、界面设计、版面框架、有关数据或电子文
- * 档等）均受中华人民共和国法律法规和相应的国际条约保护，易景科技享有上述知识
- * 产权，但相关权利人依照法律规定应享有的权利除外。未免疑义，本条所指的“知识
- * 产权”是指任何及所有基于 Halo 软件产生的：（a）版权、商标、商号、域名、与
- * 商标和商号相关的商誉、设计和专利；与创新、技术诀窍、商业秘密、保密技术、非
- * 技术信息相关的权利；（b）人身权、掩模作品权、署名权和发表权；以及（c）在
- * 本协议生效之前已存在或此后出现在世界任何地方的其他工业产权、专有权、与“知
- * 识产权”相关的权利，以及上述权利的所有续期和延长，无论此类权利是否已在相
- * 关法域内的相关机构注册。
- *
- * This software and related documentation are provided under a license
- * agreement containing restrictions on use and disclosure and are 
- * protected by intellectual property laws. Except as expressly permitted
- * in your license agreement or allowed by law, you may not use, copy, 
- * reproduce, translate, broadcast, modify, license, transmit, distribute,
- * exhibit, perform, publish, or display any part, in any form, or by any
- * means. Reverse engineering, disassembly, or decompilation of this 
- * software, unless required by law for interoperability, is prohibited.
- * 
- * This software is developed for general use in a variety of
- * information management applications. It is not developed or intended
- * for use in any inherently dangerous applications, including applications
- * that may create a risk of personal injury. If you use this software or
- * in dangerous applications, then you shall be responsible to take all
- * appropriate fail-safe, backup, redundancy, and other measures to ensure
- * its safe use. Halo Corporation and its affiliates disclaim any 
- * liability for any damages caused by use of this software in dangerous
- * applications.
- * 
- *
- * IDENTIFICATION
- *	  src/backend/utils/ddsm/mysm/strfuncs.c
  *
  *-------------------------------------------------------------------------
  */
@@ -54,163 +15,122 @@
 #include "halo_mysql.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
-#include <strings.h>
 #include <math.h>
+#include <strings.h>
 
 #include "access/detoast.h"
-#include "access/toast_compression.h"
+#include "adapter/mysql/adapter.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
-#include "common/hashfn.h"
 #include "common/int.h"
-#include "common/unicode_norm.h"
-#include "lib/hyperloglog.h"
 #include "lib/stringinfo.h"
-#include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "nodes/execnodes.h"
-#include "parser/scansup.h"
-#include "port/pg_bswap.h"
-#include "regex/regex.h"
-#include "utils/array.h"
+#include "port/pg_bitutils.h"
 #include "utils/builtins.h"
 #include "utils/bytea.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
-#include "utils/sortsupport.h"
 #include "utils/varbit.h"
 #include "utils/varlena.h"
-#include "adapter/mysql/adapter.h"
-#include "halo_mysql.h"
-
 
 typedef struct
 {
-	bool		is_multibyte;	/* T if multibyte encoding */
-	bool		is_multibyte_char_in_char;	/* need to check char boundaries? */
+	bool		is_multibyte;
+	bool		is_multibyte_char_in_char;
 
 	char	   *str1;			/* haystack string */
 	char	   *str2;			/* needle string */
 	int			len1;			/* string lengths in bytes */
 	int			len2;
 
-	/* Skip table for Boyer-Moore-Horspool search algorithm: */
-	int			skiptablemask;	/* mask for ANDing with skiptable subscripts */
-	int			skiptable[256]; /* skip distance for given mismatched char */
+	int			skiptablemask;
+	int			skiptable[256];
 
-	char	   *last_match;		/* pointer to last match in 'str1' */
-
-	/*
-	 * Sometimes we need to convert the byte position of a match to a
-	 * character position.  These store the last position that was converted,
-	 * so that on the next call, we can continue from that point, rather than
-	 * count characters from the very beginning.
-	 */
-	char	   *refpoint;		/* pointer within original haystack string */
-	int			refpos;			/* 0-based character offset of the same point */
+	char	   *last_match;
+	char	   *refpoint;
+	int			refpos;
 } TextPositionState;
 
-
 static text *text_substring(Datum str, int32 start, int32 length, bool length_not_specified);
-static text *concat_internal(const char *sepstr, int argidx, FunctionCallInfo fcinfo);
-static text *concat_ws_internal(const char *sepstr, int argidx, FunctionCallInfo fcinfo);
+static text *concat_internal(const char *sepstr, int argidx, FunctionCallInfo fcinfo, bool skip_nulls);
 static FmgrInfo *build_concat_foutcache(FunctionCallInfo fcinfo, int argidx);
 static int	text_position(text *t1, text *t2, Oid collid);
 static void text_position_setup(text *t1, text *t2, Oid collid, TextPositionState *state);
 static bool text_position_next(Oid collid, TextPositionState *state);
-static char * text_position_next_internal(Oid collid, char *start_ptr, TextPositionState *state);
-static int text_position_get_match_pos(TextPositionState *state);
-static void text_position_cleanup(TextPositionState *state);
-static void check_collation_set(Oid collid);
+static char *text_position_next_internal(Oid collid, char *start_ptr, TextPositionState *state);
+static int	text_position_get_match_pos(TextPositionState *state);
+static void check_collation_set_local(Oid collid);
 static void convert_to_digit_text_for_mysql(char **str, int str_len);
 static void convert_to_text_for_mysql(char **str, int str_len);
-static bool lowerStrs(text *t1, text *t2, char **backupBuf1, char **backupBuf2);
-static void restoreStrs(char *backupBuf1, char *backupBuf2, text *t1, text *t2);
-
+static text *ascii_lower_copy(const text *src);
+static VarBit *mys_int64_to_varbit(int64 val);
 
 PG_FUNCTION_INFO_V1(elt);
 Datum
 elt(PG_FUNCTION_ARGS)
 {
-    FmgrInfo *foutcache;
-    Datum datum;
-    char *value;
-    Oid valtype;
-    Oid valBaseType;
-    int index;
+	FmgrInfo   *foutcache;
+	Datum		datum;
+	char	   *value;
+	char	   *endptr;
+	double		dindex;
+	int64		index;
+	Oid			valtype;
+	Oid			valBaseType;
+	text	   *res;
 
-    foutcache = (FmgrInfo *) fcinfo->flinfo->fn_extra;
-    if (foutcache == NULL)
-    {
-        foutcache = build_concat_foutcache(fcinfo, 0);
-    }
+	foutcache = (FmgrInfo *) fcinfo->flinfo->fn_extra;
+	if (foutcache == NULL)
+		foutcache = build_concat_foutcache(fcinfo, 0);
 
-    if (PG_ARGISNULL(0))
-    {
-        PG_RETURN_NULL();
-    }
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
 
-    datum = PG_GETARG_DATUM(0);
-    value = OutputFunctionCall(&foutcache[0], datum);
-    index = atoi(value);
-    if ((index < 1) || (PG_NARGS() < index))
-    {
-        PG_RETURN_NULL();
-    }
+	datum = PG_GETARG_DATUM(0);
+	value = OutputFunctionCall(&foutcache[0], datum);
+	errno = 0;
+	dindex = strtod(value, &endptr);
+	pfree(value);
 
-    if (PG_ARGISNULL(index))
-    {
-        PG_RETURN_NULL();
-    }
+	if (isnan(dindex) || isinf(dindex) || dindex < 1.0 || dindex >= (double) PG_NARGS() + 0.5)
+		PG_RETURN_NULL();
 
-    datum = PG_GETARG_DATUM(index);
-    valtype = get_fn_expr_argtype(fcinfo->flinfo, index);
+	index = (int64) llrint(dindex);
+	if (index < 1 || index >= PG_NARGS())
+		PG_RETURN_NULL();
+
+	if (PG_ARGISNULL((int) index))
+		PG_RETURN_NULL();
+
+	datum = PG_GETARG_DATUM((int) index);
+	valtype = get_fn_expr_argtype(fcinfo->flinfo, (int) index);
 	valBaseType = mys_binary_base_type(valtype);
-    if (valBaseType != BYTEAOID)
-    {
-        value = OutputFunctionCall(&foutcache[index], datum);
-    }
-    else
-    {
-        bytea *vlena = DatumGetByteaPP(datum);
-        value = VARDATA_ANY(vlena);
-    }
+	if (valBaseType != BYTEAOID)
+	{
+		value = OutputFunctionCall(&foutcache[(int) index], datum);
+		res = cstring_to_text(value);
+		pfree(value);
+	}
+	else
+	{
+		bytea	   *vlena = DatumGetByteaPP(datum);
+		const char *bytes = VARDATA_ANY(vlena);
+		int			blen = VARSIZE_ANY_EXHDR(vlena);
 
-    PG_RETURN_TEXT_P(cstring_to_text(value));
+		pg_verifymbstr(bytes, blen, false);
+		res = cstring_to_text_with_len(bytes, blen);
+		if ((Pointer) vlena != DatumGetPointer(datum))
+			pfree(vlena);
+	}
+
+	PG_RETURN_TEXT_P(res);
 }
 
-
 PG_FUNCTION_INFO_V1(text_substr);
-/*
- * text_substr()
- * Return a substring starting at the specified position.
- * - thomas 1997-12-31
- *
- * Input:
- *	- string
- *	- starting position (is one-based)
- *	- string length
- *
- * If the starting position is zero or less, then return from the start of the string
- *	adjusting the length to be consistent with the "negative start" per SQL.
- * If the length is less than zero, return the remaining string.
- *
- * Added multibyte support.
- * - Tatsuo Ishii 1998-4-21
- * Changed behavior if starting position is less than one to conform to SQL behavior.
- * Formerly returned the entire string; now returns a portion.
- * - Thomas Lockhart 1998-12-10
- * Now uses faster TOAST-slicing interface
- * - John Gray 2002-02-22
- * Remove "#ifdef MULTIBYTE" and test for encoding_max_length instead. Change
- * behaviors conflicting with SQL to meet SQL (if E = S + L < S throw
- * error; if E < 1, return '', not entire string). Fixed MB related bug when
- * S > LC and < LC + 4 sometimes garbage characters are returned.
- * - Joe Conway 2002-08-10
- */
 Datum
 text_substr(PG_FUNCTION_ARGS)
 {
@@ -221,18 +141,13 @@ text_substr(PG_FUNCTION_ARGS)
 }
 
 PG_FUNCTION_INFO_V1(text_substr_no_len);
-/*
- * text_substr_no_len -
- *	  Wrapper to avoid opr_sanity failure due to
- *	  one function accepting a different number of args.
- */
 Datum
 text_substr_no_len(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(text_substring(PG_GETARG_DATUM(0),
 									PG_GETARG_INT32(1),
-									-1, 
-                                    true));
+									-1,
+									true));
 }
 
 PG_FUNCTION_INFO_V1(text_left);
@@ -240,7 +155,7 @@ Datum
 text_left(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(text_substring(PG_GETARG_DATUM(0),
-                                    1,
+									1,
 									PG_GETARG_INT32(1),
 									false));
 }
@@ -249,41 +164,22 @@ PG_FUNCTION_INFO_V1(text_right);
 Datum
 text_right(PG_FUNCTION_ARGS)
 {
-    Datum arg1;
-    Datum arg2;
-    int len1;
-    int rightLen;
-    int startIndex;
+	Datum		arg1;
+	int			len1;
+	int			rightLen;
+	int			startIndex;
 
-    if (PG_ARGISNULL(0))
-    {
-        PG_RETURN_NULL();
-    }
-    if (PG_ARGISNULL(1))
-    {
-        PG_RETURN_NULL();
-    }
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		PG_RETURN_NULL();
 
-    arg1 = PG_GETARG_DATUM(0);
-    arg2 = PG_GETARG_DATUM(1);
-    //len1 = toast_raw_datum_size(arg1) - VARHDRSZ;
-    len1 = DatumGetInt32(DirectFunctionCall1(textlen, arg1));
-    rightLen = DatumGetInt32(arg2);
+	arg1 = PG_GETARG_DATUM(0);
+	len1 = DatumGetInt32(DirectFunctionCall1(textlen, arg1));
+	rightLen = PG_GETARG_INT32(1);
 
-    if (rightLen <= 0)
-    {
-        PG_RETURN_TEXT_P(cstring_to_text(""));
-    }
+	if (rightLen <= 0)
+		PG_RETURN_TEXT_P(cstring_to_text(""));
 
-    if (rightLen < len1)
-    {
-        startIndex = len1 - rightLen + 1;
-    }
-    else
-    {
-        startIndex = 1;
-    }
-
+	startIndex = (rightLen < len1) ? (len1 - rightLen + 1) : 1;
 	PG_RETURN_TEXT_P(text_substring(arg1, startIndex, -1, true));
 }
 
@@ -291,1294 +187,726 @@ PG_FUNCTION_INFO_V1(check_set);
 Datum
 check_set(PG_FUNCTION_ARGS)
 {
-    text *txt1;
-    char* str1;
-    int str1Len;
-    char items1[64][128];
-    int items1Num;
-    text *txt2;
-    char* str2;
-    int str2Len;
-    int len;
-    int i;
-    int j;
-    int k;
-    int l;
+	text	   *txt1;
+	text	   *txt2;
+	const char *str1;
+	const char *str2;
+	int			str1Len;
+	int			str2Len;
+	const char *item_ptrs[64];
+	int			item_lens[64];
+	int			items1Num = 0;
+	int			pos;
 
-    if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
-    {
-        PG_RETURN_BOOL(false);
-    }
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		PG_RETURN_BOOL(false);
 
-    txt1 = PG_GETARG_TEXT_PP(0); 
-    str1 = VARDATA_ANY(txt1);
-    str1Len = VARSIZE_ANY_EXHDR(txt1);
-    items1Num = 0;
-    txt2 = PG_GETARG_TEXT_PP(1); 
-    str2 = VARDATA_ANY(txt2);
-    str2Len = VARSIZE_ANY_EXHDR(txt2);
+	txt1 = PG_GETARG_TEXT_PP(0);
+	txt2 = PG_GETARG_TEXT_PP(1);
+	str1 = VARDATA_ANY(txt1);
+	str1Len = VARSIZE_ANY_EXHDR(txt1);
+	str2 = VARDATA_ANY(txt2);
+	str2Len = VARSIZE_ANY_EXHDR(txt2);
 
-    if (str2Len == 0)
-    {
-        PG_RETURN_BOOL(true);
-    }
+	if (str2Len == 0)
+	{
+		PG_FREE_IF_COPY(txt1, 0);
+		PG_FREE_IF_COPY(txt2, 1);
+		PG_RETURN_BOOL(true);
+	}
 
-    i = 0;
-    j = 0;
-    k = 0;
-    for (i = 0; i < str1Len; i++)
-    {
-        if (64 <= items1Num)
-        {
-            PG_RETURN_BOOL(false);
-        }
+	pos = 0;
+	while (pos <= str1Len)
+	{
+		int			end = pos;
+		int			tlen;
 
-        if (str1[i] != ' ')
-        {
-            if (str1[i] == ',')
-            {
-                if (j < i)
-                {
-                    len = i - j;
-                    k = 1;
-                    while (true)
-                    {
-                        if (len <= 0)
-                        {
-                            break;
-                        }
+		while (end < str1Len && str1[end] != ',')
+			end++;
 
-                        if (str1[i - k] == ' ')
-                        {
-                            --len;
-                            ++k;
-                        }
-                        else 
-                        {
-                            break;
-                        }
-                    }
-                    if (128 <= len)
-                    {
-                        PG_RETURN_BOOL(false);
-                    }
+		tlen = end - pos;
+		while (tlen > 0 && str1[pos + tlen - 1] == ' ')
+			tlen--;
 
-                    memcpy(items1[items1Num], (str1 + j), len);
-                    items1[items1Num][len] = '\0';
-                    ++items1Num;
+		if (tlen > 0)
+		{
+			if (items1Num >= 64)
+			{
+				PG_FREE_IF_COPY(txt1, 0);
+				PG_FREE_IF_COPY(txt2, 1);
+				PG_RETURN_BOOL(false);
+			}
+			item_ptrs[items1Num] = str1 + pos;
+			item_lens[items1Num] = tlen;
+			items1Num++;
+		}
 
-                    j = i + 1;
-                    k = 0;
-                }
-            }   // if (str1[i] == ',')
-        }   // if (str1[i] != ' ')
-    }   // for (i = 0; i < str1Len; i++)
-    if (j < i)
-    {
-        if (64 <= items1Num)
-        {
-            PG_RETURN_BOOL(false);
-        }
+		if (end == str1Len)
+			break;
+		pos = end + 1;
+	}
 
-        len = i - j;
-        k = 1;
-        while (true)
-        {
-            if (len <= 0)
-            {
-                break;
-            }
+	pos = 0;
+	while (pos <= str2Len)
+	{
+		int			end = pos;
+		int			tlen;
+		bool		found = false;
 
-            if (str1[i - k] == ' ')
-            {
-                --len;
-                ++k;
-            }
-            else 
-            {
-                break;
-            }
-        }
-        if (128 <= len)
-        {
-            PG_RETURN_BOOL(false);
-        }
+		while (end < str2Len && str2[end] != ',')
+			end++;
 
-        memcpy(items1[items1Num], (str1 + j), len);
-        items1[items1Num][len] = '\0';
-        ++items1Num;
-    }
+		tlen = end - pos;
+		if (end == str2Len)
+		{
+			while (tlen > 0 && str2[pos + tlen - 1] == ' ')
+				tlen--;
+		}
 
-    i = 0;
-    j = i;
-    k = 0;
-    l = 0;
-    while (true)
-    {
-        if (str2Len <= i)
-        {
-            bool found = false;
-            int item2Len = 0;
-            k = i - 1;
-            while (true)
-            {
-                if (k <= j)
-                {
-                    break;
-                }
+		for (int l = 0; l < items1Num; l++)
+		{
+			if (item_lens[l] == tlen &&
+				pg_strncasecmp(str2 + pos, item_ptrs[l], tlen) == 0)
+			{
+				found = true;
+				break;
+			}
+		}
 
-                if (str2[k] != ' ')
-                {
-                    break;
-                }      
-                else
-                {
-                    --k;
-                }
-            }
+		if (!found)
+		{
+			PG_FREE_IF_COPY(txt1, 0);
+			PG_FREE_IF_COPY(txt2, 1);
+			PG_RETURN_BOOL(false);
+		}
 
-            item2Len = k - j + 1;
-            for (l = 0; l < items1Num; l++)
-            {
-                int item1Len = strlen(items1[l]);
-                if (item1Len == item2Len)
-                {
-                    if (strncmp((str2 + j), items1[l], item2Len) == 0)
-                    {
-                        found = true;
-                        break;
-                    }
-                    else if (strncasecmp((str2 + j), items1[l], item2Len) == 0)
-                    {
-                        memcpy((str2 + j), items1[l], item2Len);
-                        found = true;
-                        break;
-                    }
-                    else 
-                    {
-                        continue;
-                    }
-                }
-            }
-            if (found)
-            {
-                PG_RETURN_BOOL(true);
-            }
-            {
-                PG_RETURN_BOOL(false);
-            }
+		if (end == str2Len)
+			break;
+		pos = end + 1;
+	}
 
-            break;
-        }
-
-        if (str2[i] == ',')
-        {
-            bool found = false;
-            int item2Len = i - j;
-            for (l = 0; l < items1Num; l++)
-            {
-                int item1Len = strlen(items1[l]);
-                if (item1Len == item2Len)
-                {
-                    if (strncmp((str2 + j), items1[l], item2Len) == 0)
-                    {
-                        found = true;
-                        break;
-                    }
-                    else if (strncasecmp((str2 + j), items1[l], item2Len) == 0)
-                    {
-                        memcpy((str2 + j), items1[l], item2Len);
-                        found = true;
-                        break;
-                    }
-                    else 
-                    {
-                        continue;
-                    }
-                }
-            }
-            if (found)
-            {
-                j = i + 1;
-            }
-            else
-            {
-                PG_RETURN_BOOL(false);
-            }
-        }
-        ++i;
-    }
-
-    PG_RETURN_BOOL(true);
+	PG_FREE_IF_COPY(txt1, 0);
+	PG_FREE_IF_COPY(txt2, 1);
+	PG_RETURN_BOOL(true);
 }
-
 
 PG_FUNCTION_INFO_V1(text_instr);
 Datum
 text_instr(PG_FUNCTION_ARGS)
 {
-    text   *str = PG_GETARG_TEXT_PP(0); 
-    text   *search_str = PG_GETARG_TEXT_PP(1); 
+	text	   *str;
+	text	   *search_str;
+	int32		res;
 
 	if (mys_is_mysql_session())
 		return mys_string_instr(fcinfo);
-    PG_RETURN_INT32((int32) text_position(str, search_str, PG_GET_COLLATION()));
-}
 
+	str = PG_GETARG_TEXT_PP(0);
+	search_str = PG_GETARG_TEXT_PP(1);
+	res = (int32) text_position(str, search_str, PG_GET_COLLATION());
+	PG_FREE_IF_COPY(str, 0);
+	PG_FREE_IF_COPY(search_str, 1);
+	PG_RETURN_INT32(res);
+}
 
 PG_FUNCTION_INFO_V1(convert_time_text_to_numeric_for_mysql);
 Datum
 convert_time_text_to_numeric_for_mysql(PG_FUNCTION_ARGS)
 {
-    float8 ret;
-    Datum txt;
-    char* str;
-    int strLen;
-    int tmpSize;
-    char tmp[64];
-    int i;
-    int j;
+	char	   *str;
+	int			strLen;
+	char		tmp[64];
+	int			j = 0;
+	float8		ret;
 
-    if (PG_ARGISNULL(0))
-    {
-        PG_RETURN_NULL();
-    }
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
 
-    txt = PG_GETARG_DATUM(0);
-    str = TextDatumGetCString(txt);
-    strLen = strlen(str);
-    tmpSize = 64;
-    if (strLen == 0)
-    {
-        PG_RETURN_NULL();
-    }
-    if (tmpSize <= strLen)
-    {
-        PG_RETURN_NULL();
-    }
+	str = TextDatumGetCString(PG_GETARG_DATUM(0));
+	strLen = strlen(str);
+	if (strLen == 0 || strLen >= (int) sizeof(tmp))
+	{
+		pfree(str);
+		PG_RETURN_NULL();
+	}
 
-    i = 0;
-    j = 0;
-    for (i = 0; i < strLen; i++) 
-    {
-        // "2023-08-07 15:26:37.12345"
-        if (isdigit(str[i]) || (str[i] == '.'))
-        {
-            tmp[j] = str[i];
-            ++j;
-        }
-        else 
-        {
-            // do nothing;
-        }
-    }
-    tmp[j] = '\0';
+	for (int i = 0; i < strLen; i++)
+	{
+		if (isdigit((unsigned char) str[i]) || str[i] == '.')
+			tmp[j++] = str[i];
+	}
+	tmp[j] = '\0';
+	pfree(str);
 
-    ret = atof(tmp);
-    PG_RETURN_FLOAT8(ret);
+	ret = strtod(tmp, NULL);
+	PG_RETURN_FLOAT8(ret);
 }
 
 PG_FUNCTION_INFO_V1(text_locate2);
 Datum
 text_locate2(PG_FUNCTION_ARGS)
 {
-    text   *str = PG_GETARG_TEXT_PP(0); 
-    text   *search_str = PG_GETARG_TEXT_PP(1); 
+	text	   *str;
+	text	   *search_str;
+	int32		res;
 
 	if (mys_is_mysql_session())
 		return mys_string_locate(fcinfo);
-    PG_RETURN_INT32((int32) text_position(search_str, str, PG_GET_COLLATION()));
+
+	str = PG_GETARG_TEXT_PP(0);
+	search_str = PG_GETARG_TEXT_PP(1);
+	res = (int32) text_position(search_str, str, PG_GET_COLLATION());
+	PG_FREE_IF_COPY(str, 0);
+	PG_FREE_IF_COPY(search_str, 1);
+	PG_RETURN_INT32(res);
 }
 
 PG_FUNCTION_INFO_V1(text_locate3);
 Datum
 text_locate3(PG_FUNCTION_ARGS)
 {
-    Datum arg1;
-    Datum arg2;
-    Datum arg3;
-    text *targ1;
-    int iarg3;
-    text *slice;
-    int32 ret;
+	Datum		arg1;
+	Datum		arg2;
+	text	   *targ1;
+	int64		pos64;
+	int32		iarg3;
+	text	   *slice;
+	int32		ret;
 
 	if (mys_is_mysql_session())
 		return mys_string_locate(fcinfo);
-    if (PG_ARGISNULL(0))
-    {
-        PG_RETURN_NULL();
-    }
-    if (PG_ARGISNULL(1))
-    {
-        PG_RETURN_NULL();
-    }
-    if (PG_ARGISNULL(2))
-    {
-        PG_RETURN_INT32(0);
-    }
 
-    arg1 = PG_GETARG_DATUM(0);
-    arg2 = PG_GETARG_DATUM(1);
-    arg3 = PG_GETARG_DATUM(2);
-    targ1 = DatumGetTextPP(arg1);
-    iarg3 = DatumGetInt32(arg3);
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		PG_RETURN_NULL();
+	if (PG_ARGISNULL(2))
+		PG_RETURN_INT32(0);
 
-    if (iarg3 <= 0)
-    {
-        PG_RETURN_INT32(0);
-    }
+	pos64 = PG_GETARG_INT64(2);
+	if (pos64 <= 0 || pos64 > PG_INT32_MAX)
+		PG_RETURN_INT32(0);
 
-    slice = text_substring(arg2, iarg3, -1, true);
+	iarg3 = (int32) pos64;
+	arg1 = PG_GETARG_DATUM(0);
+	arg2 = PG_GETARG_DATUM(1);
+	targ1 = DatumGetTextPP(arg1);
+
+	slice = text_substring(arg2, iarg3, -1, true);
 	ret = (int32) text_position(slice, targ1, PG_GET_COLLATION());
-    if (0 < ret)
-    {
-        PG_RETURN_INT32(iarg3 -1 + ret);
-    }
-    else 
-    {
-        PG_RETURN_INT32(0);
-    }
+	pfree(slice);
+	if ((Pointer) targ1 != DatumGetPointer(arg1))
+		pfree(targ1);
+
+	if (ret > 0)
+		PG_RETURN_INT32(iarg3 - 1 + ret);
+	PG_RETURN_INT32(0);
 }
 
 PG_FUNCTION_INFO_V1(convertTextToDouble);
 Datum
 convertTextToDouble(PG_FUNCTION_ARGS)
 {
-    if (!PG_ARGISNULL(0))
-    {
-        Datum txt = PG_GETARG_DATUM(0);
-        char* str = TextDatumGetCString(txt);
-        int len = strlen(str);
-        if (1 <= len)
-        {
-            float8 ret;
+	char	   *orig_str;
+	char	   *endptr;
+	int			len;
+	float8		ret;
 
-            for (int i = (len - 1); i >= 0; i--)
-            {
-                if (str[i] != ' ')
-                {
-                    break;
-                }
-                else 
-                {
-                    str[i] = '\0';
-                }
-            }
-            ret = strtod(str, &str);
-            if (*str != '\0')
-            {
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-                         errmsg("invalid input syntax for type %s: \"%s\"",
-                                "double precision", str)));
-            }
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
 
-            PG_RETURN_FLOAT8(ret);
-        }
-        else 
-        {
-            PG_RETURN_FLOAT8(0.0);
-        }
-    }
-    else
-    {
-        PG_RETURN_NULL();
-    }
+	orig_str = TextDatumGetCString(PG_GETARG_DATUM(0));
+	len = strlen(orig_str);
+	while (len > 0 && orig_str[len - 1] == ' ')
+		orig_str[--len] = '\0';
+
+	if (len == 0)
+	{
+		pfree(orig_str);
+		PG_RETURN_FLOAT8(0.0);
+	}
+
+	ret = strtod(orig_str, &endptr);
+	if (*endptr != '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid input syntax for type %s: \"%s\"",
+						"double precision", orig_str)));
+
+	pfree(orig_str);
+	PG_RETURN_FLOAT8(ret);
 }
 
 PG_FUNCTION_INFO_V1(convertTextToInt8);
 Datum
 convertTextToInt8(PG_FUNCTION_ARGS)
 {
-    if (!PG_ARGISNULL(0))
-    {
-        Datum txt = PG_GETARG_DATUM(0);
-        char* str = TextDatumGetCString(txt);
-        int len = strlen(str);
-        if (1 <= len)
-        {
-            int64 ret;
-            for (int i = (len - 1); i >= 0; i--)
-            {
-                if (str[i] != ' ')
-                {
-                    break;
-                }
-                else 
-                {
-                    str[i] = '\0';
-                }
-            }
-            ret = atoll(str);
-            PG_RETURN_INT64(ret);
-        }
-        else 
-        {
-            PG_RETURN_INT64(0);
-        }
-    }
-    else
-    {
-        PG_RETURN_NULL();
-    }
-}
+	char	   *str;
+	int			len;
+	int64		ret;
 
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+
+	str = TextDatumGetCString(PG_GETARG_DATUM(0));
+	len = strlen(str);
+	while (len > 0 && str[len - 1] == ' ')
+		str[--len] = '\0';
+
+	if (len == 0)
+	{
+		pfree(str);
+		PG_RETURN_INT64(0);
+	}
+
+	errno = 0;
+	ret = strtoll(str, NULL, 10);
+	pfree(str);
+	PG_RETURN_INT64(ret);
+}
 
 PG_FUNCTION_INFO_V1(convert_text_to_bigint_for_mysql);
 Datum
 convert_text_to_bigint_for_mysql(PG_FUNCTION_ARGS)
 {
-    if (!PG_ARGISNULL(0))
-    {
-        long ret = 0;
-        Datum txt = PG_GETARG_DATUM(0);
-        char* str = TextDatumGetCString(txt);
-        int len = strlen(str);
-        int digitNum = 0;
-        int dotIndex = -1;
-        int signIndex = -1;
-        bool isNegative = false;
-        bool started = false;
-        for (int i = 0; i < len; i++)
-        {
-            if (str[i] != ' ')
-            {
-                if ('0' <= str[i] && str[i] <= '9')
-                {
-                    ++digitNum;
-                }
-                else 
-                {
-                    if (str[i] == '.') 
-                    {
-                        if (dotIndex == -1)
-                        {
-                            dotIndex = i;
-                        }
-                        else
-                        {
-                            PG_RETURN_NULL();
-                        }
-                    }
-                    else if (str[i] == '+')
-                    {
-                        if (signIndex == -1)
-                        {
-                            signIndex = i;
-                        }
-                        else
-                        {
-                            PG_RETURN_NULL();
-                        }
-                    }
-                    else if (str[i] == '-')
-                    {
-                        isNegative = true;
-                        if (signIndex == -1)
-                        {
-                            signIndex = i;
-                        }
-                        else
-                        {
-                            PG_RETURN_NULL();
-                        }
-                    }
-                    else 
-                    {
-                        PG_RETURN_NULL();
-                    }
-                }
-                started = true;
-            }
-            else 
-            {
-                if (started)
-                {
-                    for (int j = (i + 1); j < len; j++)
-                    {
-                        if (str[j] != ' ')
-                        {
-                            PG_RETURN_NULL();
-                        }
-                    }
-                }
-            }
-        }
-        if (0 < digitNum)
-        {
-            if ((0 <= dotIndex) && (0 <= signIndex))
-            {
-                if (((dotIndex + 1) == signIndex) && 
-                    ((dotIndex - 1) == signIndex))
-                {
-                    PG_RETURN_NULL();
-                }
-            }
+	char	   *str;
+	int			len;
+	int			i = 0;
+	bool		isNegative = false;
+	uint64		uval = 0;
+	uint64		max_abs;
+	int			intDigits = 0;
+	int			fracDigits = 0;
+	char		firstFrac = '0';
+	int64		ret;
 
-            ret = atol(str);
-            if (0 <= dotIndex)
-            {
-                if ('4' < str[dotIndex + 1])
-                {
-                    if (!isNegative)
-                    {
-                        ++ret;
-                    }
-                    else
-                    {
-                        --ret;
-                    }
-                }
-            }
-            PG_RETURN_INT64(ret);
-        }
-        else 
-        {
-            PG_RETURN_NULL();
-        }
-    }
-    else
-    {
-        PG_RETURN_NULL();
-    }
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+
+	str = TextDatumGetCString(PG_GETARG_DATUM(0));
+	len = strlen(str);
+
+	while (i < len && str[i] == ' ')
+		i++;
+
+	if (i < len && (str[i] == '+' || str[i] == '-'))
+	{
+		isNegative = (str[i] == '-');
+		i++;
+	}
+
+	max_abs = isNegative ? ((uint64) PG_INT64_MAX + 1) : (uint64) PG_INT64_MAX;
+
+	while (i < len && isdigit((unsigned char) str[i]))
+	{
+		uint64		d = (uint64) (str[i] - '0');
+
+		if (uval > (max_abs - d) / 10)
+		{
+			pfree(str);
+			PG_RETURN_NULL();
+		}
+		uval = uval * 10 + d;
+		intDigits++;
+		i++;
+	}
+
+	if (i < len && str[i] == '.')
+	{
+		i++;
+		while (i < len && isdigit((unsigned char) str[i]))
+		{
+			if (fracDigits == 0)
+				firstFrac = str[i];
+			fracDigits++;
+			i++;
+		}
+	}
+
+	while (i < len && str[i] == ' ')
+		i++;
+
+	if (i != len || (intDigits + fracDigits) == 0)
+	{
+		pfree(str);
+		PG_RETURN_NULL();
+	}
+
+	pfree(str);
+
+	if (firstFrac >= '5')
+	{
+		if (uval >= max_abs)
+			PG_RETURN_NULL();
+		uval++;
+	}
+
+	if (!isNegative)
+		ret = (int64) uval;
+	else if (uval == 0)
+		ret = 0;
+	else if (uval == (uint64) PG_INT64_MAX + 1)
+		ret = PG_INT64_MIN;
+	else
+		ret = -((int64) uval);
+
+	PG_RETURN_INT64(ret);
 }
 
-
-PG_FUNCTION_INFO_V1(mys_convertTextToFloat8);
-Datum
-mys_convertTextToFloat8(PG_FUNCTION_ARGS)
+static bool
+mys_parse_bitstr_to_uint64(const char *bitData, int bitDataLen, uint64 max_val, uint64 *out)
 {
-    if (!PG_ARGISNULL(0))
-    {
-        /* 未做数据的合法性检查 */
-        Datum txt = PG_GETARG_DATUM(0);
-        char* str = TextDatumGetCString(txt);
-        double ret = atof(str);
+	uint64		acc = 0;
 
-        PG_RETURN_FLOAT8(ret);
-    }
-    else
-    {
-        PG_RETURN_NULL();
-    }
+	for (int i = 0; i < bitDataLen; i++)
+	{
+		uint64		bit = (bitData[i] == '1') ? 1 : 0;
+
+		if (acc > (max_val - bit) / 2)
+			return false;
+		acc = (acc << 1) | bit;
+	}
+	*out = acc;
+	return true;
 }
 
+static bool
+mys_varbit_to_uint64(const VarBit *vb, uint64 max_val, uint64 *out)
+{
+	int			nbits = VARBITLEN(vb);
+	const bits8 *src = VARBITS(vb);
+	uint64		acc = 0;
 
+	for (int i = 0; i < nbits; i++)
+	{
+		uint64		bit = ((src[i / BITS_PER_BYTE] >> (BITS_PER_BYTE - 1 - (i % BITS_PER_BYTE))) & 1);
+
+		if (acc > (max_val - bit) / 2)
+			return false;
+		acc = (acc << 1) | bit;
+	}
+	*out = acc;
+	return true;
+}
 
 PG_FUNCTION_INFO_V1(convertTextVarbitToBigint);
 Datum
 convertTextVarbitToBigint(PG_FUNCTION_ARGS)
 {
-    unsigned long long ret = 0;
-    char *bitData = TextDatumGetCString(PG_GETARG_DATUM(0));
-    int bitDataLen = strlen(bitData);
-    for (int i = 0; i < bitDataLen; i++)
-    {
-        unsigned long long num = 1;
-        if (bitData[i] == '1')
-        {
-            for (int j = 1; j <= (bitDataLen - i - 1); j++)
-            {
-                num = num * 2;
-            }
-            ret += num;
-            if (9223372036854775807 < ret)
-            {
-                /* 
-                 * halo中没有无符号整数，
-                 * 可能导致转换后的十进制溢出
-                 */
-                PG_RETURN_NULL();
-            }
-        }
-    }
-    PG_RETURN_INT64(ret);
-}
+	text	   *txt = PG_GETARG_TEXT_PP(0);
+	uint64		val = 0;
+	bool		ok;
 
+	ok = mys_parse_bitstr_to_uint64(VARDATA_ANY(txt),
+									VARSIZE_ANY_EXHDR(txt),
+									(uint64) PG_INT64_MAX,
+									&val);
+	PG_FREE_IF_COPY(txt, 0);
+	if (!ok)
+		PG_RETURN_NULL();
+	PG_RETURN_INT64((int64) val);
+}
 
 PG_FUNCTION_INFO_V1(convertVarbitToBigint);
 Datum
 convertVarbitToBigint(PG_FUNCTION_ARGS)
 {
-    unsigned long long ret = 0;
-    VarBit *varBit = PG_GETARG_VARBIT_P(0);
-    char *bitData = DatumGetCString(DirectFunctionCall1(bit_out, VarBitPGetDatum(varBit)));
-    int bitDataLen = strlen(bitData);
-    for (int i = 0; i < bitDataLen; i++)
-    {
-        unsigned long long num = 1;
-        if (bitData[i] == '1')
-        {
-            for (int j = 1; j <= (bitDataLen - i - 1); j++)
-            {
-                num = num * 2;
-            }
-            ret += num;
-            if (9223372036854775807 < ret)
-            {
-                /* 
-                 * halo中没有无符号整数，
-                 * 可能导致转换后的十进制溢出
-                 */
-                PG_RETURN_NULL();
-            }
-        }
-    }
-    PG_RETURN_INT64(ret);
-}
+	VarBit	   *vb = PG_GETARG_VARBIT_P(0);
+	uint64		val = 0;
+	bool		ok = mys_varbit_to_uint64(vb, (uint64) PG_INT64_MAX, &val);
 
+	PG_FREE_IF_COPY(vb, 0);
+	if (!ok)
+		PG_RETURN_NULL();
+	PG_RETURN_INT64((int64) val);
+}
 
 PG_FUNCTION_INFO_V1(convertVarbitToInt);
 Datum
 convertVarbitToInt(PG_FUNCTION_ARGS)
 {
-    VarBit *varBit = PG_GETARG_VARBIT_P(0);
-    char *bitData = DatumGetCString(DirectFunctionCall1(bit_out, VarBitPGetDatum(varBit)));
-    int bitDataLen = strlen(bitData);
-    unsigned long ret = 0;
-    for (int i = 0; i < bitDataLen; i++)
-    {
-        unsigned long num = 1;
-        if (bitData[i] == '1')
-        {
-            for (int j = 1; j <= (bitDataLen - i - 1); j++)
-            {
-                num = num * 2;
-            }
-            ret += num;
-            if (2147483647 < ret)
-            {
-                /* 
-                 * halo中没有无符号整数，
-                 * 可能导致转换后的十进制溢出
-                 */
-                PG_RETURN_NULL();
-            }
-        }
-    }
-    PG_RETURN_INT32(ret);
-}
+	VarBit	   *vb = PG_GETARG_VARBIT_P(0);
+	uint64		val = 0;
+	bool		ok = mys_varbit_to_uint64(vb, (uint64) PG_INT32_MAX, &val);
 
+	PG_FREE_IF_COPY(vb, 0);
+	if (!ok)
+		PG_RETURN_NULL();
+	PG_RETURN_INT32((int32) val);
+}
 
 PG_FUNCTION_INFO_V1(convertVarbitToSmallint);
 Datum
 convertVarbitToSmallint(PG_FUNCTION_ARGS)
 {
-    VarBit *varBit = PG_GETARG_VARBIT_P(0);
-    char *bitData = DatumGetCString(DirectFunctionCall1(bit_out, VarBitPGetDatum(varBit)));
-    int bitDataLen = strlen(bitData);
-    unsigned int ret = 0;
-    for (int i = 0; i < bitDataLen; i++)
-    {
-        unsigned int num = 1;
-        if (bitData[i] == '1')
-        {
-            for (int j = 1; j <= (bitDataLen - i - 1); j++)
-            {
-                num = num * 2;
-            }
-            ret += num;
-            if (32767 < ret)
-            {
-                /* 
-                 * halo中没有无符号整数，
-                 * 可能导致转换后的十进制溢出
-                 */
-                PG_RETURN_NULL();
-            }
-        }
-    }
-    PG_RETURN_INT16(ret);
+	VarBit	   *vb = PG_GETARG_VARBIT_P(0);
+	uint64		val = 0;
+	bool		ok = mys_varbit_to_uint64(vb, (uint64) PG_INT16_MAX, &val);
+
+	PG_FREE_IF_COPY(vb, 0);
+	if (!ok)
+		PG_RETURN_NULL();
+	PG_RETURN_INT16((int16) val);
 }
 
+static VarBit *
+mys_int64_to_varbit(int64 val)
+{
+	uint64		uval = (uint64) val;
+	int32		nbits;
+	int32		rlen;
+	int32		bitsleft;
+	VarBit	   *ret;
+	bits8	   *r;
+
+	if (val < 0)
+		nbits = 64;
+	else if (uval == 0)
+		nbits = 1;
+	else
+		nbits = pg_leftmost_one_pos64(uval) + 1;
+
+	rlen = VARBITTOTALLEN(nbits);
+	ret = (VarBit *) palloc0(rlen);
+	SET_VARSIZE(ret, rlen);
+	VARBITLEN(ret) = nbits;
+	r = VARBITS(ret);
+	bitsleft = nbits;
+
+	while (bitsleft >= 8)
+	{
+		*r++ = (bits8) ((uval >> (bitsleft - 8)) & BITMASK);
+		bitsleft -= 8;
+	}
+	if (bitsleft > 0)
+		*r = (bits8) ((uval << (8 - bitsleft)) & BITMASK);
+
+	return ret;
+}
 
 PG_FUNCTION_INFO_V1(convertSmallintToVarbit);
 Datum
 convertSmallintToVarbit(PG_FUNCTION_ARGS)
 {
-	VarBit *ret;
-
-    int32 arg;
-	int32 typmod;
-	int32 rlen;
-	int32 destbitsleft;
-    int32 srcbitsleft;
-	bits8 *r;
-
-    arg = PG_GETARG_INT16(0);
-    if (0 <= arg)
-    {
-        typmod = 0;
-        do
-        {
-            arg = arg / 2;
-            typmod++;
-        } while (arg != 0);
-        arg = PG_GETARG_INT16(0);
-    }
-    else 
-    {
-        typmod = 64;
-    }
-
-    rlen = VARBITTOTALLEN(typmod);
-    ret = (VarBit *) palloc(rlen);
-    SET_VARSIZE(ret, rlen);
-    VARBITLEN(ret) = typmod;
-    r = VARBITS(ret);
-	destbitsleft = typmod;
-	srcbitsleft = 32;
-	/* drop any input bits that don't fit */
-	srcbitsleft = Min(srcbitsleft, destbitsleft);
-	/* sign-fill any excess bytes in output */
-	while (destbitsleft >= (srcbitsleft + 8))
-	{
-		*r++ = (bits8) ((arg < 0) ? BITMASK : 0);
-		destbitsleft -= 8;
-	}
-	/* store first fractional byte */
-	if (destbitsleft > srcbitsleft)
-	{
-		unsigned int val = (unsigned int) (arg >> (destbitsleft - 8));
-
-		/* Force sign-fill in case the compiler implements >> as zero-fill */
-		if (arg < 0)
-        {
-			val |= ((unsigned int) -1) << (srcbitsleft + 8 - destbitsleft);
-        }
-		*r++ = (bits8) (val & BITMASK);
-		destbitsleft -= 8;
-	}
-	/* Now srcbitsleft and destbitsleft are the same, need not track both */
-	/* store whole bytes */
-	while (destbitsleft >= 8)
-	{
-		*r++ = (bits8) ((arg >> (destbitsleft - 8)) & BITMASK);
-		destbitsleft -= 8;
-	}
-	/* store last fractional byte */
-	if (destbitsleft > 0)
-    {
-		*r = (bits8) ((arg << (8 - destbitsleft)) & BITMASK);
-    }
-
-    PG_RETURN_VARBIT_P(ret);
+	PG_RETURN_VARBIT_P(mys_int64_to_varbit((int64) PG_GETARG_INT16(0)));
 }
-
 
 PG_FUNCTION_INFO_V1(convertIntToVarbit);
 Datum
 convertIntToVarbit(PG_FUNCTION_ARGS)
 {
-	VarBit *ret;
-
-    int32 arg;
-	int32 typmod;
-	int32 rlen;
-	int32 destbitsleft;
-    int32 srcbitsleft;
-	bits8 *r;
-
-    arg = PG_GETARG_INT32(0);
-    if (0 <= arg)
-    {
-        typmod = 0;
-        do
-        {
-            arg = arg / 2;
-            typmod++;
-        } while (arg != 0);
-        arg = PG_GETARG_INT32(0);
-    }
-    else 
-    {
-        typmod = 64;
-    }
-
-    rlen = VARBITTOTALLEN(typmod);
-    ret = (VarBit *) palloc(rlen);
-    SET_VARSIZE(ret, rlen);
-    VARBITLEN(ret) = typmod;
-    r = VARBITS(ret);
-	destbitsleft = typmod;
-	srcbitsleft = 32;
-	/* drop any input bits that don't fit */
-	srcbitsleft = Min(srcbitsleft, destbitsleft);
-	/* sign-fill any excess bytes in output */
-	while (destbitsleft >= (srcbitsleft + 8))
-	{
-		*r++ = (bits8) ((arg < 0) ? BITMASK : 0);
-		destbitsleft -= 8;
-	}
-	/* store first fractional byte */
-	if (destbitsleft > srcbitsleft)
-	{
-		unsigned int val = (unsigned int) (arg >> (destbitsleft - 8));
-
-		/* Force sign-fill in case the compiler implements >> as zero-fill */
-		if (arg < 0)
-        {
-			val |= ((unsigned int) -1) << (srcbitsleft + 8 - destbitsleft);
-        }
-		*r++ = (bits8) (val & BITMASK);
-		destbitsleft -= 8;
-	}
-	/* Now srcbitsleft and destbitsleft are the same, need not track both */
-	/* store whole bytes */
-	while (destbitsleft >= 8)
-	{
-		*r++ = (bits8) ((arg >> (destbitsleft - 8)) & BITMASK);
-		destbitsleft -= 8;
-	}
-	/* store last fractional byte */
-	if (destbitsleft > 0)
-    {
-		*r = (bits8) ((arg << (8 - destbitsleft)) & BITMASK);
-    }
-
-    PG_RETURN_VARBIT_P(ret);
+	PG_RETURN_VARBIT_P(mys_int64_to_varbit((int64) PG_GETARG_INT32(0)));
 }
-
 
 PG_FUNCTION_INFO_V1(convertBigintToVarbit);
 Datum
 convertBigintToVarbit(PG_FUNCTION_ARGS)
 {
-	VarBit *ret;
-
-    int64 arg;
-	int32 typmod;
-	int32 rlen;
-	int32 destbitsleft;
-    int32 srcbitsleft;
-	bits8 *r;
-
-    arg = PG_GETARG_INT64(0);
-    if (0 <= arg)
-    {
-        typmod = 0;
-        do
-        {
-            arg = arg / 2;
-            typmod++;
-        } while (arg != 0);
-        arg = PG_GETARG_INT64(0);
-    }
-    else 
-    {
-        typmod = 64;
-    }
-
-    rlen = VARBITTOTALLEN(typmod);
-    ret = (VarBit *) palloc(rlen);
-    SET_VARSIZE(ret, rlen);
-    VARBITLEN(ret) = typmod;
-    r = VARBITS(ret);
-	destbitsleft = typmod;
-	srcbitsleft = 64;
-	/* drop any input bits that don't fit */
-	srcbitsleft = Min(srcbitsleft, destbitsleft);
-	/* Now srcbitsleft and destbitsleft are the same, need not track both */
-	/* store whole bytes */
-	while (destbitsleft >= 8)
-	{
-		*r++ = (bits8) ((arg >> (destbitsleft - 8)) & BITMASK);
-		destbitsleft -= 8;
-	}
-	/* store last fractional byte */
-	if (destbitsleft > 0)
-    {
-		*r = (bits8) ((arg << (8 - destbitsleft)) & BITMASK);
-    }
-
-    PG_RETURN_VARBIT_P(ret);
+	PG_RETURN_VARBIT_P(mys_int64_to_varbit(PG_GETARG_INT64(0)));
 }
-
 
 PG_FUNCTION_INFO_V1(convert_text_to_digit_text_for_mysql);
 Datum
 convert_text_to_digit_text_for_mysql(PG_FUNCTION_ARGS)
 {
-    if (!PG_ARGISNULL(0))
-    {
-        Datum txt = PG_GETARG_DATUM(0);
-        char* str = TextDatumGetCString(txt);
-        int len = strlen(str);
+	char	   *orig_str;
+	char	   *str;
+	int			len;
+	text	   *res;
 
-		if (mys_is_mysql_session())
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+
+	orig_str = TextDatumGetCString(PG_GETARG_DATUM(0));
+	str = orig_str;
+	len = strlen(str);
+
+	if (mys_is_mysql_session())
+	{
+		char	   *end;
+
+		(void) strtod(str, &end);
+		if (end == str)
+			mys_add_warning(1292, "Truncated incorrect DOUBLE value");
+		else
 		{
-			char *end;
-
-			(void) strtod(str, &end);
-			if (end == str)
+			while (isspace((unsigned char) *end))
+				end++;
+			if (*end)
 				mys_add_warning(1292, "Truncated incorrect DOUBLE value");
-			else
-			{
-				while (isspace((unsigned char) *end)) end++;
-				if (*end) mys_add_warning(1292, "Truncated incorrect DOUBLE value");
-			}
 		}
-        if (1 <= len)
-        {
-            convert_to_digit_text_for_mysql(&str, len);
-            PG_RETURN_TEXT_P(cstring_to_text(str));
-        }
-        else 
-        {
-            PG_RETURN_TEXT_P(cstring_to_text("0"));
-        }
-    }
-    else
-    {
-        PG_RETURN_NULL();
-    }
+	}
+
+	if (len >= 1)
+	{
+		convert_to_digit_text_for_mysql(&str, len);
+		res = cstring_to_text(str);
+	}
+	else
+	{
+		res = cstring_to_text("0");
+	}
+
+	pfree(orig_str);
+	PG_RETURN_TEXT_P(res);
 }
 
 PG_FUNCTION_INFO_V1(convert_digit_text_to_text_for_mysql);
 Datum
 convert_digit_text_to_text_for_mysql(PG_FUNCTION_ARGS)
 {
-    if (!PG_ARGISNULL(0))
-    {
-        Datum txt = PG_GETARG_DATUM(0);
-        char* str = TextDatumGetCString(txt);
-        int len = strlen(str);
-        
-        convert_to_text_for_mysql(&str, len);
-        PG_RETURN_TEXT_P(cstring_to_text(str));
-    }
-    else
-    {
-        PG_RETURN_NULL();
-    }
+	char	   *orig_str;
+	char	   *str;
+	int			len;
+	text	   *res;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+
+	orig_str = TextDatumGetCString(PG_GETARG_DATUM(0));
+	str = orig_str;
+	len = strlen(str);
+
+	convert_to_text_for_mysql(&str, len);
+	res = cstring_to_text(str);
+	pfree(orig_str);
+	PG_RETURN_TEXT_P(res);
 }
 
 PG_FUNCTION_INFO_V1(ceil_for_mysql);
 Datum
 ceil_for_mysql(PG_FUNCTION_ARGS)
 {
-    if (!PG_ARGISNULL(0))
-    {
-        Datum txt = PG_GETARG_DATUM(0);
-        char* str = TextDatumGetCString(txt);
-        int len = strlen(str);
-        if (1 <= len)
-        {
-            int64 ret;
-            float8 tmp;
-            convert_to_digit_text_for_mysql(&str, len);
-            tmp = atof(str);
-            ret = ceil(tmp);
-            PG_RETURN_INT64(ret);
-        }
-        else 
-        {
-            PG_RETURN_INT64(0);
-        }
-    }
-    else
-    {
-        PG_RETURN_NULL();
-    }
+	char	   *orig_str;
+	char	   *str;
+	int			len;
+	float8		tmp;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+
+	orig_str = TextDatumGetCString(PG_GETARG_DATUM(0));
+	str = orig_str;
+	len = strlen(str);
+	if (len < 1)
+	{
+		pfree(orig_str);
+		PG_RETURN_INT64(0);
+	}
+
+	convert_to_digit_text_for_mysql(&str, len);
+	tmp = ceil(strtod(str, NULL));
+	pfree(orig_str);
+
+	if (isnan(tmp) || tmp < (float8) PG_INT64_MIN || tmp >= 9223372036854775808.0)
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("bigint out of range")));
+
+	PG_RETURN_INT64((int64) tmp);
 }
 
 PG_FUNCTION_INFO_V1(floor_for_mysql);
 Datum
 floor_for_mysql(PG_FUNCTION_ARGS)
 {
-    if (!PG_ARGISNULL(0))
-    {
-        Datum txt = PG_GETARG_DATUM(0);
-        char* str = TextDatumGetCString(txt);
-        int len = strlen(str);
-        if (1 <= len)
-        {
-            int64 ret;
-            float8 tmp;
-            convert_to_digit_text_for_mysql(&str, len);
-            tmp = atof(str);
-            ret = floor(tmp);
-            PG_RETURN_INT64(ret);
-        }
-        else 
-        {
-            PG_RETURN_INT64(0);
-        }
-    }
-    else
-    {
-        PG_RETURN_NULL();
-    }
+	char	   *orig_str;
+	char	   *str;
+	int			len;
+	float8		tmp;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+
+	orig_str = TextDatumGetCString(PG_GETARG_DATUM(0));
+	str = orig_str;
+	len = strlen(str);
+	if (len < 1)
+	{
+		pfree(orig_str);
+		PG_RETURN_INT64(0);
+	}
+
+	convert_to_digit_text_for_mysql(&str, len);
+	tmp = floor(strtod(str, NULL));
+	pfree(orig_str);
+
+	if (isnan(tmp) || tmp < (float8) PG_INT64_MIN || tmp >= 9223372036854775808.0)
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("bigint out of range")));
+
+	PG_RETURN_INT64((int64) tmp);
 }
-
-//PG_FUNCTION_INFO_V1(mod_ti_for_mysql);
-//Datum
-//mod_ti_for_mysql(PG_FUNCTION_ARGS)
-//{
-//    if (!PG_ARGISNULL(0))
-//    {
-//        Datum txt = PG_GETARG_DATUM(0);
-//        char* str = TextDatumGetCString(txt);
-//        int len = strlen(str);
-//        int64 divisor = PG_GETARG_INT64(1);
-//        if (1 <= len)
-//        {
-//            if (divisor != 0)
-//            {
-//                float8 ret;
-//                float8 dividend;
-//                convert_to_digit_text_for_mysql(&str, len);
-//                dividend = atof(str);
-//                ret = dividend % (float8)divisor;
-//                PG_RETURN_FLOAT8(ret);
-//            }
-//            else 
-//            {
-//                PG_RETURN_NULL();
-//            }
-//        }
-//        else 
-//        {
-//            PG_RETURN_NULL();
-//        }
-//    }
-//    else
-//    {
-//        PG_RETURN_NULL();
-//    }
-//}
-//
-//PG_FUNCTION_INFO_V1(mod_it_for_mysql);
-//Datum
-//mod_it_for_mysql(PG_FUNCTION_ARGS)
-//{
-//    if (!PG_ARGISNULL(0))
-//    {
-//        int64 dividend = PG_GETARG_INT64(0);
-//        Datum txt = PG_GETARG_DATUM(1);
-//        char* str = TextDatumGetCString(txt);
-//        int len = strlen(str);
-//        if (1 <= len)
-//        {
-//            float8 ret;
-//            float8 divisor;
-//            convert_to_digit_text_for_mysql(&str, len);
-//            divisor = atof(str);
-//            if (divisor != 0)
-//            {
-//                ret = dividend % divisor;
-//                PG_RETURN_FLOAT8(ret);
-//            }
-//            else 
-//            {
-//                PG_RETURN_NULL();
-//            }
-//        }
-//        else 
-//        {
-//            PG_RETURN_NULL();
-//        }
-//    }
-//    else
-//    {
-//        PG_RETURN_NULL();
-//    }
-//}
-//
-//PG_FUNCTION_INFO_V1(mod_tn_for_mysql);
-//Datum
-//mod_tn_for_mysql(PG_FUNCTION_ARGS)
-//{
-//    if (!PG_ARGISNULL(0))
-//    {
-//        Datum txt = PG_GETARG_DATUM(0);
-//        char* str = TextDatumGetCString(txt);
-//        int len = strlen(str);
-//        float8 divisor = PG_GETARG_FLOAT8(1);
-//        if (1 <= len)
-//        {
-//            if (divisor != 0)
-//            {
-//                float8 ret;
-//                float8 dividend;
-//                convert_to_digit_text_for_mysql(&str, len);
-//                dividend = atof(str);
-//                ret = dividend % divisor;
-//                PG_RETURN_FLOAT8(ret);
-//            }
-//            else 
-//            {
-//                PG_RETURN_NULL();
-//            }
-//        }
-//        else 
-//        {
-//            PG_RETURN_NULL();
-//        }
-//    }
-//    else
-//    {
-//        PG_RETURN_NULL();
-//    }
-//}
-//
-//PG_FUNCTION_INFO_V1(mod_nt_for_mysql);
-//Datum
-//mod_nt_for_mysql(PG_FUNCTION_ARGS)
-//{
-//    if (!PG_ARGISNULL(0))
-//    {
-//        float8 dividend = PG_GETARG_FLOAT8(0);
-//        Datum txt = PG_GETARG_DATUM(1);
-//        char* str = TextDatumGetCString(txt);
-//        int len = strlen(str);
-//        if (1 <= len)
-//        {
-//            float8 ret;
-//            float8 divisor;
-//            convert_to_digit_text_for_mysql(&str, len);
-//            divisor = atof(str);
-//            if (divisor != 0)
-//            {
-//                ret = dividend % divisor;
-//                PG_RETURN_FLOAT8(ret);
-//            }
-//            else 
-//            {
-//                PG_RETURN_NULL();
-//            }
-//        }
-//        else 
-//        {
-//            PG_RETURN_NULL();
-//        }
-//    }
-//    else
-//    {
-//        PG_RETURN_NULL();
-//    }
-//}
-//
-//PG_FUNCTION_INFO_V1(mod_tt_for_mysql);
-//Datum
-//mod_tt_for_mysql(PG_FUNCTION_ARGS)
-//{
-//    if (!PG_ARGISNULL(0))
-//    {
-//        Datum txt1 = PG_GETARG_DATUM(0);
-//        char* str1 = TextDatumGetCString(txt1);
-//        int len1 = strlen(str1);
-//        Datum txt2 = PG_GETARG_DATUM(1);
-//        char* str2 = TextDatumGetCString(txt2);
-//        int len2 = strlen(str2);
-//        if ((1 <= len1) && (1 <= len2))
-//        {
-//            float8 dividend;
-//            float8 divisor;
-//            convert_to_digit_text_for_mysql(&str1, len1);
-//            dividend = atof(str1);
-//            convert_to_digit_text_for_mysql(&str2, len2);
-//            divisor = atof(str2);
-//
-//            if (divisor != 0)
-//            {
-//                float8 ret;
-//                ret = dividend % divisor;
-//                PG_RETURN_FLOAT8(ret);
-//            }
-//            else 
-//            {
-//                PG_RETURN_NULL();
-//            }
-//        }
-//        else 
-//        {
-//            PG_RETURN_NULL();
-//        }
-//    }
-//    else
-//    {
-//        PG_RETURN_NULL();
-//    }
-//}
-
 
 PG_FUNCTION_INFO_V1(mys_bit_to_text);
 Datum
 mys_bit_to_text(PG_FUNCTION_ARGS)
 {
-    if (!PG_ARGISNULL(0))
-    {
-        VarBit *s = PG_GETARG_VARBIT_P(0);
-        char *bitData = DatumGetCString(DirectFunctionCall1(bit_out, VarBitPGetDatum(s)));
-        int bitLen = VARBITLEN(s);
-        int needPrePadBitNum = VARBITPAD(s);
-        int byteLen = VARBITBYTES(s);
-        text *result = (text *) palloc0(byteLen + VARHDRSZ);
-        bits8 *textData;
-        int i;
+	VarBit	   *s;
+	int			bitLen;
+	int			nbytes;
+	int			shift;
+	const bits8 *src;
+	text	   *result;
+	bits8	   *dst;
 
-        SET_VARSIZE(result, byteLen + VARHDRSZ);
-        textData = (bits8 *)VARDATA(result);
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
 
-        if (bitLen != 0)
-        {
-            int j;
-            bool saw_non_ascii = false;
+	s = PG_GETARG_VARBIT_P(0);
+	bitLen = VARBITLEN(s);
+	nbytes = VARBITBYTES(s);
+	shift = nbytes * BITS_PER_BYTE - bitLen;
+	src = VARBITS(s);
+	result = (text *) palloc0(VARHDRSZ + nbytes);
+	dst = (bits8 *) VARDATA(result);
 
-            for (i = 0; i < (BITS_PER_BYTE - needPrePadBitNum); i++)
-            {
-                textData[0] = textData[0] * 2 + (bitData[i] - '0');
-            }
-            if (textData[0] == '\0' || IS_HIGHBIT_SET(textData[0]))
-				saw_non_ascii = true;
+	SET_VARSIZE(result, VARHDRSZ + nbytes);
+	if (bitLen != 0)
+	{
+		if (shift == 0)
+			memcpy(dst, src, nbytes);
+		else
+		{
+			bits8		carry = 0;
 
-            for (j = 1; j < byteLen; j++)
-            {
-                int end = i + BITS_PER_BYTE;
-                for (; i < end; i++)
-                {
-                    textData[j] = textData[j] * 2 + (bitData[i] - '0');
-                }
-                if (textData[j] == '\0' || IS_HIGHBIT_SET(textData[j]))
-				    saw_non_ascii = true;
-            }
-            if (saw_non_ascii)
-            {
-                pg_verifymbstr((const char *)textData, byteLen, false);
-            }
-        }
-        PG_RETURN_TEXT_P(result);
-    }
-    else
-    {
-        PG_RETURN_NULL();
-    }
+			for (int i = 0; i < nbytes; i++)
+			{
+				dst[i] = carry | (src[i] >> shift);
+				carry = (bits8) (src[i] << (BITS_PER_BYTE - shift));
+			}
+		}
+
+		for (int i = 0; i < nbytes; i++)
+		{
+			if (dst[i] == '\0' || IS_HIGHBIT_SET(dst[i]))
+			{
+				pg_verifymbstr((const char *) dst, nbytes, false);
+				break;
+			}
+		}
+	}
+
+	PG_FREE_IF_COPY(s, 0);
+	PG_RETURN_TEXT_P(result);
 }
 
-
 PG_FUNCTION_INFO_V1(cast_bittext_to_bytea);
-/*
- * BIT -> bytea (X'..', 0x.., b'..' literals stored into binary columns): the
- * bits right-aligned in whole bytes, as in MySQL (0xabc = 0x0abc, b'1' = 0x01)
- */
 Datum
 cast_bittext_to_bytea(PG_FUNCTION_ARGS)
 {
-	VarBit     *s = PG_GETARG_VARBIT_P(0);
-	int         nbytes = VARBITBYTES(s);
-	int         shift = nbytes * BITS_PER_BYTE - VARBITLEN(s);
+	VarBit	   *s = PG_GETARG_VARBIT_P(0);
+	int			nbytes = VARBITBYTES(s);
+	int			shift = nbytes * BITS_PER_BYTE - VARBITLEN(s);
 	const bits8 *src = VARBITS(s);
-	bytea      *result = palloc(VARHDRSZ + nbytes);
-	bits8      *dst = (bits8 *) VARDATA(result);
+	bytea	   *result = palloc(VARHDRSZ + nbytes);
+	bits8	   *dst = (bits8 *) VARDATA(result);
 
 	SET_VARSIZE(result, VARHDRSZ + nbytes);
 	if (shift == 0)
 		memcpy(dst, src, nbytes);
 	else
 	{
-		/* VarBit keeps the bits left-aligned: shift them right */
-		bits8       carry = 0;
+		bits8		carry = 0;
 
 		for (int i = 0; i < nbytes; i++)
 		{
@@ -1586,106 +914,58 @@ cast_bittext_to_bytea(PG_FUNCTION_ARGS)
 			carry = (bits8) (src[i] << (BITS_PER_BYTE - shift));
 		}
 	}
+
+	PG_FREE_IF_COPY(s, 0);
 	PG_RETURN_BYTEA_P(result);
 }
 
-/*
- * text_substring -
- *	Does the real work for text_substr() and text_substr_no_len()
- *
- *	This is broken out so it can be called directly by other string processing
- *	functions.  Note that the argument is passed as a Datum, to indicate that
- *	it may still be in compressed/toasted form.  We can avoid detoasting all
- *	of it in some cases.
- *
- *	The result is always a freshly palloc'd datum.
- */
 static text *
 text_substring(Datum str, int32 start, int32 length, bool length_not_specified)
 {
-    int32		eml = pg_database_encoding_max_length();
-    int32		S = start;		/* start position */
-	int32		S1;				/* adjusted start position */
-	int32		L1;				/* adjusted substring length */
-	int32		E;				/* end position */
-    int len;
+	int32		eml = pg_database_encoding_max_length();
+	int32		S = start;
+	int32		S1;
+	int32		L1;
+	int32		E;
+	int			len;
 
-	/*
-	 * SQL99 says S can be zero or negative, but we still must fetch from the
-	 * start of the string.
-	 */
-	//S1 = Max(S, 1);
+	len = DatumGetInt32(DirectFunctionCall1(textlen, str));
 
-    len = DatumGetInt32(DirectFunctionCall1(textlen, str));
+	if (start == 0 || (start < 0 && (int64) len < -(int64) start))
+		return cstring_to_text("");
+	if (!length_not_specified && length <= 0)
+		return cstring_to_text("");
 
-    if ((start == 0) || 
-        ((start < 0) && (len < -start)))
-    {
-        return cstring_to_text("");
-    }
-    if (!length_not_specified && (length <= 0))
-    {
-        return cstring_to_text("");
-    }
-    //length = length < 0 ? 0 : length;
+	if (start < 0)
+		S = len + 1 + start;
 
-    if (start < 0)
-    {
-        S = len + 1 + start;
-    }
+	S1 = Max(S, 1);
 
-    S1 = Max(S, 1);
-
-	/* life is easy if the encoding max length is 1 */
 	if (eml == 1)
 	{
-		if (length_not_specified)	/* special case - get length to end of
-									 * string */
+		if (length_not_specified)
 			L1 = -1;
 		else if (length < 0)
 		{
-			/* SQL99 says to throw an error for E < S, i.e., negative length */
 			ereport(ERROR,
 					(errcode(ERRCODE_SUBSTRING_ERROR),
 					 errmsg("negative substring length not allowed")));
-			L1 = -1;			/* silence stupider compilers */
-		}
-		else if (pg_add_s32_overflow(S, length, &E))
-		{
-			/*
-			 * L could be large enough for S + L to overflow, in which case
-			 * the substring must run to end of string.
-			 */
 			L1 = -1;
 		}
+		else if (pg_add_s32_overflow(S, length, &E))
+			L1 = -1;
 		else
 		{
-			/*
-			 * A zero or negative value for the end position can happen if the
-			 * start was negative or one. SQL99 says to return a zero-length
-			 * string.
-			 */
 			if (E < 1)
 				return cstring_to_text("");
-
 			L1 = E - S1;
 		}
 
-		/*
-		 * If the start position is past the end of the string, SQL99 says to
-		 * return a zero-length string -- DatumGetTextPSlice() will do that
-		 * for us.  We need only convert S1 to zero-based starting position.
-		 */
 		return DatumGetTextPSlice(str, S1 - 1, L1);
 	}
 	else if (eml > 1)
 	{
-		/*
-		 * When encoding max length is > 1, we can't get LC without
-		 * detoasting, so we'll grab a conservatively large slice now and go
-		 * back later to do the right thing
-		 */
-		int32		slice_start;
+		int32		slice_start = 0;
 		int32		slice_size;
 		int32		slice_strlen;
 		text	   *slice;
@@ -1695,68 +975,32 @@ text_substring(Datum str, int32 start, int32 length, bool length_not_specified)
 		char	   *s;
 		text	   *ret;
 
-		/*
-		 * We need to start at position zero because there is no way to know
-		 * in advance which byte offset corresponds to the supplied start
-		 * position.
-		 */
-		slice_start = 0;
-
-		if (length_not_specified)	/* special case - get length to end of
-									 * string */
+		if (length_not_specified)
 			slice_size = L1 = -1;
 		else if (length < 0)
 		{
-			/* SQL99 says to throw an error for E < S, i.e., negative length */
 			ereport(ERROR,
 					(errcode(ERRCODE_SUBSTRING_ERROR),
 					 errmsg("negative substring length not allowed")));
-			slice_size = L1 = -1;	/* silence stupider compilers */
-		}
-		else if (pg_add_s32_overflow(S, length, &E))
-		{
-			/*
-			 * L could be large enough for S + L to overflow, in which case
-			 * the substring must run to end of string.
-			 */
 			slice_size = L1 = -1;
 		}
+		else if (pg_add_s32_overflow(S, length, &E))
+			slice_size = L1 = -1;
 		else
 		{
-			/*
-			 * A zero or negative value for the end position can happen if the
-			 * start was negative or one. SQL99 says to return a zero-length
-			 * string.
-			 */
 			if (E < 1)
 				return cstring_to_text("");
-
-			/*
-			 * if E is past the end of the string, the tuple toaster will
-			 * truncate the length for us
-			 */
 			L1 = E - S1;
-
-			/*
-			 * Total slice size in bytes can't be any longer than the start
-			 * position plus substring length times the encoding max length.
-			 * If that overflows, we can just use -1.
-			 */
 			if (pg_mul_s32_overflow(E, eml, &slice_size))
 				slice_size = -1;
 		}
 
-		/*
-		 * If we're working with an untoasted source, no need to do an extra
-		 * copying step.
-		 */
 		if (VARATT_IS_COMPRESSED(DatumGetPointer(str)) ||
 			VARATT_IS_EXTERNAL(DatumGetPointer(str)))
 			slice = DatumGetTextPSlice(str, slice_start, slice_size);
 		else
 			slice = (text *) DatumGetPointer(str);
 
-		/* see if we got back an empty string */
 		if (VARSIZE_ANY_EXHDR(slice) == 0)
 		{
 			if (slice != (text *) DatumGetPointer(str))
@@ -1764,14 +1008,9 @@ text_substring(Datum str, int32 start, int32 length, bool length_not_specified)
 			return cstring_to_text("");
 		}
 
-		/* Now we can get the actual length of the slice in MB characters */
 		slice_strlen = pg_mbstrlen_with_len(VARDATA_ANY(slice),
 											VARSIZE_ANY_EXHDR(slice));
 
-		/*
-		 * Check that the start position wasn't > slice_strlen. If so, SQL99
-		 * says to return a zero-length string.
-		 */
 		if (S1 > slice_strlen)
 		{
 			if (slice != (text *) DatumGetPointer(str))
@@ -1779,29 +1018,16 @@ text_substring(Datum str, int32 start, int32 length, bool length_not_specified)
 			return cstring_to_text("");
 		}
 
-		/*
-		 * Adjust L1 and E1 now that we know the slice string length. Again
-		 * remember that S1 is one based, and slice_start is zero based.
-		 */
 		if (L1 > -1)
 			E1 = Min(S1 + L1, slice_start + 1 + slice_strlen);
 		else
 			E1 = slice_start + 1 + slice_strlen;
 
-		/*
-		 * Find the start position in the slice; remember S1 is not zero based
-		 */
 		p = VARDATA_ANY(slice);
 		for (i = 0; i < S1 - 1; i++)
 			p += pg_mblen(p);
 
-		/* hang onto a pointer to our start position */
 		s = p;
-
-		/*
-		 * Count the actual bytes used by the substring of the requested
-		 * length.
-		 */
 		for (i = S1; i < E1; i++)
 			p += pg_mblen(p);
 
@@ -1817,54 +1043,45 @@ text_substring(Datum str, int32 start, int32 length, bool length_not_specified)
 	else
 		elog(ERROR, "invalid backend encoding: encoding max length < 1");
 
-	/* not reached: suppress compiler warning */
 	return NULL;
 }
 
 PG_FUNCTION_INFO_V1(text_concat);
-
 Datum
 text_concat(PG_FUNCTION_ARGS)
 {
-	text	   *result;
+	text	   *result = concat_internal("", 0, fcinfo, false);
 
-	result = concat_internal("", 0, fcinfo);
 	if (result == NULL)
 		PG_RETURN_NULL();
 	PG_RETURN_TEXT_P(result);
 }
 
 PG_FUNCTION_INFO_V1(text_concat_ws);
-
 Datum
 text_concat_ws(PG_FUNCTION_ARGS)
 {
-    char *sep;
-	text *result;
+	text	   *sep_txt;
+	char	   *sep;
+	text	   *result;
 
-    /* return NULL when separator is NULL */
 	if (PG_ARGISNULL(0))
 		PG_RETURN_NULL();
-	sep = text_to_cstring(PG_GETARG_TEXT_PP(0));
 
-	result = concat_ws_internal(sep, 1, fcinfo);
+	sep_txt = PG_GETARG_TEXT_PP(0);
+	sep = text_to_cstring(sep_txt);
+	PG_FREE_IF_COPY(sep_txt, 0);
+
+	result = concat_internal(sep, 1, fcinfo, true);
+	pfree(sep);
+
 	if (result == NULL)
 		PG_RETURN_NULL();
 	PG_RETURN_TEXT_P(result);
 }
 
-/*
- * Implementation of both concat() and concat_ws().
- *
- * sepstr is the separator string to place between values.
- * argidx identifies the first argument to concatenate (counting from zero);
- * note that this must be constant across any one series of calls.
- *
- * Returns NULL if result should be NULL, else text value.
- */
 static text *
-concat_internal(const char *sepstr, int argidx,
-				FunctionCallInfo fcinfo)
+concat_internal(const char *sepstr, int argidx, FunctionCallInfo fcinfo, bool skip_nulls)
 {
 	text	   *result;
 	StringInfoData str;
@@ -1872,10 +1089,8 @@ concat_internal(const char *sepstr, int argidx,
 	bool		first_arg = true;
 	int			i;
 
-	/* Normal case without explicit VARIADIC marker */
 	initStringInfo(&str);
 
-	/* Get output function info, building it if first time through */
 	foutcache = (FmgrInfo *) fcinfo->flinfo->fn_extra;
 	if (foutcache == NULL)
 		foutcache = build_concat_foutcache(fcinfo, argidx);
@@ -1884,96 +1099,39 @@ concat_internal(const char *sepstr, int argidx,
 	{
 		if (!PG_ARGISNULL(i))
 		{
-			Datum value = PG_GETARG_DATUM(i);
-            Oid valtype = get_fn_expr_argtype(fcinfo->flinfo, i);
-			Oid valBaseType = mys_binary_base_type(valtype);
+			Datum		value = PG_GETARG_DATUM(i);
+			Oid			valtype = get_fn_expr_argtype(fcinfo->flinfo, i);
+			Oid			valBaseType = mys_binary_base_type(valtype);
 
-			/* add separator if appropriate */
 			if (first_arg)
 				first_arg = false;
 			else
 				appendStringInfoString(&str, sepstr);
 
-			/* call the appropriate type output function, append the result */
-            if (valBaseType != BYTEAOID)
-            {
-                appendStringInfoString(&str,
-                                       OutputFunctionCall(&foutcache[i], value));
-            }
-            else
-            {
-                bytea *vlena = DatumGetByteaPP(value);
-                char *byte = VARDATA_ANY(vlena);
-                size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
+			if (valBaseType != BYTEAOID)
+			{
+				char	   *out = OutputFunctionCall(&foutcache[i], value);
 
-                pg_verifymbstr(byte, byteLen, false);
-                appendBinaryStringInfo(&str, byte, byteLen);
-            }
+				appendStringInfoString(&str, out);
+				pfree(out);
+			}
+			else
+			{
+				bytea	   *vlena = DatumGetByteaPP(value);
+				char	   *byte = VARDATA_ANY(vlena);
+				size_t		byteLen = VARSIZE_ANY_EXHDR(vlena);
+
+				pg_verifymbstr(byte, (int) byteLen, false);
+				appendBinaryStringInfo(&str, byte, byteLen);
+				if ((Pointer) vlena != DatumGetPointer(value))
+					pfree(vlena);
+			}
 		}
-        else
-        {
-            pfree(str.data);
-            return NULL;
-        }
-	}
-
-	result = cstring_to_text_with_len(str.data, str.len);
-	pfree(str.data);
-
-	return result;
-}
-
-static text *
-concat_ws_internal(const char *sepstr, int argidx, FunctionCallInfo fcinfo)
-{
-	text	   *result;
-	StringInfoData str;
-	FmgrInfo   *foutcache;
-	bool		first_arg = true;
-	int			i;
-
-	/* Normal case without explicit VARIADIC marker */
-	initStringInfo(&str);
-
-	/* Get output function info, building it if first time through */
-	foutcache = (FmgrInfo *) fcinfo->flinfo->fn_extra;
-	if (foutcache == NULL)
-		foutcache = build_concat_foutcache(fcinfo, argidx);
-
-	for (i = argidx; i < PG_NARGS(); i++)
-	{
-		if (!PG_ARGISNULL(i))
+		else if (!skip_nulls)
 		{
-			Datum value = PG_GETARG_DATUM(i);
-            Oid valtype = get_fn_expr_argtype(fcinfo->flinfo, i);
-			Oid valBaseType = mys_binary_base_type(valtype);
-
-			/* add separator if appropriate */
-			if (first_arg)
-				first_arg = false;
-			else
-				appendStringInfoString(&str, sepstr);
-
-			/* call the appropriate type output function, append the result */
-            if (valBaseType != BYTEAOID)
-            {
-                appendStringInfoString(&str,
-                                       OutputFunctionCall(&foutcache[i], value));
-            }
-            else
-            {
-                bytea *vlena = DatumGetByteaPP(value);
-                char *byte = VARDATA_ANY(vlena);
-                size_t byteLen = VARSIZE_ANY_EXHDR(vlena);
-
-                pg_verifymbstr(byte, byteLen, false);
-                appendBinaryStringInfo(&str, byte, byteLen);
-            }
+			pfree(str.data);
+			return NULL;
 		}
-        else
-        {
-            continue;
-        }
 	}
 
 	result = cstring_to_text_with_len(str.data, str.len);
@@ -1981,39 +1139,52 @@ concat_ws_internal(const char *sepstr, int argidx, FunctionCallInfo fcinfo)
 
 	return result;
 }
-/*
- * Prepare cache with fmgr info for the output functions of the datatypes of
- * the arguments of a concat-like function, beginning with argument "argidx".
- * (Arguments before that will have corresponding slots in the resulting
- * FmgrInfo array, but we don't fill those slots.)
- */
+
 static FmgrInfo *
 build_concat_foutcache(FunctionCallInfo fcinfo, int argidx)
 {
 	FmgrInfo   *foutcache;
+	int			nargs = PG_NARGS();
 	int			i;
 
-	/* We keep the info in fn_mcxt so it survives across calls */
 	foutcache = (FmgrInfo *) MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-												PG_NARGS() * sizeof(FmgrInfo));
+												Max(nargs, 1) * sizeof(FmgrInfo));
 
-	for (i = argidx; i < PG_NARGS(); i++)
+	for (i = argidx; i < nargs; i++)
 	{
-		Oid			valtype;
+		Oid			valtype = get_fn_expr_argtype(fcinfo->flinfo, i);
 		Oid			typOutput;
 		bool		typIsVarlena;
 
-		valtype = get_fn_expr_argtype(fcinfo->flinfo, i);
 		if (!OidIsValid(valtype))
-			elog(ERROR, "could not determine data type of concat() input");
+			ereport(ERROR,
+					(errcode(ERRCODE_INDETERMINATE_DATATYPE),
+					 errmsg("could not determine data type of concat() input")));
 
 		getTypeOutputInfo(valtype, &typOutput, &typIsVarlena);
 		fmgr_info_cxt(typOutput, &foutcache[i], fcinfo->flinfo->fn_mcxt);
 	}
 
 	fcinfo->flinfo->fn_extra = foutcache;
-
 	return foutcache;
+}
+
+static text *
+ascii_lower_copy(const text *src)
+{
+	int			len = VARSIZE_ANY_EXHDR(src);
+	const char *s = VARDATA_ANY(src);
+	text	   *dst = (text *) palloc(VARHDRSZ + len);
+	char	   *d = VARDATA(dst);
+
+	SET_VARSIZE(dst, VARHDRSZ + len);
+	for (int i = 0; i < len; i++)
+	{
+		unsigned char c = (unsigned char) s[i];
+
+		d[i] = (c >= 'A' && c <= 'Z') ? (char) (c + ('a' - 'A')) : (char) c;
+	}
+	return dst;
 }
 
 static int
@@ -2021,52 +1192,46 @@ text_position(text *t1, text *t2, Oid collid)
 {
 	TextPositionState state;
 	int			result;
-    char *backupBuf1 = NULL;
-    char *backupBuf2 = NULL;
-    bool lowered = false;
+	text	   *s1 = t1;
+	text	   *s2 = t2;
+	bool		copied = false;
 
-	/* Empty needle always matches at position 1 */
 	if (VARSIZE_ANY_EXHDR(t2) < 1)
 		return 1;
-
-	/* Otherwise, can't match if haystack is shorter than needle */
 	if (VARSIZE_ANY_EXHDR(t1) < VARSIZE_ANY_EXHDR(t2))
 		return 0;
 
-    if (collid == getCaseInsensitiveId())
-    {
-        lowered = lowerStrs(t1, t2, &backupBuf1, &backupBuf2);
-        collid = 100;   /* 临时修改collid，绕过nondeterministic collations are not supported for substring searches错误*/
-    }
-    else 
-    {
-        /* do nothing; */
-    }
+	if (collid == getCaseInsensitiveId())
+	{
+		s1 = ascii_lower_copy(t1);
+		s2 = ascii_lower_copy(t2);
+		copied = true;
+		collid = C_COLLATION_OID;
+	}
 
-	text_position_setup(t1, t2, collid, &state);
+	text_position_setup(s1, s2, collid, &state);
 	if (!text_position_next(collid, &state))
 		result = 0;
 	else
 		result = text_position_get_match_pos(&state);
 
-    if (lowered)
-    {
-        restoreStrs(backupBuf1, backupBuf2, t1, t2);
-    }
+	if (copied)
+	{
+		pfree(s1);
+		pfree(s2);
+	}
 
-    text_position_cleanup(&state);
-    return result;
+	return result;
 }
-
 
 static void
 text_position_setup(text *t1, text *t2, Oid collid, TextPositionState *state)
 {
 	int			len1 = VARSIZE_ANY_EXHDR(t1);
 	int			len2 = VARSIZE_ANY_EXHDR(t2);
-	pg_locale_t mylocale = 0;
+	pg_locale_t mylocale = NULL;
 
-	check_collation_set(collid);
+	check_collation_set_local(collid);
 
 	if (!lc_collate_is_c(collid) && collid != DEFAULT_COLLATION_OID)
 		mylocale = pg_newlocale_from_collation(collid);
@@ -2079,15 +1244,6 @@ text_position_setup(text *t1, text *t2, Oid collid, TextPositionState *state)
 	Assert(len1 > 0);
 	Assert(len2 > 0);
 
-	/*
-	 * Even with a multi-byte encoding, we perform the search using the raw
-	 * byte sequence, ignoring multibyte issues.  For UTF-8, that works fine,
-	 * because in UTF-8 the byte sequence of one character cannot contain
-	 * another character.  For other multi-byte encodings, we do the search
-	 * initially as a simple byte search, ignoring multibyte issues, but
-	 * verify afterwards that the match we found is at a character boundary,
-	 * and continue the search if it was a false match.
-	 */
 	if (pg_database_encoding_max_length() == 1)
 	{
 		state->is_multibyte = false;
@@ -2111,18 +1267,8 @@ text_position_setup(text *t1, text *t2, Oid collid, TextPositionState *state)
 	state->last_match = NULL;
 	state->refpoint = state->str1;
 	state->refpos = 0;
-    state->skiptablemask = 255;
+	state->skiptablemask = 255;
 
-	/*
-	 * Prepare the skip table for Boyer-Moore-Horspool searching.  In these
-	 * notes we use the terminology that the "haystack" is the string to be
-	 * searched (t1) and the "needle" is the pattern being sought (t2).
-	 *
-	 * If the needle is empty or bigger than the haystack then there is no
-	 * point in wasting cycles initializing the table.  We also choose not to
-	 * use B-M-H for needles of length 1, since the skip table can't possibly
-	 * save anything in that case.
-	 */
 	if (len1 >= len2 && len2 > 1)
 	{
 		int			searchlength = len1 - len2;
@@ -2131,18 +1277,6 @@ text_position_setup(text *t1, text *t2, Oid collid, TextPositionState *state)
 		int			i;
 		const char *str2 = state->str2;
 
-		/*
-		 * First we must determine how much of the skip table to use.  The
-		 * declaration of TextPositionState allows up to 256 elements, but for
-		 * short search problems we don't really want to have to initialize so
-		 * many elements --- it would take too long in comparison to the
-		 * actual search time.  So we choose a useful skip table size based on
-		 * the haystack length minus the needle length.  The closer the needle
-		 * length is to the haystack length the less useful skipping becomes.
-		 *
-		 * Note: since we use bit-masking to select table elements, the skip
-		 * table size MUST be a power of 2, and so the mask must be 2^N-1.
-		 */
 		if (searchlength < 16)
 			skiptablemask = 3;
 		else if (searchlength < 64)
@@ -2159,36 +1293,15 @@ text_position_setup(text *t1, text *t2, Oid collid, TextPositionState *state)
 			skiptablemask = 255;
 		state->skiptablemask = skiptablemask;
 
-		/*
-		 * Initialize the skip table.  We set all elements to the needle
-		 * length, since this is the correct skip distance for any character
-		 * not found in the needle.
-		 */
 		for (i = 0; i <= skiptablemask; i++)
 			state->skiptable[i] = len2;
 
-		/*
-		 * Now examine the needle.  For each character except the last one,
-		 * set the corresponding table element to the appropriate skip
-		 * distance.  Note that when two characters share the same skip table
-		 * entry, the one later in the needle must determine the skip
-		 * distance.
-		 */
 		last = len2 - 1;
-
 		for (i = 0; i < last; i++)
 			state->skiptable[(unsigned char) str2[i] & skiptablemask] = last - i;
 	}
 }
 
-/*
- * Advance to the next match, starting from the end of the previous match
- * (or the beginning of the string, on first call).  Returns true if a match
- * is found.
- *
- * Note that this refuses to match an empty-string needle.  Most callers
- * will have handled that case specially and we'll never see it here.
- */
 static bool
 text_position_next(Oid collid, TextPositionState *state)
 {
@@ -2197,9 +1310,8 @@ text_position_next(Oid collid, TextPositionState *state)
 	char	   *matchptr;
 
 	if (needle_len <= 0)
-		return false;			/* result for empty pattern */
+		return false;
 
-	/* Start from the point right after the previous match. */
 	if (state->last_match)
 		start_ptr = state->last_match + needle_len;
 	else
@@ -2207,35 +1319,18 @@ text_position_next(Oid collid, TextPositionState *state)
 
 retry:
 	matchptr = text_position_next_internal(collid, start_ptr, state);
-
 	if (!matchptr)
 		return false;
 
-	/*
-	 * Found a match for the byte sequence.  If this is a multibyte encoding,
-	 * where one character's byte sequence can appear inside a longer
-	 * multi-byte character, we need to verify that the match was at a
-	 * character boundary, not in the middle of a multi-byte character.
-	 */
 	if (state->is_multibyte_char_in_char)
 	{
-		/* Walk one character at a time, until we reach the match. */
-
-		/* the search should never move backwards. */
 		Assert(state->refpoint <= matchptr);
 
 		while (state->refpoint < matchptr)
 		{
-			/* step to next character. */
 			state->refpoint += pg_mblen(state->refpoint);
 			state->refpos++;
 
-			/*
-			 * If we stepped over the match's start position, then it was a
-			 * false positive, where the byte sequence appeared in the middle
-			 * of a multi-byte character.  Skip it, and continue the search at
-			 * the next character boundary.
-			 */
 			if (state->refpoint > matchptr)
 			{
 				start_ptr = state->refpoint;
@@ -2248,11 +1343,6 @@ retry:
 	return true;
 }
 
-/*
- * Subroutine of text_position_next().  This searches for the raw byte
- * sequence, ignoring any multi-byte encoding issues.  Returns the first
- * match starting at 'start_ptr', or NULL if no match is found.
- */
 static char *
 text_position_next_internal(Oid collid, char *start_ptr, TextPositionState *state)
 {
@@ -2268,104 +1358,36 @@ text_position_next_internal(Oid collid, char *start_ptr, TextPositionState *stat
 
 	if (needle_len == 1)
 	{
-		/* No point in using B-M-H for a one-character needle */
 		char		nchar = *needle;
 
-		hptr = start_ptr;
-        if (collid == getCaseInsensitiveId())
-        {
-            while (hptr < haystack_end)
-            {
-                if ((*hptr == nchar) || 
-                    (('a' <= *hptr) && (*hptr <= 'z') && ((*hptr - 32 ) == nchar)) || 
-                    (('A' <= *hptr) && (*hptr <= 'Z') && ((*hptr + 32 ) == nchar)))
-                {
-                    return (char *) hptr;
-                }
-                hptr++;
-            }
-        }
-        else 
-        {
-            while (hptr < haystack_end)
-            {
-                if (*hptr == nchar)
-                {
-                    return (char *) hptr;
-                }
-                hptr++;
-            }
-        }
-    }
-    else
-    {
-        const char *needle_last = &needle[needle_len - 1];
+		for (hptr = start_ptr; hptr < haystack_end; hptr++)
+		{
+			if (*hptr == nchar)
+				return (char *) hptr;
+		}
+	}
+	else
+	{
+		const char *needle_last = &needle[needle_len - 1];
 
-        /* Start at startpos plus the length of the needle */
-        hptr = start_ptr + needle_len - 1;
-        if (collid == getCaseInsensitiveId())
-        {
-            while (hptr < haystack_end)
-            {
-                /* Match the needle scanning *backward* */
-                const char *nptr;
-                const char *p;
+		hptr = start_ptr + needle_len - 1;
+		while (hptr < haystack_end)
+		{
+			const char *nptr = needle_last;
+			const char *p = hptr;
 
-                nptr = needle_last;
-                p = hptr;
-                while ((*nptr == *p) || 
-                       (('a' <= *nptr) && (*nptr <= 'z') && ((*nptr - 32) == *p)) || 
-                       (('A' <= *nptr) && (*nptr <= 'Z') && ((*nptr + 32) == *p)))
-                {
-                    /* Matched it all?	If so, return 1-based position */
-                    if (nptr == needle)
-                        return (char *) p;
-                    nptr--, p--;
-                }
+			while (*nptr == *p)
+			{
+				if (nptr == needle)
+					return (char *) p;
+				nptr--, p--;
+			}
 
-                /*
-                 * No match, so use the haystack char at hptr to decide how far to
-                 * advance.  If the needle had any occurrence of that character
-                 * (or more precisely, one sharing the same skiptable entry)
-                 * before its last character, then we advance far enough to align
-                 * the last such needle character with that haystack position.
-                 * Otherwise we can advance by the whole needle length.
-                 */
-                hptr += state->skiptable[(unsigned char) *hptr & skiptablemask];
-            }
-        }
-        else 
-        {
-            while (hptr < haystack_end)
-            {
-                /* Match the needle scanning *backward* */
-                const char *nptr;
-                const char *p;
+			hptr += state->skiptable[(unsigned char) *hptr & skiptablemask];
+		}
+	}
 
-                nptr = needle_last;
-                p = hptr;
-                while (*nptr == *p)
-                {
-                    /* Matched it all?	If so, return 1-based position */
-                    if (nptr == needle)
-                        return (char *) p;
-                    nptr--, p--;
-                }
-
-                /*
-                 * No match, so use the haystack char at hptr to decide how far to
-                 * advance.  If the needle had any occurrence of that character
-                 * (or more precisely, one sharing the same skiptable entry)
-                 * before its last character, then we advance far enough to align
-                 * the last such needle character with that haystack position.
-                 * Otherwise we can advance by the whole needle length.
-                 */
-                hptr += state->skiptable[(unsigned char) *hptr & skiptablemask];
-            }
-        }
-    }
-
-    return 0;					/* not found */
+	return NULL;
 }
 
 static int
@@ -2373,913 +1395,462 @@ text_position_get_match_pos(TextPositionState *state)
 {
 	if (!state->is_multibyte)
 		return state->last_match - state->str1 + 1;
-	else
+
+	while (state->refpoint < state->last_match)
 	{
-		/* Convert the byte position to char position. */
-		while (state->refpoint < state->last_match)
-		{
-			state->refpoint += pg_mblen(state->refpoint);
-			state->refpos++;
-		}
-		Assert(state->refpoint == state->last_match);
-		return state->refpos + 1;
+		state->refpoint += pg_mblen(state->refpoint);
+		state->refpos++;
 	}
+	Assert(state->refpoint == state->last_match);
+	return state->refpos + 1;
 }
 
 static void
-text_position_cleanup(TextPositionState *state)
-{
-	/* no cleanup needed */
-}
-
-static void
-check_collation_set(Oid collid)
+check_collation_set_local(Oid collid)
 {
 	if (!OidIsValid(collid))
-	{
-		/*
-		 * This typically means that the parser could not resolve a conflict
-		 * of implicit collations, so report it that way.
-		 */
 		ereport(ERROR,
 				(errcode(ERRCODE_INDETERMINATE_COLLATION),
 				 errmsg("could not determine which collation to use for string comparison"),
 				 errhint("Use the COLLATE clause to set the collation explicitly.")));
-	}
 }
-
-//static void
-//convert_to_int_text_for_mysql(char **str, int str_len)
-//{
-//    char* ptr = *str;
-//    int i = 0;
-//
-//    if (str_len <= 0)
-//    {
-//        return;
-//    }
-//
-//    for (i = 0; i < str_len; i++)
-//    {
-//        if (ptr[i] != ' ')
-//        {
-//            break;
-//        }
-//    }
-//    if (0 < i)
-//    {
-//        ptr += i;
-//        str_len -= i;
-//        i = 0;
-//    }
-//
-//    if (str_len <= 0)
-//    {
-//        (*str)[0] = '0';
-//        (*str)[1] = '\0';
-//    }
-//    else 
-//    {
-//        if (isdigit(ptr[0]))
-//        {
-//            for (i = 0; i < str_len; i++)
-//            {
-//                if (ptr[i] != '0')
-//                {
-//                    break;
-//                }
-//            }
-//            if (0 < i)
-//            {
-//                ptr += i;
-//                str_len -= i;
-//            }
-//
-//            for (i = 0; i < str_len; i++)
-//            {
-//                if (!isdigit(ptr[i]))
-//                {
-//                    ptr[i] = '\0';
-//                    break;
-//                }
-//            }
-//            if (i <= 0)
-//            {
-//                //  00(ptr)
-//                //00(ptr)
-//                (*str)[0] = '0';
-//                (*str)[1] = '\0';
-//            }
-//            else 
-//            {
-//                //1
-//                //1a
-//                //  00(ptr)123
-//                //00(ptr)123
-//                *str = ptr;
-//            }
-//        }   // if (isdigit(ptr[0]))
-//        else if (ptr[0] == '+')
-//        {
-//            ++ptr;
-//            --str_len;
-//
-//            for (i = 0; i < str_len; i++)
-//            {
-//                if (ptr[i] != '0')
-//                {
-//                    break;
-//                }
-//            }
-//            if (0 < i)
-//            {
-//                ptr += i;
-//                str_len -= i;
-//            }
-//
-//            for (i = 0; i < str_len; i++)
-//            {
-//                if (!isdigit(ptr[i]))
-//                {
-//                    ptr[i] = '\0';
-//                    break;
-//                }
-//            }
-//            if (i <= 0)
-//            {
-//                (*str)[0] = '0';
-//                (*str)[1] = '\0';
-//            }
-//            else 
-//            {
-//                *str = ptr;
-//            }
-//        }   // else if (ptr[0] == '+')
-//        else if (ptr[0] == '-')
-//        {
-//            for (i = 1; i < str_len; i++)
-//            {
-//                if (ptr[i] != '0')
-//                {
-//                    break;
-//                }
-//            }
-//            if (i <= 1)
-//            {
-//                for (i = 1; i < str_len; i++)
-//                {
-//                    if (!isdigit(ptr[i]))
-//                    {
-//                        ptr[i] = '\0';
-//                        break;
-//                    }
-//                }
-//                if (1 < i)
-//                {
-//                    // -1ab
-//                    // -123
-//                    *str = ptr;
-//                }
-//                else 
-//                {
-//                    // -abc
-//                    (*str)[0] = '0';
-//                    (*str)[1] = '\0';
-//                }
-//            }
-//            else
-//            {
-//                // -00abc
-//                // -00123
-//                // -001ab
-//                // -00123abc
-//                ptr += i;
-//                for (i = 0; i < str_len; i++)
-//                {
-//                    if (!isdigit(ptr[i]))
-//                    {
-//                        ptr[i] = '\0';
-//                        break;
-//                    }
-//                }
-//                if (0 < i)
-//                {
-//                    // -00(ptr)123
-//                    // -00(ptr)1ab
-//                    // -00(ptr)123abc
-//                    int j = 0;
-//                    int k = 0;
-//                    (*str)[j++] = '-';
-//                    for (k = 0; k < i; k++)
-//                    {
-//                        (*str)[j++] = ptr[k];
-//                    }
-//                    (*str)[j] = '\0';
-//                }
-//                else 
-//                {
-//                    (*str)[0] = '0';
-//                    (*str)[1] = '\0';
-//                }
-//            }
-//        }   // else if (ptr[0] == '-')
-//        else 
-//        {
-//            (*str)[0] = '0';
-//            (*str)[1] = '\0';
-//        }
-//    }
-//}
-
 
 static void
 convert_to_digit_text_for_mysql(char **str, int str_len)
 {
-    char* ptr = *str;
-    int dotNum = 0;
-    int i = 0;
+	char	   *ptr = *str;
+	int			dotNum = 0;
+	int			i = 0;
 
-    if (str_len <= 0)
-    {
-        return;
-    }
+	if (str_len <= 0)
+		return;
 
-    for (i = 0; i < str_len; i++)
-    {
-        if (ptr[i] != ' ')
-        {
-            break;
-        }
-    }
-    if (0 < i)
-    {
-        ptr += i;
-        str_len -= i;
-        i = 0;
-    }
+	while (i < str_len && ptr[i] == ' ')
+		i++;
+	if (i > 0)
+	{
+		ptr += i;
+		str_len -= i;
+	}
 
-    if (str_len <= 0)
-    {
-        (*str)[0] = '0';
-        (*str)[1] = '\0';
-    }
-    else 
-    {
-        if (isdigit(ptr[0]))
-        {
-            for (i = 0; i < str_len; i++)
-            {
-                if (ptr[i] != '0')
-                {
-                    break;
-                }
-            }
-            if (0 < i)
-            {
-                ptr += i;
-                str_len -= i;
-            }
+	if (str_len <= 0)
+	{
+		(*str)[0] = '0';
+		(*str)[1] = '\0';
+		return;
+	}
 
-            for (i = 0; i < str_len; i++)
-            {
-                if (!isdigit(ptr[i]))
-                {
-                    if (ptr[i] == '.')
-                    {
-                        ++dotNum;
-                        if (1 < dotNum)
-                        {
-                            ptr[i] = '\0';
-                            break;
-                        }
-                    }
-                    else 
-                    {
-                        ptr[i] = '\0';
-                        break;
-                    }
-                }
-            }
-            if (i <= 0)
-            {
-                (*str)[0] = '0';
-                (*str)[1] = '\0';
-            }
-            else 
-            {
-                *str = ptr;
-            }
-        }   // if (isdigit(ptr[0]))
-        else if (ptr[0] == '+')
-        {
-            ++ptr;
-            --str_len;
+	if (isdigit((unsigned char) ptr[0]) || ptr[0] == '+')
+	{
+		if (ptr[0] == '+')
+		{
+			ptr++;
+			str_len--;
+		}
+		i = 0;
+		while (i < str_len && ptr[i] == '0')
+			i++;
+		if (i > 0)
+		{
+			ptr += i;
+			str_len -= i;
+		}
 
-            for (i = 0; i < str_len; i++)
-            {
-                if (ptr[i] != '0')
-                {
-                    break;
-                }
-            }
-            if (0 < i)
-            {
-                ptr += i;
-                str_len -= i;
-            }
+		for (i = 0; i < str_len; i++)
+		{
+			if (!isdigit((unsigned char) ptr[i]))
+			{
+				if (ptr[i] == '.')
+				{
+					if (++dotNum > 1)
+					{
+						ptr[i] = '\0';
+						break;
+					}
+				}
+				else
+				{
+					ptr[i] = '\0';
+					break;
+				}
+			}
+		}
 
-            for (i = 0; i < str_len; i++)
-            {
-                if (!isdigit(ptr[i]))
-                {
-                    if (ptr[i] == '.')
-                    {
-                        ++dotNum;
-                        if (1 < dotNum)
-                        {
-                            ptr[i] = '\0';
-                            break;
-                        }
-                    }
-                    else 
-                    {
-                        ptr[i] = '\0';
-                        break;
-                    }
-                }
-            }
-            if (i <= 0)
-            {
-                (*str)[0] = '0';
-                (*str)[1] = '\0';
-            }
-            else 
-            {
-                *str = ptr;
-            }
-        }   // else if (ptr[0] == '+')
-        else if (ptr[0] == '-')
-        {
-            for (i = 1; i < str_len; i++)
-            {
-                if (ptr[i] != '0')
-                {
-                    break;
-                }
-            }
-            if (i <= 1)
-            {
-                for (i = 1; i < str_len; i++)
-                {
-                    if (!isdigit(ptr[i]))
-                    {
-                        if (ptr[i] == '.')
-                        {
-                            ++dotNum;
-                            if (1 < dotNum)
-                            {
-                                ptr[i] = '\0';
-                                break;
-                            }
-                        }
-                        else 
-                        {
-                            ptr[i] = '\0';
-                            break;
-                        }
-                    }
-                }
-                if (1 < i)
-                {
-                    *str = ptr;
-                }
-                else 
-                {
-                    (*str)[0] = '0';
-                    (*str)[1] = '\0';
-                }
-            }
-            else
-            {
-                ptr += i;
-                for (i = 0; i < str_len; i++)
-                {
-                    if (!isdigit(ptr[i]))
-                    {
-                        if (ptr[i] == '.')
-                        {
-                            ++dotNum;
-                            if (1 < dotNum)
-                            {
-                                ptr[i] = '\0';
-                                break;
-                            }
-                        }
-                        else 
-                        {
-                            ptr[i] = '\0';
-                            break;
-                        }
-                    }
-                }
-                if (0 < i)
-                {
-                    int j = 0;
-                    int k = 0;
-                    (*str)[j++] = '-';
-                    for (k = 0; k < i; k++)
-                    {
-                        (*str)[j++] = ptr[k];
-                    }
-                    (*str)[j] = '\0';
-                }
-                else 
-                {
-                    (*str)[0] = '0';
-                    (*str)[1] = '\0';
-                }
-            }
-        }   // else if (ptr[0] == '-')
-        else if (ptr[0] == '.')
-        {
-            for (i = 1; i < str_len; i++)
-            {
-                if (!isdigit(ptr[i]))
-                {
-                    ptr[i] = '\0';
-                    break;
-                }
-            }
+		if (i <= 0 || (i == 1 && ptr[0] == '.'))
+		{
+			(*str)[0] = '0';
+			(*str)[1] = '\0';
+		}
+		else
+			*str = ptr;
+	}
+	else if (ptr[0] == '-')
+	{
+		for (i = 1; i < str_len; i++)
+		{
+			if (ptr[i] != '0')
+				break;
+		}
+		if (i <= 1)
+		{
+			for (i = 1; i < str_len; i++)
+			{
+				if (!isdigit((unsigned char) ptr[i]))
+				{
+					if (ptr[i] == '.')
+					{
+						if (++dotNum > 1)
+						{
+							ptr[i] = '\0';
+							break;
+						}
+					}
+					else
+					{
+						ptr[i] = '\0';
+						break;
+					}
+				}
+			}
+			if (i > 1 && !(i == 2 && ptr[1] == '.'))
+				*str = ptr;
+			else
+			{
+				(*str)[0] = '0';
+				(*str)[1] = '\0';
+			}
+		}
+		else
+		{
+			int			skip = i;
 
-            if (i <= 1)
-            {
-                (*str)[0] = '0';
-                (*str)[1] = '\0';
-            }
-            else 
-            {
-                *str = ptr;
-            }
-        }
-        else 
-        {
-            (*str)[0] = '0';
-            (*str)[1] = '\0';
-        }
-    }
+			ptr += skip;
+			str_len -= skip;
+			for (i = 0; i < str_len; i++)
+			{
+				if (!isdigit((unsigned char) ptr[i]))
+				{
+					if (ptr[i] == '.')
+					{
+						if (++dotNum > 1)
+						{
+							ptr[i] = '\0';
+							break;
+						}
+					}
+					else
+					{
+						ptr[i] = '\0';
+						break;
+					}
+				}
+			}
+			if (i > 0 && !(i == 1 && ptr[0] == '.'))
+			{
+				int			j = 0;
+
+				(*str)[j++] = '-';
+				for (int k = 0; k < i; k++)
+					(*str)[j++] = ptr[k];
+				(*str)[j] = '\0';
+			}
+			else
+			{
+				(*str)[0] = '0';
+				(*str)[1] = '\0';
+			}
+		}
+	}
+	else if (ptr[0] == '.')
+	{
+		for (i = 1; i < str_len; i++)
+		{
+			if (!isdigit((unsigned char) ptr[i]))
+			{
+				ptr[i] = '\0';
+				break;
+			}
+		}
+		if (i <= 1)
+		{
+			(*str)[0] = '0';
+			(*str)[1] = '\0';
+		}
+		else
+			*str = ptr;
+	}
+	else
+	{
+		(*str)[0] = '0';
+		(*str)[1] = '\0';
+	}
 }
-
 
 static void
 convert_to_text_for_mysql(char **str, int str_len)
 {
-    char* ptr = *str;
-    int i = 0;
+	char	   *ptr = *str;
+	int			i = 0;
 
-    if (str_len <= 0)
-    {
-        return;
-    }
+	if (str_len <= 0)
+		return;
 
-    if (isdigit(ptr[0]))
-    {
-        for (i = 0; i < str_len; i++)
-        {
-            if (ptr[i] != '0')
-            {
-                break;
-            }
-        }
+	if (isdigit((unsigned char) ptr[0]) || ptr[0] == '+')
+	{
+		if (ptr[0] == '+')
+		{
+			ptr++;
+			str_len--;
+		}
+		while (i < str_len && ptr[i] == '0')
+			i++;
+		ptr += i;
+		str_len -= i;
 
-        ptr += i;
-        str_len -= i;
+		if (str_len > 0)
+			*str = ptr;
+		else
+		{
+			(*str)[0] = '0';
+			(*str)[1] = '\0';
+		}
+	}
+	else if (ptr[0] == '-')
+	{
+		for (i = 1; i < str_len; i++)
+		{
+			if (ptr[i] != '0')
+				break;
+		}
+		if (i == 1)
+		{
+			if (str_len > 1)
+				*str = ptr;
+			else
+			{
+				(*str)[0] = '0';
+				(*str)[1] = '\0';
+			}
+		}
+		else
+		{
+			ptr += i;
+			str_len -= i;
+			if (str_len > 0)
+			{
+				int			j = 0;
 
-        if (0 < str_len)
-        {
-            *str = ptr;
-        }
-        else
-        {
-            (*str)[0] = '0';
-            (*str)[1] = '\0';
-        }
-    }   // if (isdigit(ptr[0]))
-    else if (ptr[0] == '+')
-    {
-        ++ptr;
-        --str_len;
-
-        for (i = 0; i < str_len; i++)
-        {
-            if (ptr[i] != '0')
-            {
-                break;
-            }
-        }
-
-        ptr += i;
-        str_len -= i;
-
-        if (0 < str_len)
-        {
-            *str = ptr;
-        }
-        else 
-        {
-            (*str)[0] = '0';
-            (*str)[1] = '\0';
-        }
-    }   // else if (ptr[0] == '+')
-    else if (ptr[0] == '-')
-    {
-        for (i = 1; i < str_len; i++)
-        {
-            if (ptr[i] != '0')
-            {
-                break;
-            }
-        }
-
-        if (i == 1)
-        {
-            *str = ptr;
-        }
-        else
-        {
-            ptr += i;
-            str_len -= i;
-            if (0 < str_len)
-            {
-                int j = 0;
-                (*str)[j++] = '-';
-                for (i = 0; i < str_len; i++)
-                {
-                    (*str)[j++] = ptr[i];
-                }
-                (*str)[j] = '\0';
-            }
-            else 
-            {
-                (*str)[0] = '0';
-                (*str)[1] = '\0';
-            }
-        }
-    }   // else if (ptr[0] == '-')
-    else 
-    {
-        (*str)[0] = '0';
-        (*str)[1] = '\0';
-    }
+				(*str)[j++] = '-';
+				for (i = 0; i < str_len; i++)
+					(*str)[j++] = ptr[i];
+				(*str)[j] = '\0';
+			}
+			else
+			{
+				(*str)[0] = '0';
+				(*str)[1] = '\0';
+			}
+		}
+	}
+	else
+	{
+		(*str)[0] = '0';
+		(*str)[1] = '\0';
+	}
 }
-
 
 PG_FUNCTION_INFO_V1(rowCount);
 Datum
 rowCount(PG_FUNCTION_ARGS)
 {
-    PG_RETURN_INT64(affectedRows);
+	PG_RETURN_INT64(affectedRows);
 }
-
 
 PG_FUNCTION_INFO_V1(mysFoundRows);
 Datum
 mysFoundRows(PG_FUNCTION_ARGS)
 {
-    PG_RETURN_INT64(foundRows);
+	PG_RETURN_INT64(foundRows);
 }
 
 PG_FUNCTION_INFO_V1(mysLastInsertId);
 Datum
 mysLastInsertId(PG_FUNCTION_ARGS)
 {
-    PG_RETURN_INT64(lastInsertID);
+	PG_RETURN_INT64(lastInsertID);
 }
-
 
 PG_FUNCTION_INFO_V1(substringIndex);
 Datum
 substringIndex(PG_FUNCTION_ARGS)
 {
-    char *ret = NULL;
+	text	   *str_txt = PG_GETARG_TEXT_PP(0);
+	text	   *sep_txt = PG_GETARG_TEXT_PP(1);
+	int32		index = PG_GETARG_INT32(2);
+	const char *str = VARDATA_ANY(str_txt);
+	int			strLen = VARSIZE_ANY_EXHDR(str_txt);
+	const char *sep = VARDATA_ANY(sep_txt);
+	int			sepLen = VARSIZE_ANY_EXHDR(sep_txt);
+	const char *res_ptr = str;
+	int			res_len = 0;
+	text	   *result;
 
-    char *str = TextDatumGetCString(PG_GETARG_DATUM(0));
-    int strLen = strlen(str);
-    char *separator = TextDatumGetCString(PG_GETARG_DATUM(1));
-    int separatorLen = strlen(separator);
-    int index = DatumGetInt32(PG_GETARG_DATUM(2));
+	if (sepLen == 0 || index == 0 || strLen == 0)
+	{
+		res_len = 0;
+	}
+	else if (index > 0)
+	{
+		res_ptr = str;
+		res_len = strLen;
+		for (int i = 0; i <= strLen - sepLen; i++)
+		{
+			if (memcmp(str + i, sep, sepLen) == 0)
+			{
+				index--;
+				if (index == 0)
+				{
+					res_len = i;
+					break;
+				}
+				i += sepLen - 1;
+			}
+		}
+	}
+	else
+	{
+		res_ptr = str;
+		res_len = strLen;
+		for (int i = strLen - sepLen; i >= 0; i--)
+		{
+			if (memcmp(str + i, sep, sepLen) == 0)
+			{
+				index++;
+				if (index == 0)
+				{
+					res_ptr = str + i + sepLen;
+					res_len = strLen - (i + sepLen);
+					break;
+				}
+				i -= sepLen - 1;
+			}
+		}
+	}
 
-    if (0 < index)
-    {
-        ret = str;
-        for (int i = 0; i < strLen; i++)
-        {
-            if ((separatorLen <= (strLen - i)) && 
-                (strncmp((str + i), separator, separatorLen) == 0))
-            {
-                index--;
-                if (0 == index)
-                {
-                    str[i] = '\0';
-                    ret = str;
-                    break;
-                }
-                else 
-                {
-                    i += (separatorLen - 1);
-                }
-            }
-        }
-    }
-    else if (0 == index)
-    {
-        str[0] = '\0';
-        ret = str;
-    }
-    else 
-    {
-        ret = str;
-        // SELECT SUBSTRING_INDEX('15,151,152,16', ',', -1);
-        for (int i = (strLen - separatorLen); 0 <= i; i--)
-        {
-            if (strncmp((str + i), separator, separatorLen) == 0)
-            {
-                index++;
-                if (0 == index)
-                {
-                    ret = str + i + 1;
-                    break;
-                }
-                else 
-                {
-                    i -= (separatorLen - 1);
-                }
-            }
-        }
-    }
-
-    PG_RETURN_TEXT_P(cstring_to_text(ret));
+	result = cstring_to_text_with_len(res_ptr, res_len);
+	PG_FREE_IF_COPY(str_txt, 0);
+	PG_FREE_IF_COPY(sep_txt, 1);
+	PG_RETURN_TEXT_P(result);
 }
-
 
 PG_FUNCTION_INFO_V1(mysVersion);
 Datum
 mysVersion(PG_FUNCTION_ARGS)
 {
-    PG_RETURN_TEXT_P(cstring_to_text(halo_mysql_version));
+	const char *ver = (halo_mysql_version != NULL) ? halo_mysql_version : "8.0.36-openHalo";
+
+	PG_RETURN_TEXT_P(cstring_to_text(ver));
 }
 
 PG_FUNCTION_INFO_V1(isValidBinary);
 Datum
 isValidBinary(PG_FUNCTION_ARGS)
 {
-    char *str = TextDatumGetCString(PG_GETARG_DATUM(0));
-    int strLen = strlen(str);
-    for (int i = 0; i < strLen; i++)
-    {
-        if ((str[i] != '0') && (str[i] != '1'))
-        {
-            PG_RETURN_BOOL(false);
-        }
-    }
+	text	   *txt = PG_GETARG_TEXT_PP(0);
+	const char *str = VARDATA_ANY(txt);
+	int			strLen = VARSIZE_ANY_EXHDR(txt);
+	bool		valid = true;
 
-    PG_RETURN_BOOL(true);
+	for (int i = 0; i < strLen; i++)
+	{
+		if (str[i] != '0' && str[i] != '1')
+		{
+			valid = false;
+			break;
+		}
+	}
+
+	PG_FREE_IF_COPY(txt, 0);
+	PG_RETURN_BOOL(valid);
 }
 
 PG_FUNCTION_INFO_V1(isValidHex);
 Datum
 isValidHex(PG_FUNCTION_ARGS)
 {
-    char *str = TextDatumGetCString(PG_GETARG_DATUM(0));
-    int strLen = strlen(str);
-    for (int i = 0; i < strLen; i++)
-    {
-        if ((str[i] != '0') && 
-            (str[i] != '1') && 
-            (str[i] != '2') && 
-            (str[i] != '3') && 
-            (str[i] != '4') && 
-            (str[i] != '5') && 
-            (str[i] != '6') && 
-            (str[i] != '7') && 
-            (str[i] != '8') && 
-            (str[i] != '9') && 
-            (str[i] != 'a') && 
-            (str[i] != 'A') && 
-            (str[i] != 'b') && 
-            (str[i] != 'B') && 
-            (str[i] != 'c') && 
-            (str[i] != 'C') && 
-            (str[i] != 'd') && 
-            (str[i] != 'D') && 
-            (str[i] != 'e') && 
-            (str[i] != 'E') && 
-            (str[i] != 'f') && 
-            (str[i] != 'F')) 
-        {
-            PG_RETURN_BOOL(false);
-        }
-    }
+	text	   *txt = PG_GETARG_TEXT_PP(0);
+	const char *str = VARDATA_ANY(txt);
+	int			strLen = VARSIZE_ANY_EXHDR(txt);
+	bool		valid = true;
 
-    PG_RETURN_BOOL(true);
+	for (int i = 0; i < strLen; i++)
+	{
+		if (!isxdigit((unsigned char) str[i]))
+		{
+			valid = false;
+			break;
+		}
+	}
+
+	PG_FREE_IF_COPY(txt, 0);
+	PG_RETURN_BOOL(valid);
 }
 
 PG_FUNCTION_INFO_V1(convertTextHexToTextVarbit);
 Datum
 convertTextHexToTextVarbit(PG_FUNCTION_ARGS)
 {
-    char *ret;
+	static const char hex_bits[16][5] = {
+		"0000", "0001", "0010", "0011",
+		"0100", "0101", "0110", "0111",
+		"1000", "1001", "1010", "1011",
+		"1100", "1101", "1110", "1111"
+	};
+	text	   *txt = PG_GETARG_TEXT_PP(0);
+	const char *data = VARDATA_ANY(txt);
+	int			dataLen = VARSIZE_ANY_EXHDR(txt);
+	char	   *buf;
+	int			j = 0;
+	int			start = 0;
+	text	   *res;
 
-    char *data = TextDatumGetCString(PG_GETARG_DATUM(0));
-    int dataLen = strlen(data);
-    int retSize = dataLen * 4 + 1;
-    int j = 0;
+	if (dataLen == 0)
+	{
+		PG_FREE_IF_COPY(txt, 0);
+		PG_RETURN_TEXT_P(cstring_to_text(""));
+	}
 
-    if (dataLen <= 16)
-    {
-        ret = palloc(retSize);
-        for (int i = 0; i < dataLen; i++)
-        {
-            if (data[i] == '0')
-            {
-                ret[j++] = '0';
-                ret[j++] = '0';
-                ret[j++] = '0';
-                ret[j++] = '0';
-            }
-            else if (data[i] == '1')
-            {
-                ret[j++] = '0';
-                ret[j++] = '0';
-                ret[j++] = '0';
-                ret[j++] = '1';
-            }
-            else if (data[i] == '2')
-            {
-                ret[j++] = '0';
-                ret[j++] = '0';
-                ret[j++] = '1';
-                ret[j++] = '0';
-            }
-            else if (data[i] == '3')
-            {
-                ret[j++] = '0';
-                ret[j++] = '0';
-                ret[j++] = '1';
-                ret[j++] = '1';
-            }
-            else if (data[i] == '4')
-            {
-                ret[j++] = '0';
-                ret[j++] = '1';
-                ret[j++] = '0';
-                ret[j++] = '0';
-            }
-            else if (data[i] == '5')
-            {
-                ret[j++] = '0';
-                ret[j++] = '1';
-                ret[j++] = '0';
-                ret[j++] = '1';
-            }
-            else if (data[i] == '6')
-            {
-                ret[j++] = '0';
-                ret[j++] = '1';
-                ret[j++] = '1';
-                ret[j++] = '0';
-            }
-            else if (data[i] == '7')
-            {
-                ret[j++] = '0';
-                ret[j++] = '1';
-                ret[j++] = '1';
-                ret[j++] = '1';
-            }
-            else if (data[i] == '8')
-            {
-                ret[j++] = '1';
-                ret[j++] = '0';
-                ret[j++] = '0';
-                ret[j++] = '0';
-            }
-            else if (data[i] == '9')
-            {
-                ret[j++] = '1';
-                ret[j++] = '0';
-                ret[j++] = '0';
-                ret[j++] = '1';
-            }
-            else if ((data[i] == 'a') || (data[i] == 'A'))
-            {
-                ret[j++] = '1';
-                ret[j++] = '0';
-                ret[j++] = '1';
-                ret[j++] = '0';
-            }
-            else if ((data[i] == 'b') || (data[i] == 'B'))
-            {
-                ret[j++] = '1';
-                ret[j++] = '0';
-                ret[j++] = '1';
-                ret[j++] = '1';
-            }
-            else if ((data[i] == 'c') || (data[i] == 'C'))
-            {
-                ret[j++] = '1';
-                ret[j++] = '1';
-                ret[j++] = '0';
-                ret[j++] = '0';
-            }
-            else if ((data[i] == 'd') || (data[i] == 'D'))
-            {
-                ret[j++] = '1';
-                ret[j++] = '1';
-                ret[j++] = '0';
-                ret[j++] = '1';
-            }
-            else if ((data[i] == 'e') || (data[i] == 'E'))
-            {
-                ret[j++] = '1';
-                ret[j++] = '1';
-                ret[j++] = '1';
-                ret[j++] = '0';
-            }
-            else /* if ((data[i] == 'f') || (data[i] == 'F'))*/
-            {
-                ret[j++] = '1';
-                ret[j++] = '1';
-                ret[j++] = '1';
-                ret[j++] = '1';
-            }
-        }
-        ret[j++] = '\0';
-        for (j = 0; j < (retSize - 2); j++)
-        {
-            if (ret[j] != '0')
-            {
-                break;
-            }
-        }
-        ret = ret + j;
+	if (dataLen > 16)
+	{
+		PG_FREE_IF_COPY(txt, 0);
+		PG_RETURN_TEXT_P(cstring_to_text("1111111111111111111111111111111111111111111111111111111111111111"));
+	}
 
-        PG_RETURN_TEXT_P(cstring_to_text(ret));
-    }
-    else 
-    {
-        PG_RETURN_TEXT_P(cstring_to_text("1111111111111111111111111111111111111111111111111111111111111111"));
-    }
-}
+	buf = palloc(dataLen * 4 + 1);
+	for (int i = 0; i < dataLen; i++)
+	{
+		unsigned char c = (unsigned char) data[i];
+		int			nibble;
 
+		if (c >= '0' && c <= '9')
+			nibble = c - '0';
+		else if (c >= 'a' && c <= 'f')
+			nibble = 10 + (c - 'a');
+		else if (c >= 'A' && c <= 'F')
+			nibble = 10 + (c - 'A');
+		else
+			nibble = 15;
 
-static bool 
-lowerStrs(text *t1, text *t2, char **backupBuf1, char **backupBuf2)
-{
-    bool ret = false;
-    char *str1 = VARDATA_ANY(t1);
-    char *str2 = VARDATA_ANY(t2);
-    int	len1 = VARSIZE_ANY_EXHDR(t1);
-    int	len2 = VARSIZE_ANY_EXHDR(t2);
-    for (int i = 0; i < len1; i++)
-    {
-        if (('A' <= str1[i]) && (str1[i] <= 'Z'))
-        {
-            if (*backupBuf1 == NULL)
-            {
-                *backupBuf1 = pstrdup(str1);
-            }
-            str1[i] += 32;
-            ret = true;
-        }
-    }
-    for (int i = 0; i < len2; i++)
-    {
-        if (('A' <= str2[i]) && (str2[i] <= 'Z'))
-        {
-            if (*backupBuf2 == NULL)
-            {
-                *backupBuf2 = pstrdup(str2);
-            }
-            str2[i] += 32;
-            ret = true;
-        }
-    }
+		memcpy(buf + j, hex_bits[nibble], 4);
+		j += 4;
+	}
+	buf[j] = '\0';
+	PG_FREE_IF_COPY(txt, 0);
 
-    return ret;
-}
+	while (start < j - 1 && buf[start] == '0')
+		start++;
 
-static void 
-restoreStrs(char *backupBuf1, char *backupBuf2, text *t1, text *t2)
-{
-    if (backupBuf1 != NULL)
-    {
-        char *str1 = VARDATA_ANY(t1);
-        int	len1 = VARSIZE_ANY_EXHDR(t1);
-        memcpy(str1, backupBuf1, len1);
-    }
-    if (backupBuf2 != NULL)
-    {
-        char *str2 = VARDATA_ANY(t2);
-        int	len2 = VARSIZE_ANY_EXHDR(t2);
-        memcpy(str2, backupBuf2, len2);
-    }
+	res = cstring_to_text(buf + start);
+	pfree(buf);
+	PG_RETURN_TEXT_P(res);
 }

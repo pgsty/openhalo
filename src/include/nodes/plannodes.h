@@ -315,9 +315,6 @@ typedef struct ModifyTable
 	int			epqParam;
 	/* ON CONFLICT action */
 	OnConflictAction onConflictAction;
-	bool		onConflictAll;
-	bool		onConflictReplace;
-	bool		onConflictIgnore;
 	/* List of ON CONFLICT arbiter index OIDs  */
 	List	   *arbiterIndexes;
 	/* INSERT ON CONFLICT DO UPDATE targetlist */
@@ -334,6 +331,10 @@ typedef struct ModifyTable
 	List	   *mergeActionLists;
 	/* per-target-table join conditions for MERGE */
 	List	   *mergeJoinConditions;
+	/* Dialect conflict/IGNORE modifiers placed at struct tail for ABI stability */
+	bool		onConflictAll;
+	bool		onConflictReplace;
+	bool		onConflictIgnore;
 } ModifyTable;
 
 struct PartitionPruneInfo;		/* forward reference to struct below */

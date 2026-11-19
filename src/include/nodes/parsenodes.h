@@ -256,6 +256,8 @@ typedef struct Query
 	ParseLoc	stmt_location;
 	/* length in bytes; 0 means "rest of string" */
 	ParseLoc	stmt_len pg_node_attr(query_jumble_ignore);
+	/* dialect IGNORE flag for UPDATE/DELETE; omitted from stored rules */
+	bool		ignoreFailure pg_node_attr(read_write_ignore, read_as(false));
 } Query;
 
 
@@ -1653,14 +1655,14 @@ typedef struct OnConflictClause
 {
 	NodeTag		type;
 	OnConflictAction action;	/* DO NOTHING or UPDATE? */
-	/* Alternative SQL dialects: arbitrate all keys, in input row order. */
-	bool		allIndexes;
-	bool		replace;		/* delete conflicts before inserting */
-	bool		ignoreFailure;	/* skip rows violating foreign keys */
 	InferClause *infer;			/* Optional index inference clause */
 	List	   *targetList;		/* the target list (of ResTarget) */
 	Node	   *whereClause;	/* qualifications */
 	ParseLoc	location;		/* token location, or -1 if unknown */
+	/* Alternative SQL dialects: arbitrate all keys, in input row order. */
+	bool		allIndexes;
+	bool		replace;		/* delete conflicts before inserting */
+	bool		ignoreFailure;	/* skip rows violating constraints */
 } OnConflictClause;
 
 /*
@@ -2131,6 +2133,7 @@ typedef struct DeleteStmt
 	Node	   *whereClause;	/* qualifications */
 	ReturningClause *returningClause;	/* RETURNING clause */
 	WithClause *withClause;		/* WITH clause */
+	bool		ignoreFailure;	/* dialect DELETE IGNORE */
 } DeleteStmt;
 
 /* ----------------------
@@ -2146,6 +2149,7 @@ typedef struct UpdateStmt
 	List	   *fromClause;		/* optional from clause for more tables */
 	ReturningClause *returningClause;	/* RETURNING clause */
 	WithClause *withClause;		/* WITH clause */
+	bool		ignoreFailure;	/* dialect UPDATE IGNORE */
 } UpdateStmt;
 
 /* ----------------------

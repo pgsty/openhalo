@@ -186,6 +186,29 @@ mys_txn_classify(Node *stmt, MysStmtInfo *info)
 			info->txn_kind = MYS_TXN_NEUTRAL;
 			break;
 
+		case T_DoStmt:
+			{
+				DoStmt	   *d = (DoStmt *) stmt;
+
+				if (d->args != NIL && IsA(linitial(d->args), DefElem))
+				{
+					const char *tag = linitial_node(DefElem, d->args)->defname;
+
+					if (strcmp(tag, "aux_mysql_use_db") == 0)
+					{
+						info->txn_kind = MYS_TXN_NEUTRAL;
+						break;
+					}
+					if (strcmp(tag, "aux_mysql_alter_db") == 0)
+					{
+						info->txn_kind = MYS_TXN_IMPLICIT_COMMIT;
+						break;
+					}
+				}
+				info->txn_kind = MYS_TXN_REGULAR;
+				break;
+			}
+
 		case T_CreateStmt:
 			info->txn_kind = ((CreateStmt *) stmt)->relation->relpersistence == RELPERSISTENCE_TEMP ?
 				MYS_TXN_REGULAR : MYS_TXN_IMPLICIT_COMMIT;
@@ -447,6 +470,11 @@ mys_txn_deferred_error(ErrorData *edata)
 	DoStmt	   *d = makeNode(DoStmt);
 	RawStmt    *rs = makeNode(RawStmt);
 
+	if (deferred_parse_error != NULL)
+	{
+		FreeErrorData(deferred_parse_error);
+		deferred_parse_error = NULL;
+	}
 	d->args = list_make1(makeDefElem(DEFERRED_ERROR_MARKER, NULL, -1));
 	rs->stmt = (Node *) d;
 	rs->stmt_location = 0;
@@ -472,4 +500,14 @@ mys_txn_raise_deferred_error(void)
 
 	deferred_parse_error = NULL;
 	ReThrowError(edata);
+}
+
+void
+mys_txn_reset_deferred_error(void)
+{
+	if (deferred_parse_error != NULL)
+	{
+		FreeErrorData(deferred_parse_error);
+		deferred_parse_error = NULL;
+	}
 }

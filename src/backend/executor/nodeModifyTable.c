@@ -125,6 +125,8 @@ typedef struct ModifyTableContext
 typedef struct UpdateContext
 {
 	bool		crossPartUpdate;	/* was it a cross-partition update? */
+	bool		ignored;		/* skipped by IGNORE conflict precheck? */
+	TupleTableSlot *oldSlot;	/* existing tuple version being updated */
 	TU_UpdateIndexes updateIndexes; /* Which index updates are required? */
 
 	/*
@@ -917,7 +919,7 @@ ExecInsert(ModifyTableContext *context,
 
 	/* Input scans retain their original snapshot.  Only the write command
 	 * advances, allowing successive input rows to change the same target. */
-	if (node->onConflictAll)
+	if (node->onConflictAll && mtstate->mt_has_written)
 	{
 		CommandCounterIncrement();
 		estate->es_output_cid = GetCurrentCommandId(true);
@@ -931,7 +933,8 @@ ExecInsert(ModifyTableContext *context,
 	 */
 	if (resultRelationDesc->rd_rel->relhasindex &&
 		resultRelInfo->ri_IndexRelationDescs == NULL)
-		ExecOpenIndices(resultRelInfo, onconflict != ONCONFLICT_NONE);
+		ExecOpenIndices(resultRelInfo,
+						onconflict != ONCONFLICT_NONE || node->onConflictIgnore);
 
 	/*
 	 * BEFORE ROW INSERT Triggers.
@@ -1316,6 +1319,8 @@ ExecInsert(ModifyTableContext *context,
 													   false);
 		}
 	}
+
+	mtstate->mt_has_written = true;
 
 	if (canSetTag)
 		(estate->es_processed)++;
@@ -1724,11 +1729,46 @@ ExecDelete(ModifyTableContext *context,
 		 * transaction-snapshot mode transactions.
 		 */
 ldelete:
+		if (!changingPart &&
+			context->mtstate->operation == CMD_DELETE &&
+			((ModifyTable *) context->mtstate->ps.plan)->onConflictIgnore &&
+			tupleid != NULL && ItemPointerIsValid(tupleid) &&
+			resultRelationDesc->trigdesc &&
+			resultRelationDesc->trigdesc->trig_delete_after_row)
+		{
+			TupleTableSlot *lockSlot = ExecGetReturningSlot(estate, resultRelInfo);
+
+			result = table_tuple_lock(resultRelationDesc, tupleid,
+									  estate->es_snapshot, lockSlot,
+									  estate->es_output_cid,
+									  LockTupleExclusive, LockWaitBlock,
+									  0, &context->tmfd);
+			if (result == TM_Ok)
+			{
+				bool		ok;
+
+				if (context->mtstate->mt_has_written)
+					CommandCounterIncrement();
+				ok = RI_FKey_check_delete(resultRelationDesc, lockSlot);
+				ExecClearTuple(lockSlot);
+				if (!ok)
+					return NULL;
+			}
+			else
+			{
+				ExecClearTuple(lockSlot);
+				if (tmresult)
+					*tmresult = result;
+				goto ldelete_result;
+			}
+		}
+
 		result = ExecDeleteAct(context, resultRelInfo, tupleid, changingPart);
 
 		if (tmresult)
 			*tmresult = result;
 
+ldelete_result:
 		switch (result)
 		{
 			case TM_SelfModified:
@@ -1886,6 +1926,8 @@ ldelete:
 		 * anyway, since the tuple is still visible to other transactions.
 		 */
 	}
+
+	context->mtstate->mt_has_written = true;
 
 	if (canSetTag)
 		(estate->es_processed)++;
@@ -2183,7 +2225,8 @@ ExecUpdatePrologue(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	 */
 	if (resultRelationDesc->rd_rel->relhasindex &&
 		resultRelInfo->ri_IndexRelationDescs == NULL)
-		ExecOpenIndices(resultRelInfo, false);
+		ExecOpenIndices(resultRelInfo,
+						((ModifyTable *) context->mtstate->ps.plan)->onConflictIgnore);
 
 	/* BEFORE ROW UPDATE triggers */
 	if (resultRelInfo->ri_TrigDesc &&
@@ -2367,6 +2410,48 @@ lreplace:
 	 */
 	if (resultRelationDesc->rd_att->constr)
 		ExecConstraints(resultRelInfo, slot, estate);
+
+	if (((ModifyTable *) context->mtstate->ps.plan)->onConflictIgnore &&
+		tupleid != NULL && ItemPointerIsValid(tupleid) &&
+		updateCxt->oldSlot != NULL)
+	{
+		ItemPointerData conflictTid;
+
+		if (context->mtstate->operation != CMD_INSERT)
+		{
+			TupleTableSlot *lockSlot = ExecGetReturningSlot(estate, resultRelInfo);
+
+			updateCxt->lockmode = ExecUpdateLockMode(estate, resultRelInfo);
+			result = table_tuple_lock(resultRelationDesc, tupleid,
+									  estate->es_snapshot, lockSlot,
+									  estate->es_output_cid,
+									  updateCxt->lockmode, LockWaitBlock,
+									  0, &context->tmfd);
+			ExecClearTuple(lockSlot);
+			if (result != TM_Ok)
+				return result;
+		}
+
+		if (resultRelInfo->ri_NumIndices > 0 &&
+			!ExecCheckIndexConstraints(resultRelInfo, slot, estate,
+									   &conflictTid, tupleid, NIL))
+		{
+			ereport(WARNING,
+					(errcode(ERRCODE_UNIQUE_VIOLATION),
+					 errmsg("Duplicate entry for unique key")));
+			updateCxt->ignored = true;
+			return TM_Ok;
+		}
+
+		if (context->mtstate->mt_has_written)
+			CommandCounterIncrement();
+		if (!RI_FKey_check_update(resultRelationDesc,
+								  updateCxt->oldSlot, slot))
+		{
+			updateCxt->ignored = true;
+			return TM_Ok;
+		}
+	}
 
 	/*
 	 * replace the heap tuple
@@ -2619,9 +2704,13 @@ ExecUpdate(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 		 * to do them again.)
 		 */
 redo_act:
+		updateCxt.oldSlot = oldSlot;
 		lockedtid = *tupleid;
 		result = ExecUpdateAct(context, resultRelInfo, tupleid, oldtuple, slot,
 							   canSetTag, &updateCxt);
+
+		if (updateCxt.ignored)
+			return NULL;
 
 		/*
 		 * If ExecUpdateAct reports that a cross-partition update was done,
@@ -2780,6 +2869,8 @@ redo_act:
 		}
 	}
 
+	context->mtstate->mt_has_written = true;
+
 	if (canSetTag)
 		(estate->es_processed)++;
 
@@ -2860,6 +2951,7 @@ ExecOnConflictDelete(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	if (tupleDeleted)
 	{
 		(*deleted)++;
+		context->mtstate->mt_has_written = true;
 		CommandCounterIncrement();
 		estate->es_output_cid = GetCurrentCommandId(true);
 	}

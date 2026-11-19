@@ -67,6 +67,7 @@ typedef struct MysAuthCacheEntry
 
 static HTAB *auth_cache = NULL;
 static LWLock *auth_cache_lock = NULL;
+static uint32 auth_evict_cursor = 0;
 
 #define AUTH_CACHE_TRANCHE "aux_mysql auth cache"
 
@@ -168,31 +169,40 @@ mys_sha2_fast_auth(const char *user, const char *shadow_pass,
 	uint8		check[SHA2_LEN];
 	bool		found = false;
 
-	if (auth_cache == NULL || shadow_pass == NULL || resp_len != SHA2_LEN)
+	if (auth_cache == NULL || resp_len != SHA2_LEN)
 		return false;
 
 	cache_key(user, key);
-	sha256(shadow_pass, strlen(shadow_pass), NULL, 0, verifier);
+	if (shadow_pass != NULL)
+		sha256(shadow_pass, strlen(shadow_pass), NULL, 0, verifier);
+	else
+		sha256(key, NAMEDATALEN, NULL, 0, verifier);
 
 	LWLockAcquire(auth_cache_lock, LW_SHARED);
 	e = hash_search(auth_cache, key, HASH_FIND, NULL);
-	if (e && digest_equal(e->verifier, verifier, SHA2_LEN))
+	if (shadow_pass != NULL && e && digest_equal(e->verifier, verifier, SHA2_LEN))
 	{
 		memcpy(stage2, e->stage2, SHA2_LEN);
 		found = true;
 	}
+	else
+	{
+		memcpy(stage2, verifier, SHA2_LEN);
+	}
 	LWLockRelease(auth_cache_lock);
 
-	if (!found)
-		return false;
-
-	/* stage1 = resp XOR SHA256(stage2 || nonce);  SHA256(stage1) == stage2 ? */
+	/*
+	 * Always run the SHA-256 scramble computation so unknown users / cache
+	 * misses are not distinguishable by fast-path timing.
+	 */
 	sha256(stage2, SHA2_LEN, nonce, nonce_len, xor_key);
 	for (int i = 0; i < SHA2_LEN; i++)
 		stage1[i] = resp[i] ^ xor_key[i];
 	sha256(stage1, SHA2_LEN, NULL, 0, check);
 	explicit_bzero(stage1, sizeof(stage1));
 
+	if (!found)
+		return false;
 	return digest_equal(check, stage2, SHA2_LEN);
 }
 
@@ -219,20 +229,24 @@ mys_sha2_cache_store(const char *user, const char *shadow_pass, const char *pass
 	e = hash_search(auth_cache, key, HASH_ENTER_NULL, NULL);
 	if (e == NULL)
 	{
-		/* cache full: evict an arbitrary entry */
+		/* cache full: evict a rotating entry rather than always bucket 0 */
 		HASH_SEQ_STATUS seq;
-		MysAuthCacheEntry *victim;
+		MysAuthCacheEntry *victim = NULL;
+		long		entries = hash_get_num_entries(auth_cache);
+		long		target = entries > 0 ? (long) (auth_evict_cursor++ % (uint32) entries) : 0;
+		long		step = 0;
 
 		hash_seq_init(&seq, auth_cache);
-		victim = hash_seq_search(&seq);
-		if (victim)
+		while ((victim = hash_seq_search(&seq)) != NULL)
 		{
-			char		vkey[NAMEDATALEN];
-
-			memcpy(vkey, victim->user, NAMEDATALEN);
-			hash_seq_term(&seq);
-			hash_search(auth_cache, vkey, HASH_REMOVE, NULL);
+			if (step++ >= target)
+			{
+				hash_seq_term(&seq);
+				break;
+			}
 		}
+		if (victim != NULL)
+			hash_search(auth_cache, victim->user, HASH_REMOVE, NULL);
 		e = hash_search(auth_cache, key, HASH_ENTER_NULL, NULL);
 	}
 	if (e)
@@ -250,9 +264,12 @@ mys_flush_auth_cache(PG_FUNCTION_ARGS)
 {
 	HASH_SEQ_STATUS seq;
 	MysAuthCacheEntry *e;
-	List	   *keys = NIL;
 	int64		n = 0;
-	ListCell   *lc;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to flush authentication cache")));
 
 	if (auth_cache == NULL)
 		PG_RETURN_INT64(0);
@@ -260,13 +277,8 @@ mys_flush_auth_cache(PG_FUNCTION_ARGS)
 	LWLockAcquire(auth_cache_lock, LW_EXCLUSIVE);
 	hash_seq_init(&seq, auth_cache);
 	while ((e = hash_seq_search(&seq)) != NULL)
-		keys = lappend(keys, pnstrdup(e->user, NAMEDATALEN));
-	foreach(lc, keys)
 	{
-		char		key[NAMEDATALEN];
-
-		cache_key(lfirst(lc), key);
-		if (hash_search(auth_cache, key, HASH_REMOVE, NULL))
+		if (hash_search(auth_cache, e->user, HASH_REMOVE, NULL))
 			n++;
 	}
 	LWLockRelease(auth_cache_lock);
@@ -297,11 +309,14 @@ ssl_errmsg(void)
 static EVP_PKEY *
 generate_key(const char *path)
 {
-	EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+	EVP_PKEY_CTX *ctx;
 	EVP_PKEY   *key = NULL;
+	char	   *tmppath;
 	int			fd;
 	FILE	   *fp;
 
+	ERR_clear_error();
+	ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
 	if (ctx == NULL || EVP_PKEY_keygen_init(ctx) <= 0 ||
 		EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0 ||
 		EVP_PKEY_keygen(ctx, &key) <= 0)
@@ -313,23 +328,82 @@ generate_key(const char *path)
 	}
 	EVP_PKEY_CTX_free(ctx);
 
-	fd = open(path, O_WRONLY | O_CREAT | O_EXCL | PG_BINARY, S_IRUSR | S_IWUSR);
+	tmppath = psprintf("%s.tmp.%d", path, (int) getpid());
+	fd = open(tmppath, O_WRONLY | O_CREAT | O_EXCL | PG_BINARY, S_IRUSR | S_IWUSR);
 	if (fd < 0 || (fp = fdopen(fd, "w")) == NULL)
 	{
 		if (fd >= 0)
+		{
 			close(fd);
+			(void) unlink(tmppath);
+		}
 		ereport(WARNING,
 				(errcode_for_file_access(),
-				 errmsg("aux_mysql: could not create RSA private key file \"%s\": %m", path)));
-		return key;				/* still usable for this run */
+				 errmsg("aux_mysql: could not create RSA private key file \"%s\": %m", tmppath)));
+		pfree(tmppath);
+		return key;				/* still usable in memory for this run */
 	}
-	if (PEM_write_PrivateKey(fp, key, NULL, NULL, 0, NULL, NULL) != 1)
+
+	ERR_clear_error();
+	if (PEM_write_PrivateKey(fp, key, NULL, NULL, 0, NULL, NULL) != 1 ||
+		fflush(fp) != 0 || pg_fsync(fileno(fp)) != 0)
+	{
 		ereport(WARNING,
 				(errmsg("aux_mysql: could not write RSA private key file \"%s\": %s",
-						path, ssl_errmsg())));
-	fclose(fp);
-	ereport(LOG,
-			(errmsg("aux_mysql: generated RSA key pair \"%s\" for caching_sha2_password", path)));
+						tmppath, ssl_errmsg())));
+		fclose(fp);
+		(void) unlink(tmppath);
+		pfree(tmppath);
+		return key;
+	}
+	if (fclose(fp) != 0)
+	{
+		(void) unlink(tmppath);
+		pfree(tmppath);
+		return key;
+	}
+
+	if (link(tmppath, path) == 0)
+	{
+		(void) unlink(tmppath);
+		ereport(LOG,
+				(errmsg("aux_mysql: generated RSA key pair \"%s\" for caching_sha2_password", path)));
+	}
+	else if (errno == EEXIST)
+	{
+		/* Another process created the file concurrently; read theirs instead. */
+		FILE	   *other;
+
+		(void) unlink(tmppath);
+		other = AllocateFile(path, "r");
+		if (other != NULL)
+		{
+			EVP_PKEY   *existing;
+
+			ERR_clear_error();
+			existing = PEM_read_PrivateKey(other, NULL, NULL, NULL);
+			FreeFile(other);
+			if (existing != NULL)
+			{
+				EVP_PKEY_free(key);
+				key = existing;
+			}
+		}
+	}
+	else if (rename(tmppath, path) == 0)
+	{
+		ereport(LOG,
+				(errmsg("aux_mysql: generated RSA key pair \"%s\" for caching_sha2_password", path)));
+	}
+	else
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("aux_mysql: could not install RSA private key file \"%s\": %m", path)));
+		(void) unlink(tmppath);
+	}
+
+	pfree(tmppath);
 	return key;
 }
 
@@ -348,6 +422,7 @@ load_key(void)
 	fp = AllocateFile(path, "r");
 	if (fp != NULL)
 	{
+		ERR_clear_error();
 		rsa_key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
 		FreeFile(fp);
 		if (rsa_key == NULL)
@@ -380,6 +455,7 @@ load_key(void)
 	}
 
 	/* SubjectPublicKeyInfo PEM ("BEGIN PUBLIC KEY"), as MySQL sends it */
+	ERR_clear_error();
 	bio = BIO_new(BIO_s_mem());
 	if (bio == NULL || PEM_write_bio_PUBKEY(bio, rsa_key) != 1)
 	{
@@ -391,6 +467,12 @@ load_key(void)
 		return;
 	}
 	len = BIO_get_mem_data(bio, &data);
+	if (rsa_public_pem)
+	{
+		free(rsa_public_pem);
+		rsa_public_pem = NULL;
+		rsa_public_pem_len = 0;
+	}
 	rsa_public_pem = malloc(len + 1);
 	if (rsa_public_pem)
 	{
@@ -440,17 +522,22 @@ mys_rsa_decrypt_password(const uint8 *in, int inlen,
 	EVP_PKEY_CTX *ctx;
 	size_t		outlen = 0;
 	unsigned char *out;
+	unsigned char *nul;
 	char	   *pw;
 
+	if (rsa_key == NULL)
+		load_key();
 	if (rsa_key == NULL || inlen <= 0 || nonce_len <= 0)
 		return NULL;
 
+	ERR_clear_error();
 	ctx = EVP_PKEY_CTX_new(rsa_key, NULL);
 	if (ctx == NULL || EVP_PKEY_decrypt_init(ctx) <= 0 ||
 		EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0 ||
 		EVP_PKEY_decrypt(ctx, NULL, &outlen, in, inlen) <= 0)
 	{
 		EVP_PKEY_CTX_free(ctx);
+		ERR_clear_error();
 		return NULL;
 	}
 	out = palloc(outlen + 1);
@@ -465,7 +552,17 @@ mys_rsa_decrypt_password(const uint8 *in, int inlen,
 
 	for (size_t i = 0; i < outlen; i++)
 		out[i] ^= (unsigned char) nonce[i % nonce_len];
-	pw = pnstrdup((char *) out, strnlen((char *) out, outlen));
+
+	/* MySQL caching_sha2_password always encrypts the NUL-terminated password */
+	nul = memchr(out, '\0', outlen);
+	if (nul == NULL)
+	{
+		explicit_bzero(out, outlen);
+		pfree(out);
+		return NULL;
+	}
+
+	pw = pnstrdup((char *) out, (Size) (nul - out));
 	explicit_bzero(out, outlen);
 	pfree(out);
 	return pw;

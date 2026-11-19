@@ -35,8 +35,10 @@
 
 #include "halo_mysql.h"
 #include "mys_prefix.h"
+#include "adapter/mysql/systemVar.h"
+#include "adapter/mysql/uuidShort.h"
 
-PG_MODULE_MAGIC_EXT(.name = "aux_mysql", .version = "1.9");
+PG_MODULE_MAGIC_EXT(.name = "aux_mysql", .version = "2.0");
 
 bool		halo_mysql_listener_on = true;
 int			halo_mysql_port = 3306;
@@ -47,12 +49,6 @@ int			halo_mysql_parser = MYS_PARSER_MYSQL;
 int			halo_mysql_protocol_id = 0;
 int			halo_mysql_auth_plugin = MYS_AUTH_CACHING_SHA2;
 static bool halo_mysql_auto_create_extension = true;
-
-/* openHalo shared state (sysvar_core.c, uuid_short_core.c) */
-extern Size GlobalSystemVariablesShmemSize(void);
-extern void GlobalSystemVariablesShmemInit(void);
-extern Size UuidShortShmemSize(void);
-extern void UuidShortShmemInit(void);
 
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -65,6 +61,7 @@ halo_mysql_shmem_request(void)
 	RequestAddinShmemSpace(add_size(add_size(GlobalSystemVariablesShmemSize(),
 											 UuidShortShmemSize()),
 									mys_auth_shmem_size()));
+	GlobalSystemVariablesShmemRequest();
 	mys_auth_shmem_request();
 }
 
@@ -133,11 +130,19 @@ halo_mysql_ensure_extension(void)
 
 		pgstat_report_activity(STATE_RUNNING, sql);
 		debug_query_string = sql;
-		if (SPI_connect() != SPI_OK_CONNECT)
-			elog(ERROR, "SPI_connect failed");
-		if (SPI_execute(sql, false, 0) != SPI_OK_UTILITY)
-			elog(ERROR, "could not create extension aux_mysql");
-		SPI_finish();
+		PG_TRY();
+		{
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "SPI_connect failed");
+			if (SPI_execute(sql, false, 0) != SPI_OK_UTILITY)
+				elog(ERROR, "could not create extension aux_mysql");
+			SPI_finish();
+		}
+		PG_FINALLY();
+		{
+			debug_query_string = NULL;
+		}
+		PG_END_TRY();
 		ereport(LOG,
 				(errmsg("aux_mysql: created extension aux_mysql in database \"%s\"",
 						halo_mysql_database)));
@@ -282,9 +287,5 @@ _PG_init(void)
 	mysql_utility_init();
 	mys_prefix_init();
 
-#ifdef HALO_BABELFISH_API
-	mysql_babelfish_register();
-#else
 	halo_mysql_protocol_id = RegisterProtocolExtension(&mysql_protocol_config);
-#endif
 }
