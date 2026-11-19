@@ -8,7 +8,7 @@
  * relations need be included.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_attribute.h
@@ -34,6 +34,8 @@
  *		You may need to change catalog/genbki.pl as well.
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,AttributeRelation_Rowtype_Id) BKI_SCHEMA_MACRO
 {
 	Oid			attrelid BKI_LOOKUP(pg_class);	/* OID of relation containing
@@ -185,6 +187,8 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
 #endif
 } FormData_pg_attribute;
 
+END_CATALOG_STRUCT
+
 /*
  * ATTRIBUTE_FIXED_PART_SIZE is the size of the fixed-layout,
  * guaranteed-not-null part of a pg_attribute row.  This is in fact as much
@@ -228,6 +232,15 @@ MAKE_SYSCACHE(ATTNUM, pg_attribute_relid_attnum_index, 128);
 
 #define		  ATTRIBUTE_GENERATED_STORED	's'
 #define		  ATTRIBUTE_GENERATED_VIRTUAL	'v'
+
+/*
+ * Reserved attoptions key used, in the back branches, to store the attribute
+ * version.  See attoptions_get_version() and
+ * src/backend/catalog/README.attver.md.
+ *
+ * This is defined here to make it visible to pg_dump.c.
+ */
+#define ATTRIBUTE_VERSION_ATTOPTION "pg_attver"
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 

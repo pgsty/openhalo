@@ -4,7 +4,7 @@
  *	  definition of the "relation" system catalog (pg_class)
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_class.h
@@ -29,6 +29,8 @@
  * BKI_BOOTSTRAP catalogs, since only those rows appear in pg_class.dat.
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,RelationRelation_Rowtype_Id) BKI_SCHEMA_MACRO
 {
 	/* oid */
@@ -144,6 +146,8 @@ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,Relat
 #endif
 } FormData_pg_class;
 
+END_CATALOG_STRUCT
+
 /* Size of fixed part of pg_class tuples, not counting var-length fields */
 #define CLASS_TUPLE_SIZE \
 	 (offsetof(FormData_pg_class,relminmxid) + sizeof(TransactionId))
@@ -230,6 +234,17 @@ MAKE_SYSCACHE(RELNAMENSP, pg_class_relname_nsp_index, 128);
 	((relkind) == RELKIND_RELATION || \
 	 (relkind) == RELKIND_TOASTVALUE || \
 	 (relkind) == RELKIND_MATVIEW)
+
+/*
+ * Relation kinds with a rowtype.
+ */
+#define RELKIND_HAS_ROWTYPE(relkind) \
+	((relkind) == RELKIND_RELATION || \
+	 (relkind) == RELKIND_VIEW || \
+	 (relkind) == RELKIND_MATVIEW || \
+	 (relkind) == RELKIND_COMPOSITE_TYPE || \
+	 (relkind) == RELKIND_FOREIGN_TABLE || \
+	 (relkind) == RELKIND_PARTITIONED_TABLE)
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 

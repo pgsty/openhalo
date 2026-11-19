@@ -1148,7 +1148,7 @@ drop function trigger_ddl_func();
 
 --
 -- Verify behavior of before and after triggers with INSERT...ON CONFLICT
--- DO UPDATE
+-- DO UPDATE and DO SELECT
 --
 create table upsert (key int4 primary key, color text);
 
@@ -1197,6 +1197,7 @@ insert into upsert values(5, 'purple') on conflict (key) do update set color = '
 insert into upsert values(6, 'white') on conflict (key) do update set color = 'updated ' || upsert.color;
 insert into upsert values(7, 'pink') on conflict (key) do update set color = 'updated ' || upsert.color;
 insert into upsert values(8, 'yellow') on conflict (key) do update set color = 'updated ' || upsert.color;
+insert into upsert values(8, 'blue') on conflict (key) do select for update where upsert.color = 'yellow trig modified' returning old.*, new.*, upsert.*;
 
 select * from upsert;
 
@@ -1577,6 +1578,44 @@ drop table parted;
 drop function parted_trigfunc();
 
 --
+-- Constraint triggers
+--
+create constraint trigger crtr
+  after insert on foo not valid
+  for each row execute procedure foo ();
+create constraint trigger crtr
+  after insert on foo no inherit
+  for each row execute procedure foo ();
+create constraint trigger crtr
+  after insert on foo not enforced
+  for each row execute procedure foo ();
+
+-- Test exception handling in a deferred constraint trigger at COMMIT.
+create table deferred_trigger_test (a int);
+create function deferred_trigger_func() returns trigger
+  language plpgsql as $$
+begin
+  perform 1 / 0;
+  return new;
+exception when division_by_zero then
+  raise notice 'caught division_by_zero';
+  return new;
+end;
+$$;
+create constraint trigger deferred_trigger
+  after insert on deferred_trigger_test
+  deferrable initially deferred
+  for each row execute function deferred_trigger_func();
+
+begin;
+insert into deferred_trigger_test values (1);
+commit;
+select * from deferred_trigger_test;
+
+drop table deferred_trigger_test;
+drop function deferred_trigger_func();
+
+--
 -- Constraint triggers and partitioned tables
 create table parted_constr_ancestor (a int, b text)
   partition by range (b);
@@ -1591,7 +1630,7 @@ create constraint trigger parted_trig after insert on parted_constr_ancestor
   deferrable
   for each row execute procedure trigger_notice_ab();
 create constraint trigger parted_trig_two after insert on parted_constr
-  deferrable initially deferred
+  deferrable initially deferred enforced
   for each row when (bark(new.b) AND new.a % 2 = 1)
   execute procedure trigger_notice_ab();
 
@@ -2460,6 +2499,75 @@ when not matched then
 
 drop table merge_source_table, merge_target_table;
 
+--
+-- test transition tables with MERGE into a partitioned table
+--
+create table merge_part_target_table (a int, b text) partition by list (a);
+create table merge_part_target_table_p1 partition of merge_part_target_table
+  for values in (1, 2);
+create index on merge_part_target_table (a);
+create trigger merge_part_target_table_update_trig
+  after update on merge_part_target_table
+  referencing old table as old_table new table as new_table
+  for each statement execute procedure dump_update();
+
+insert into merge_part_target_table values (2, 'original2');
+
+merge into merge_part_target_table t
+using (values (1, 'inserted1'), (2, 'updated2')) as s(a, b)
+on t.a = s.a
+when matched then
+	update set b = s.b
+when not matched then
+	insert values (s.a, s.b);
+
+select * from merge_part_target_table order by a;
+
+drop table merge_part_target_table;
+
+--
+-- Same again, but with a partition whose column order differs from the
+-- root, so that a child-to-root conversion is required.
+--
+create table merge_conv_table (a int, b text) partition by range (a);
+create table merge_conv_table_p (b text, a int);
+alter table merge_conv_table attach partition merge_conv_table_p
+  for values from (0) to (100);
+create index on merge_conv_table (a);
+create trigger merge_conv_table_update_trig
+  after update on merge_conv_table
+  referencing old table as old_table new table as new_table
+  for each statement execute procedure dump_update();
+
+insert into merge_conv_table values (2, 'original2');
+
+-- Coerce a nested loop join plan with the VALUES on the outer side
+-- and an index scan on the inner side.  This makes the MATCHED and
+-- NOT MATCHED rows to be processed in the order they're listed in the
+-- VALUES, i.e. the NOT MATCHED row before the MATCHED, which was
+-- relevant for hitting an old bug in inserting to the the transition
+-- table.  As of this writing, that's the plan you get with the
+-- defaults anyway, but the costs are pretty close.
+begin;
+set local enable_nestloop = on;
+set local enable_hashjoin = off;
+set local enable_mergejoin = off;
+set local enable_seqscan = off;
+
+merge into merge_conv_table t
+using (values (1, 'inserted1'), (2, 'updated2')) as s(a, b)
+on t.a = s.a
+when matched then
+	update set b = s.b
+when not matched then
+	insert values (s.a, s.b);
+
+commit;
+
+select * from merge_conv_table order by a;
+
+drop table merge_conv_table;
+
 -- cleanup
 drop function dump_insert();
 drop function dump_update();
@@ -2774,3 +2882,41 @@ drop table defer_trig;
 drop function whoami();
 drop role regress_fn_owner;
 drop role regress_caller;
+
+
+--
+-- Test a trigger on a partition table where a columns NOT NULLness differs
+-- between parent and child. In a WIP patch, this mismatch caused a spurious
+-- error that was not detected by any existing tests. Therefore a test seems
+-- appropriate.
+--
+
+CREATE TABLE trignulldiff_parent (key int, childnotnull int, parentnotnull int NOT NULL)
+  PARTITION BY LIST (key);
+CREATE TABLE trignulldiff_child PARTITION OF trignulldiff_parent
+  FOR VALUES IN (1, 2);
+ALTER TABLE trignulldiff_child ALTER COLUMN childnotnull SET NOT NULL;
+CREATE FUNCTION trignulldiff_return_parent() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  -- Returns a row of the parent type (which is not NOT NULL), even when
+  -- invoked on the child table. This verifies we handle that difference
+  -- correctly.
+  RETURN ROW(NEW.key, NEW.childnotnull, NEW.parentnotnull)::trignulldiff_parent;
+END $$;
+CREATE TRIGGER trignulldiff_return_parent BEFORE INSERT ON trignulldiff_parent
+  FOR EACH ROW EXECUTE FUNCTION trignulldiff_return_parent();
+
+-- test not inserting NULLs
+INSERT INTO trignulldiff_parent VALUES (1,11, 111) RETURNING *;
+INSERT INTO trignulldiff_child VALUES (1,22, 222) RETURNING *;
+INSERT INTO trignulldiff_parent VALUES (1,33, 333) RETURNING *;
+INSERT INTO trignulldiff_child VALUES (1,44, 444) RETURNING *;
+
+-- test inserting NULLs
+INSERT INTO trignulldiff_parent VALUES (2, NULL, 111) RETURNING *;
+INSERT INTO trignulldiff_child VALUES (2, NULL, 222) RETURNING *;
+INSERT INTO trignulldiff_parent VALUES (2, 33, NULL) RETURNING *;
+INSERT INTO trignulldiff_child VALUES (2, 444, NULL) RETURNING *;
+
+DROP TABLE IF EXISTS trignulldiff_parent CASCADE;
+DROP FUNCTION IF EXISTS trignulldiff_return_parent();

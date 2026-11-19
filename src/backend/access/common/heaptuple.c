@@ -45,7 +45,7 @@
  * and we'd like to still refer to them via C struct offsets.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -60,11 +60,16 @@
 #include "access/heaptoast.h"
 #include "access/sysattr.h"
 #include "access/tupdesc_details.h"
+#include "access/xlogdefs.h"
+#include "catalog/pg_type_d.h"
 #include "common/hashfn.h"
+#include "common/int.h"
+#include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/expandeddatum.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/typcache.h"
 
 
 /*
@@ -87,6 +92,14 @@
 #define COMPACT_ATTR_IS_PACKABLE(att) \
 	((att)->attlen == -1 && (att)->attispackable)
 
+
+static void heap_datum_check_coercion(HeapTupleHeader tup, TupleDesc targetDesc);
+
+
+/* GUC variable */
+int			composite_type_mismatch = COMPOSITE_TYPE_MISMATCH_ERROR;
+
+
 /*
  * Setup for caching pass-by-ref missing attributes in a way that survives
  * tupleDesc destruction.
@@ -103,16 +116,16 @@ static HTAB *missing_cache = NULL;
 static uint32
 missing_hash(const void *key, Size keysize)
 {
-	const missing_cache_key *entry = (missing_cache_key *) key;
+	const missing_cache_key *entry = key;
 
-	return hash_bytes((const unsigned char *) entry->value, entry->len);
+	return hash_bytes((const unsigned char *) DatumGetPointer(entry->value), entry->len);
 }
 
 static int
 missing_match(const void *key1, const void *key2, Size keysize)
 {
-	const missing_cache_key *entry1 = (missing_cache_key *) key1;
-	const missing_cache_key *entry2 = (missing_cache_key *) key2;
+	const missing_cache_key *entry1 = key1;
+	const missing_cache_key *entry2 = key2;
 
 	if (entry1->len != entry2->len)
 		return entry1->len > entry2->len ? 1 : -1;
@@ -123,7 +136,7 @@ missing_match(const void *key1, const void *key2, Size keysize)
 }
 
 static void
-init_missing_cache()
+init_missing_cache(void)
 {
 	HASHCTL		hash_ctl;
 
@@ -189,7 +202,7 @@ getmissingattr(TupleDesc tupleDesc,
 			if (att->attlen > 0)
 				key.len = att->attlen;
 			else
-				key.len = VARSIZE_ANY(attrmiss->am_value);
+				key.len = VARSIZE_ANY(DatumGetPointer(attrmiss->am_value));
 			key.value = attrmiss->am_value;
 
 			entry = hash_search(missing_cache, &key, HASH_ENTER, &found);
@@ -220,14 +233,32 @@ heap_compute_data_size(TupleDesc tupleDesc,
 					   const Datum *values,
 					   const bool *isnull)
 {
+	return heap_compute_data_size_ext(tupleDesc, values, isnull, false);
+}
+
+/*
+ * heap_compute_data_size_ext
+ *		Determine size of the data area of a tuple to be constructed,
+ *		potentially over MaxAllocSize
+ *
+ * If allow_huge is false, then we raise an error if any intermediate
+ * result goes beyond MaxAllocSize; in 32-bit architectures we also
+ * do that when the result of an addition overflows Size (which is 32-bit)
+ */
+Size
+heap_compute_data_size_ext(TupleDesc tupleDesc,
+						   const Datum *values,
+						   const bool *isnull,
+						   bool allow_huge)
+{
 	Size		data_length = 0;
-	int			i;
 	int			numberOfAttributes = tupleDesc->natts;
 
-	for (i = 0; i < numberOfAttributes; i++)
+	for (int i = 0; i < numberOfAttributes; i++)
 	{
 		Datum		val;
 		CompactAttribute *atti;
+		bool		ovfl;
 
 		if (isnull[i])
 			continue;
@@ -242,7 +273,9 @@ heap_compute_data_size(TupleDesc tupleDesc,
 			 * we're anticipating converting to a short varlena header, so
 			 * adjust length and don't count any alignment
 			 */
-			data_length += VARATT_CONVERTED_SHORT_SIZE(DatumGetPointer(val));
+			ovfl = pg_add_size_overflow(data_length,
+										VARATT_CONVERTED_SHORT_SIZE(DatumGetPointer(val)),
+										&data_length);
 		}
 		else if (atti->attlen == -1 &&
 				 VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(val)))
@@ -252,15 +285,28 @@ heap_compute_data_size(TupleDesc tupleDesc,
 			 * tuple doesn't depend on it
 			 */
 			data_length = att_nominal_alignby(data_length, atti->attalignby);
-			data_length += EOH_get_flat_size(DatumGetEOHP(val));
+			ovfl = pg_add_size_overflow(data_length,
+										EOH_get_flat_size(DatumGetEOHP(val)),
+										&data_length);
 		}
 		else
 		{
 			data_length = att_datum_alignby(data_length, atti->attalignby,
 											atti->attlen, val);
-			data_length = att_addlength_datum(data_length, atti->attlen,
-											  val);
+			data_length = att_addlength_datum_overflow(data_length, atti->attlen,
+													   val, &ovfl);
 		}
+
+		/*
+		 * Unless caller allows huge values, prevent going beyond the palloc
+		 * limit.  In cases where caller does allow huge values, we can't
+		 * trust the AllocSizeIsValid() test alone on 32-bit platforms, which
+		 * is why we use overflow-detecting addition above.
+		 */
+		if (ovfl || (!allow_huge && !AllocSizeIsValid(data_length)))
+			ereport(ERROR,
+					errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					errmsg("tuple is too big"));
 	}
 
 	return data_length;
@@ -273,7 +319,7 @@ heap_compute_data_size(TupleDesc tupleDesc,
  */
 static inline void
 fill_val(CompactAttribute *att,
-		 bits8 **bit,
+		 uint8 **bit,
 		 int *bitmask,
 		 char **dataP,
 		 uint16 *infomask,
@@ -401,9 +447,9 @@ void
 heap_fill_tuple(TupleDesc tupleDesc,
 				const Datum *values, const bool *isnull,
 				char *data, Size data_size,
-				uint16 *infomask, bits8 *bit)
+				uint16 *infomask, uint8 *bit)
 {
-	bits8	   *bitP;
+	uint8	   *bitP;
 	int			bitmask;
 	int			i;
 	int			numberOfAttributes = tupleDesc->natts;
@@ -498,19 +544,7 @@ heap_attisnull(HeapTuple tup, int attnum, TupleDesc tupleDesc)
  *		nocachegetattr
  *
  *		This only gets called from fastgetattr(), in cases where we
- *		can't use a cacheoffset and the value is not null.
- *
- *		This caches attribute offsets in the attribute descriptor.
- *
- *		An alternative way to speed things up would be to cache offsets
- *		with the tuple, but that seems more difficult unless you take
- *		the storage hit of actually putting those offsets into the
- *		tuple you send to disk.  Yuck.
- *
- *		This scheme will be slightly slower than that, but should
- *		perform well for queries which hit large #'s of tuples.  After
- *		you cache the offsets once, examining all the other tuples using
- *		the same attribute descriptor will go much quicker. -cim 5/4/91
+ *		can't use the attcacheoff and the value is not null.
  *
  *		NOTE: if you need to change this code, see also heap_deform_tuple.
  *		Also see nocache_index_getattr, which is the same code for index
@@ -522,194 +556,120 @@ nocachegetattr(HeapTuple tup,
 			   int attnum,
 			   TupleDesc tupleDesc)
 {
+	CompactAttribute *cattr;
 	HeapTupleHeader td = tup->t_data;
 	char	   *tp;				/* ptr to data part of tuple */
-	bits8	   *bp = td->t_bits;	/* ptr to null bitmap in tuple */
-	bool		slow = false;	/* do we have to walk attrs? */
-	int			off;			/* current offset within data */
+	uint8	   *bp = td->t_bits;	/* ptr to null bitmap in tuple */
+	Size		off;			/* current offset within data */
+	int			startAttr;
+	int			firstNullAttr;
+	int			i;
+	bool		hasnulls = HeapTupleHasNulls(tup);
 
-	/* ----------------
-	 *	 Three cases:
-	 *
-	 *	 1: No nulls and no variable-width attributes.
-	 *	 2: Has a null or a var-width AFTER att.
-	 *	 3: Has nulls or var-widths BEFORE att.
-	 * ----------------
+	/*
+	 * It shouldn't be possible to allocate overlength tuples, so it's not
+	 * possible to get in wraparound problems in the arithmetic below.
 	 */
+	Assert(AllocSizeIsValid(tup->t_len));
+
+	/* Did someone forget to call TupleDescFinalize()? */
+	Assert(tupleDesc->firstNonCachedOffsetAttr >= 0);
 
 	attnum--;
 
-	if (!HeapTupleNoNulls(tup))
+	/*
+	 * To minimize the number of attributes we need to look at, start walking
+	 * the tuple at the attribute with the highest attcacheoff prior to attnum
+	 * or the first NULL attribute prior to attnum, whichever comes first.
+	 */
+	if (hasnulls)
+		firstNullAttr = first_null_attr(bp, attnum);
+	else
+		firstNullAttr = attnum;
+
+	if (tupleDesc->firstNonCachedOffsetAttr > 0 && firstNullAttr > 0)
 	{
 		/*
-		 * there's a null somewhere in the tuple
-		 *
-		 * check to see if any preceding bits are null...
+		 * Try to start with the highest attribute with an attcacheoff that's
+		 * prior to the one we're looking for, or with the attribute prior to
+		 * the first NULL attribute, if there is one.
 		 */
-		int			byte = attnum >> 3;
-		int			finalbit = attnum & 0x07;
-
-		/* check for nulls "before" final bit of last byte */
-		if ((~bp[byte]) & ((1 << finalbit) - 1))
-			slow = true;
-		else
-		{
-			/* check for nulls in any "earlier" bytes */
-			int			i;
-
-			for (i = 0; i < byte; i++)
-			{
-				if (bp[i] != 0xFF)
-				{
-					slow = true;
-					break;
-				}
-			}
-		}
+		startAttr = Min(tupleDesc->firstNonCachedOffsetAttr - 1, firstNullAttr - 1);
+		off = TupleDescCompactAttr(tupleDesc, startAttr)->attcacheoff;
+	}
+	else
+	{
+		/* Otherwise, start at the beginning... */
+		startAttr = 0;
+		off = 0;
 	}
 
 	tp = (char *) td + td->t_hoff;
 
-	if (!slow)
+	/*
+	 * Calculate 'off' up to the first NULL attr.  We use two cheaper loops
+	 * when the tuple has no variable-width columns.  When variable-width
+	 * columns exists, we use att_addlength_pointer() to move the offset
+	 * beyond the current attribute.
+	 */
+	if (!HeapTupleHasVarWidth(tup))
 	{
-		CompactAttribute *att;
-
-		/*
-		 * If we get here, there are no nulls up to and including the target
-		 * attribute.  If we have a cached offset, we can use it.
-		 */
-		att = TupleDescCompactAttr(tupleDesc, attnum);
-		if (att->attcacheoff >= 0)
-			return fetchatt(att, tp + att->attcacheoff);
-
-		/*
-		 * Otherwise, check for non-fixed-length attrs up to and including
-		 * target.  If there aren't any, it's safe to cheaply initialize the
-		 * cached offsets for these attrs.
-		 */
-		if (HeapTupleHasVarWidth(tup))
+		for (i = startAttr; i < firstNullAttr; i++)
 		{
-			int			j;
+			cattr = TupleDescCompactAttr(tupleDesc, i);
 
-			for (j = 0; j <= attnum; j++)
-			{
-				if (TupleDescCompactAttr(tupleDesc, j)->attlen <= 0)
-				{
-					slow = true;
-					break;
-				}
-			}
-		}
-	}
-
-	if (!slow)
-	{
-		int			natts = tupleDesc->natts;
-		int			j = 1;
-
-		/*
-		 * If we get here, we have a tuple with no nulls or var-widths up to
-		 * and including the target attribute, so we can use the cached offset
-		 * ... only we don't have it yet, or we'd not have got here.  Since
-		 * it's cheap to compute offsets for fixed-width columns, we take the
-		 * opportunity to initialize the cached offsets for *all* the leading
-		 * fixed-width columns, in hope of avoiding future visits to this
-		 * routine.
-		 */
-		TupleDescCompactAttr(tupleDesc, 0)->attcacheoff = 0;
-
-		/* we might have set some offsets in the slow path previously */
-		while (j < natts && TupleDescCompactAttr(tupleDesc, j)->attcacheoff > 0)
-			j++;
-
-		off = TupleDescCompactAttr(tupleDesc, j - 1)->attcacheoff +
-			TupleDescCompactAttr(tupleDesc, j - 1)->attlen;
-
-		for (; j < natts; j++)
-		{
-			CompactAttribute *att = TupleDescCompactAttr(tupleDesc, j);
-
-			if (att->attlen <= 0)
-				break;
-
-			off = att_nominal_alignby(off, att->attalignby);
-
-			att->attcacheoff = off;
-
-			off += att->attlen;
+			off = att_nominal_alignby(off, cattr->attalignby);
+			off += cattr->attlen;
 		}
 
-		Assert(j > attnum);
+		for (; i < attnum; i++)
+		{
+			if (att_isnull(i, bp))
+				continue;
 
-		off = TupleDescCompactAttr(tupleDesc, attnum)->attcacheoff;
+			cattr = TupleDescCompactAttr(tupleDesc, i);
+
+			off = att_nominal_alignby(off, cattr->attalignby);
+			off += cattr->attlen;
+		}
 	}
 	else
 	{
-		bool		usecache = true;
-		int			i;
-
-		/*
-		 * Now we know that we have to walk the tuple CAREFULLY.  But we still
-		 * might be able to cache some offsets for next time.
-		 *
-		 * Note - This loop is a little tricky.  For each non-null attribute,
-		 * we have to first account for alignment padding before the attr,
-		 * then advance over the attr based on its length.  Nulls have no
-		 * storage and no alignment padding either.  We can use/set
-		 * attcacheoff until we reach either a null or a var-width attribute.
-		 */
-		off = 0;
-		for (i = 0;; i++)		/* loop exit is at "break" */
+		for (i = startAttr; i < firstNullAttr; i++)
 		{
-			CompactAttribute *att = TupleDescCompactAttr(tupleDesc, i);
+			int			attlen;
 
-			if (HeapTupleHasNulls(tup) && att_isnull(i, bp))
-			{
-				usecache = false;
-				continue;		/* this cannot be the target att */
-			}
+			cattr = TupleDescCompactAttr(tupleDesc, i);
+			attlen = cattr->attlen;
+			off = att_pointer_alignby(off,
+									  cattr->attalignby,
+									  attlen,
+									  tp + off);
+			off = att_addlength_pointer(off, attlen, tp + off);
+		}
 
-			/* If we know the next offset, we can skip the rest */
-			if (usecache && att->attcacheoff >= 0)
-				off = att->attcacheoff;
-			else if (att->attlen == -1)
-			{
-				/*
-				 * We can only cache the offset for a varlena attribute if the
-				 * offset is already suitably aligned, so that there would be
-				 * no pad bytes in any case: then the offset will be valid for
-				 * either an aligned or unaligned value.
-				 */
-				if (usecache &&
-					off == att_nominal_alignby(off, att->attalignby))
-					att->attcacheoff = off;
-				else
-				{
-					off = att_pointer_alignby(off, att->attalignby, -1,
-											  tp + off);
-					usecache = false;
-				}
-			}
-			else
-			{
-				/* not varlena, so safe to use att_nominal_alignby */
-				off = att_nominal_alignby(off, att->attalignby);
+		for (; i < attnum; i++)
+		{
+			int			attlen;
 
-				if (usecache)
-					att->attcacheoff = off;
-			}
+			if (att_isnull(i, bp))
+				continue;
 
-			if (i == attnum)
-				break;
-
-			off = att_addlength_pointer(off, att->attlen, tp + off);
-
-			if (usecache && att->attlen <= 0)
-				usecache = false;
+			cattr = TupleDescCompactAttr(tupleDesc, i);
+			attlen = cattr->attlen;
+			off = att_pointer_alignby(off, cattr->attalignby, attlen,
+									  tp + off);
+			off = att_addlength_pointer(off, attlen, tp + off);
 		}
 	}
 
-	return fetchatt(TupleDescCompactAttr(tupleDesc, attnum), tp + off);
+	cattr = TupleDescCompactAttr(tupleDesc, attnum);
+	off = att_pointer_alignby(off,
+							  cattr->attalignby,
+							  cattr->attlen,
+							  tp + off);
+
+	return fetchatt(cattr, tp + off);
 }
 
 /* ----------------
@@ -846,13 +806,16 @@ expand_tuple(HeapTuple *targetHeapTuple,
 	Size		targetDataLen;
 	Size		len;
 	int			hoff;
-	bits8	   *nullBits = NULL;
+	uint8	   *nullBits = NULL;
 	int			bitMask = 0;
 	char	   *targetData;
 	uint16	   *infoMask;
 
 	Assert((targetHeapTuple && !targetMinimalTuple)
 		   || (!targetHeapTuple && targetMinimalTuple));
+
+	if (HeapTupleHeaderIsVersionedDatum(sourceTHeader))
+		heap_datum_check(sourceTHeader, tupleDesc);
 
 	Assert(sourceNatts < natts);
 
@@ -901,9 +864,14 @@ expand_tuple(HeapTuple *targetHeapTuple,
 												  att->attlen,
 												  attrmiss[attnum].am_value);
 
-				targetDataLen = att_addlength_pointer(targetDataLen,
-													  att->attlen,
-													  attrmiss[attnum].am_value);
+				targetDataLen = att_addlength_datum(targetDataLen,
+													att->attlen,
+													attrmiss[attnum].am_value);
+
+				if (!AllocSizeIsValid(targetDataLen))
+					ereport(ERROR,
+							errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							errmsg("tuple is too big"));
 			}
 			else
 			{
@@ -952,13 +920,11 @@ expand_tuple(HeapTuple *targetHeapTuple,
 		targetTHeader->t_infomask = sourceTHeader->t_infomask;
 		targetTHeader->t_hoff = hoff;
 		HeapTupleHeaderSetNatts(targetTHeader, natts);
-		HeapTupleHeaderSetDatumLength(targetTHeader, len);
-		HeapTupleHeaderSetTypeId(targetTHeader, tupleDesc->tdtypeid);
-		HeapTupleHeaderSetTypMod(targetTHeader, tupleDesc->tdtypmod);
-		/* We also make sure that t_ctid is invalid unless explicitly set */
-		ItemPointerSetInvalid(&(targetTHeader->t_ctid));
+		/* invalidates t_ctid */
+		heap_tuple_set_datum(targetTHeader, tupleDesc, len);
+
 		if (targetNullLen > 0)
-			nullBits = (bits8 *) ((char *) (*targetHeapTuple)->t_data
+			nullBits = (uint8 *) ((char *) (*targetHeapTuple)->t_data
 								  + offsetof(HeapTupleHeaderData, t_bits));
 		targetData = (char *) (*targetHeapTuple)->t_data + hoff;
 		infoMask = &(targetTHeader->t_infomask);
@@ -975,8 +941,12 @@ expand_tuple(HeapTuple *targetHeapTuple,
 		(*targetMinimalTuple)->t_infomask = sourceTHeader->t_infomask;
 		/* Same macro works for MinimalTuples */
 		HeapTupleHeaderSetNatts(*targetMinimalTuple, natts);
+
+		/* like HeapTupleHeaderClearDatum() */
+		(*targetMinimalTuple)->t_infomask &= ~HEAP_IS_DATUM;
+
 		if (targetNullLen > 0)
-			nullBits = (bits8 *) ((char *) *targetMinimalTuple
+			nullBits = (uint8 *) ((char *) *targetMinimalTuple
 								  + offsetof(MinimalTupleData, t_bits));
 		targetData = (char *) *targetMinimalTuple + hoff;
 		infoMask = &((*targetMinimalTuple)->t_infomask);
@@ -1099,9 +1069,11 @@ heap_copy_tuple_as_datum(HeapTuple tuple, TupleDesc tupleDesc)
 	td = (HeapTupleHeader) palloc(tuple->t_len);
 	memcpy(td, tuple->t_data, tuple->t_len);
 
-	HeapTupleHeaderSetDatumLength(td, tuple->t_len);
-	HeapTupleHeaderSetTypeId(td, tupleDesc->tdtypeid);
-	HeapTupleHeaderSetTypMod(td, tupleDesc->tdtypmod);
+	/* if wrongly marked, set the type from scratch */
+	if (HeapTupleHeaderReallyIsDatum(td))
+		heap_datum_update_type(td, tupleDesc);
+	else
+		heap_tuple_set_datum(td, tupleDesc, tuple->t_len);
 
 	return PointerGetDatum(td);
 }
@@ -1175,14 +1147,20 @@ heap_form_tuple(TupleDesc tupleDescriptor,
 	ItemPointerSetInvalid(&(tuple->t_self));
 	tuple->t_tableOid = InvalidOid;
 
-	HeapTupleHeaderSetDatumLength(td, len);
-	HeapTupleHeaderSetTypeId(td, tupleDescriptor->tdtypeid);
-	HeapTupleHeaderSetTypMod(td, tupleDescriptor->tdtypmod);
-	/* We also make sure that t_ctid is invalid unless explicitly set */
-	ItemPointerSetInvalid(&(td->t_ctid));
-
+	/*
+	 * Mark the tuple as a datum-style tuple. This is safe even if we
+	 * eventually use it as a row type tuple, as e.g. inserting it into a
+	 * table will reset the relevant state.
+	 *
+	 * The reason we always set the datum fields is that there are a lot of
+	 * callers to heap_form_tuple() and the vast majority should have the
+	 * datum information. It's easier to call HeapTupleHeaderClearDatum() in
+	 * the few other cases.
+	 */
 	HeapTupleHeaderSetNatts(td, numberOfAttributes);
 	td->t_hoff = hoff;
+
+	heap_tuple_set_datum(td, tupleDescriptor, len);
 
 	heap_fill_tuple(tupleDescriptor,
 					values,
@@ -1230,8 +1208,8 @@ heap_modify_tuple(HeapTuple tuple,
 	 * O(N^2) if there are many non-replaced columns, so it seems better to
 	 * err on the side of linear cost.
 	 */
-	values = (Datum *) palloc(numberOfAttributes * sizeof(Datum));
-	isnull = (bool *) palloc(numberOfAttributes * sizeof(bool));
+	values = palloc_array(Datum, numberOfAttributes);
+	isnull = palloc_array(bool, numberOfAttributes);
 
 	heap_deform_tuple(tuple, tupleDesc, values, isnull);
 
@@ -1253,9 +1231,12 @@ heap_modify_tuple(HeapTuple tuple,
 	pfree(isnull);
 
 	/*
-	 * copy the identification info of the old tuple: t_ctid, t_self
+	 * copy the identification info of the old tuple: t_self, t_tableOid.
+	 *
+	 * We used to also set t_data->t_ctid here, but that would invalidate the
+	 * version included in datum tuples. There are no known callers that need
+	 * t_ctid copied.
 	 */
-	newTuple->t_data->t_ctid = tuple->t_data->t_ctid;
 	newTuple->t_self = tuple->t_self;
 	newTuple->t_tableOid = tuple->t_tableOid;
 
@@ -1292,8 +1273,8 @@ heap_modify_tuple_by_cols(HeapTuple tuple,
 	 * allocate and fill values and isnull arrays from the tuple, then replace
 	 * selected columns from the input arrays.
 	 */
-	values = (Datum *) palloc(numberOfAttributes * sizeof(Datum));
-	isnull = (bool *) palloc(numberOfAttributes * sizeof(bool));
+	values = palloc_array(Datum, numberOfAttributes);
+	isnull = palloc_array(bool, numberOfAttributes);
 
 	heap_deform_tuple(tuple, tupleDesc, values, isnull);
 
@@ -1315,14 +1296,665 @@ heap_modify_tuple_by_cols(HeapTuple tuple,
 	pfree(values);
 	pfree(isnull);
 
-	/*
-	 * copy the identification info of the old tuple: t_ctid, t_self
-	 */
-	newTuple->t_data->t_ctid = tuple->t_data->t_ctid;
+	/* see equivalent code in heap_modify_tuple() */
 	newTuple->t_self = tuple->t_self;
 	newTuple->t_tableOid = tuple->t_tableOid;
 
 	return newTuple;
+}
+
+/*
+ * Mark the tuple as a datum-style tuple.
+ *
+ * This includes setting the datum's length, typeid and version information.
+ *
+ * The caller already needs to have done HeapTupleHeaderSetNatts().
+ *
+ * Note that the caller needs to be sure that it is safe to use tupleDesc to
+ * deform tup, since this function may remove information that could otherwise
+ * have been used to detect unsafe deforming.
+ *
+ * See also src/backend/catalog/README.attver.md
+ */
+void
+heap_tuple_set_datum(HeapTupleHeader tup, TupleDesc tupleDesc, uint32 len)
+{
+	HeapTupleHeaderSetDatumLength(tup, len);
+	HeapTupleHeaderSetTypeId(tup, tupleDesc->tdtypeid);
+	HeapTupleHeaderSetDatum(tup);
+
+	if (tupleDesc->tdtypeid == RECORDOID)
+	{
+		/*
+		 * RECORDOID tuples are not protected by versioning (and do not need
+		 * to be).
+		 */
+		HeapTupleHeaderSetTypMod(tup, tupleDesc->tdtypmod);
+
+		/*
+		 * Invalidating t_ctid makes the tuple an unversioned datum, even if
+		 * it previously was a versioned one.
+		 */
+		ItemPointerSetInvalid(&tup->t_ctid);
+	}
+	else
+	{
+		int			natts = HeapTupleHeaderGetNatts(tup);
+		XLogRecPtr	version;
+
+		/*
+		 * Stamp the datum with the version of the last attribute it actually
+		 * contains, not the version of the last attribute in the tuple desc.
+		 * That is important in case the tuple has fewer attributes than the
+		 * descriptor.
+		 *
+		 * A zero-attribute tuple contains no data to decode, so it is always
+		 * safe to deform; give it an explicit version of InvalidXLogRecPtr,
+		 * so it can be deformed if columns are added later (as the version is
+		 * stored in pg_attribute, a rowtype without columns has no version).
+		 *
+		 * It is never valid to have fewer attributes in the descriptor than
+		 * the tuple when forming a tuple, so error out in that case.
+		 * Hopefully unreachable.
+		 */
+		if (natts == 0)
+			version = InvalidXLogRecPtr;
+		else if (natts == tupleDesc->natts)
+			version = TupleDescGetVersion(tupleDesc);
+		else if (natts < tupleDesc->natts)
+			version = TupleDescGetAttrVersion(tupleDesc, natts);
+		else
+			elog(ERROR, "datum's descriptor has fewer (%d) attributes than tuple (%d)",
+				 tupleDesc->natts, natts);
+
+		HeapTupleHeaderSetVersion(tup, version);
+	}
+}
+
+/*
+ * Update the type of a datum tuple to the type of tupleDesc.
+ *
+ * If the tuple already is a versioned datum, it is verified to be compatible
+ * with tupleDesc first, as relabeling it would otherwise hide a
+ * mismatch.
+ *
+ * Additionally, if the current type and the target type differ, the types are
+ * verified to be compatible (if possible).
+ */
+void
+heap_datum_update_type(HeapTupleHeader tup, TupleDesc tupleDesc)
+{
+	Assert(HeapTupleHeaderReallyIsDatum(tup));
+
+	heap_datum_check_coercion(tup, tupleDesc);
+
+	heap_tuple_set_datum(tup, tupleDesc,
+						 HeapTupleHeaderGetDatumLength(tup));
+}
+
+/*
+ * Verify that the datum tuple "tup" can be deformed with "deformingDesc",
+ * the descriptor the caller wants to use.
+ *
+ * "datumDesc" is the descriptor of the datum's own row type, against which
+ * the datum's version has already been checked (if it is versioned).  Only
+ * the attributes present in the tuple are compared, so this does not
+ * establish that the two descriptors are interchangeable for other tuples.
+ */
+static void
+verify_tupledesc_compatibility(HeapTupleHeader tup,
+							   TupleDesc datumDesc, TupleDesc deformingDesc)
+{
+	int			datum_natts = HeapTupleHeaderGetNatts(tup);
+	int			error_level =
+		composite_type_mismatch == COMPOSITE_TYPE_MISMATCH_WARN ?
+		WARNING : ERROR;
+
+	/*
+	 * Should never get here with a datumDesc that has insufficient
+	 * attributes.
+	 */
+	if (datumDesc->natts < datum_natts)
+	{
+		elog(error_level, "datum's descriptor has fewer (%d) attributes than tuple (%d)",
+			 datumDesc->natts, datum_natts);
+		return;
+	}
+
+	/*
+	 * We sometimes may get called with a deformingDesc that has extra
+	 * attributes for resjunk columns. That's safe iff the tuple itself does
+	 * not have those columns (the expected case). But we can't accept cases
+	 * where the datum has more attributes than deformingDesc.
+	 */
+	if (unlikely(deformingDesc->natts < datum_natts))
+	{
+		ereport(error_level,
+				errcode(ERRCODE_DATATYPE_MISMATCH),
+				errmsg("tuple descriptor has fewer (%d) attributes than tuple (%d)",
+					   deformingDesc->natts, datum_natts));
+		return;
+	}
+
+	/*
+	 * The message isn't translatable, due to the interpolated format strings.
+	 * That's OK, as this is just a defensive layer that shouldn't be reached.
+	 *
+	 * With composite_type_mismatch = warn, only the first mismatch is
+	 * reported.
+	 */
+#define check_attribute_aspect(aspect, format) \
+	if (unlikely(attr_datum->aspect != attr_deform->aspect)) \
+	{ \
+		ereport(error_level, \
+				errcode(ERRCODE_DATATYPE_MISMATCH), \
+				errmsg_internal("datum attribute \"%s\" at position %d does not match deforming descriptor's %s ("format" vs "format")", \
+								NameStr(attr_datum->attname), \
+								i + 1, \
+								CppAsString(aspect), \
+								attr_datum->aspect, attr_deform->aspect) \
+			); \
+		return; \
+	}
+
+	for (int i = 0; i < datum_natts; i++)
+	{
+		Form_pg_attribute attr_datum = TupleDescAttr(datumDesc, i);
+		Form_pg_attribute attr_deform = TupleDescAttr(deformingDesc, i);
+
+		/* don't care about the attribute's name being the same */
+
+		if (unlikely(attr_datum->attisdropped != attr_deform->attisdropped))
+		{
+			/*
+			 * Targetlists can represent dropped columns as NULL::int4.  A
+			 * NULL attribute consumes neither bytes nor alignment, so its
+			 * type and storage metadata need not match for deforming to be
+			 * safe.
+			 *
+			 * See eval-plan-qual-dropped-column.spec for a test exercising
+			 * this path.
+			 */
+			bool		isnull = (tup->t_infomask & HEAP_HASNULL) &&
+				att_isnull(i, tup->t_bits);
+
+			/*
+			 * XXX: At some point in the future we should also check that
+			 * attr_deform's NOT NULLness matches, due to the optimized
+			 * deforming slots can use for NOT NULL columns. But right now we
+			 * don't know if that's guaranteed here (and the constraints
+			 * applying to the tuple might not yet have been validated). We
+			 * also, at the moment, won't get here for slots with that
+			 * optimization. Therefore delay this for later.
+			 */
+			if (isnull)
+				continue;
+		}
+
+		/* Other dropped-column mismatches require explicit conversion. */
+		check_attribute_aspect(attisdropped, "%u");
+
+		/*
+		 * While, with an atttypid mismatch, the types could be binary
+		 * coercible, we can't know that here, and in any case, it should have
+		 * led to attribute mapping being used.
+		 */
+		if (!attr_datum->attisdropped)
+			check_attribute_aspect(atttypid, "%u");
+		check_attribute_aspect(attlen, "%d");
+		check_attribute_aspect(attalign, "%c");
+
+		/*
+		 * If the attribute is dropped, byval does not matter. It'd generally
+		 * be correct to check byval regardless, but check_attrmap_match()
+		 * doesn't currently, so that could cause spurious errors.
+		 */
+		if (!attr_datum->attisdropped)
+		{
+			/*
+			 * Theoretically bool could be wider than char, so I'm using %u
+			 * here.
+			 */
+			check_attribute_aspect(attbyval, "%u");
+		}
+
+		/*
+		 * It does not seem necessary to compare atttypmod, attcollation, etc,
+		 * they are not required to match for correct deforming.
+		 */
+	}
+#undef check_attribute_aspect
+}
+
+/*
+ * Report accessing a tuple with an incompatible tuple descriptor, due to a
+ * version mismatch.  descVersion is the version the tuple was compared with,
+ * see datum_attribute_version_ok().  This is out-of-line because it can be
+ * reached via several paths.
+ */
+pg_noinline static void
+heap_datum_version_mismatch_error(Oid tupTypeid, Oid descTypeid,
+								  XLogRecPtr tupVersion, XLogRecPtr descVersion)
+{
+	int			error_level =
+		composite_type_mismatch == COMPOSITE_TYPE_MISMATCH_WARN ?
+		WARNING : ERROR;
+
+	/*
+	 * NB: We can't embed the versions in the primary message without making
+	 * test output unstable. Putting them into DETAIL would require the tests
+	 * to use \set VERBOSITY terse, which would also hide the other DETAIL and
+	 * CONTEXT lines that many of them benefit from. Therefore the versions
+	 * are only reported in the server log. That's not pretty, but ...
+	 */
+
+	/* log details about the mismatch */
+	ereport(LOG_SERVER_ONLY,
+			errcode(ERRCODE_DATUM_VERSION_MISMATCH),
+			errmsg("tuple descriptor for type %s (OID %u), version %X/%X is incompatible with tuple type %s (OID %u), version %X/%X",
+				   format_type_be(descTypeid), descTypeid,
+				   LSN_FORMAT_ARGS(descVersion),
+				   format_type_be(tupTypeid), tupTypeid,
+				   LSN_FORMAT_ARGS(tupVersion)));
+
+	/* raise the actual error / warning */
+	ereport(error_level,
+			errcode(ERRCODE_DATUM_VERSION_MISMATCH),
+			tupVersion < descVersion ?
+			errmsg("row type of datum tuple was altered after the datum's creation")
+			:
+			errmsg("using outdated tuple descriptor when deforming row type"),
+			errhint("See server log for additional details."));
+}
+
+/*
+ * Check if the tuple can be safely decoded, despite a mismatch between the
+ * descriptor's version and the tuple's, due to the tuple having fewer
+ * attributes and that subset having a matching version.
+ *
+ * This can happen legitimately if the tuple has fewer attributes than the
+ * descriptor, and only attributes not included in the tuple have been
+ * altered.  To handle that case, we just need to compare the tuple's version
+ * with the version number of attribute tupNatts in the tuple descriptor.
+ *
+ * *cmpVersion is set to the version the tuple was compared with, for the
+ * caller to report a mismatch.
+ */
+static bool
+datum_attribute_version_ok(TupleDesc tupleDesc, int tupNatts,
+						   XLogRecPtr tupVersion, XLogRecPtr *cmpVersion)
+{
+	*cmpVersion = TupleDescGetVersion(tupleDesc);
+
+	/* should only be called if the aggregate version does not match */
+	Assert(*cmpVersion != tupVersion);
+
+	/* always safe to deform no columns */
+	if (tupNatts == 0)
+		return true;
+
+	/*
+	 * Iff the tuple is lacking columns in the descriptor, we can check the
+	 * version of the last column present.
+	 *
+	 * We do not allow cases where the tuple descriptor has fewer columns than
+	 * the tuple, as that indicates using a too old descriptor. It might be
+	 * safe to allow that in some cases, but there don't seem to be any
+	 * convincing cases that'd benefit.
+	 */
+	if (tupleDesc->natts > tupNatts)
+	{
+		*cmpVersion = TupleDescGetAttrVersion(tupleDesc, tupNatts);
+		return tupVersion == *cmpVersion;
+	}
+
+	return false;
+}
+
+/*
+ * Fetch and return a pinned TupleDesc for the type/typmod combination.
+ *
+ * This switches to CurTransactionContext during the fetch, in case we get
+ * called from within something like a tuplesort with a bump context (which
+ * does not support freeing), which could be a problem during a syscache
+ * miss. Because syscache misses can leak some memory, it should be a context
+ * with a somewhat bounded lifetime. Using the current transaction context
+ * seems like the most obvious choice.
+ */
+static TupleDesc
+heap_datum_fetch_tupledesc(Oid tupTypeid, int32 tupTypmod)
+{
+	MemoryContext oldContext = MemoryContextSwitchTo(CurTransactionContext);
+	TupleDesc	descForTuple = lookup_rowtype_tupdesc(tupTypeid, tupTypmod);
+
+	MemoryContextSwitchTo(oldContext);
+
+	return descForTuple;
+}
+
+/*
+ * Fetch the tuple descriptor for the tuple using the tuple's typeid, check
+ * that the tuple has the same version as that fetched descriptor and finally
+ * verify that the callerDesc is compatible with that fetched TupleDesc.
+ *
+ * Normally this should not be needed, but we have a few codepaths that use
+ * tuple descriptors that are verified to be compatible, with mismatching
+ * typeids. In the places this function is used, we can't be sure that the
+ * mismatch is harmless, so we re-verify compatibility.
+ *
+ * NB: This is not cheap, so it's worth making sure that this path is only
+ * reached for cases with significant per-row costs.
+ */
+static void
+heap_datum_fetch_compare_tupledesc(HeapTupleHeader tup,
+								   Oid tupTypeid, int32 tupTypmod,
+								   TupleDesc callerDesc)
+{
+	int			tupNatts = HeapTupleHeaderGetNatts(tup);
+	TupleDesc	descForTuple = heap_datum_fetch_tupledesc(tupTypeid, tupTypmod);
+	XLogRecPtr	descForTupleVersion = TupleDescGetVersion(descForTuple);
+
+	/*
+	 * First check if the tuple descriptor we just looked up has a compatible
+	 * version. It's possible there have been incompatible alterations since
+	 * the tuple was formed.
+	 */
+	if (HeapTupleHeaderIsVersionedDatum(tup))
+	{
+		XLogRecPtr	tupVersion = HeapTupleHeaderGetVersion(tup);
+		XLogRecPtr	cmpVersion;
+
+		if (unlikely(descForTupleVersion != tupVersion) &&
+			!datum_attribute_version_ok(descForTuple, tupNatts, tupVersion,
+										&cmpVersion))
+			heap_datum_version_mismatch_error(tupTypeid, descForTuple->tdtypeid,
+											  tupVersion, cmpVersion);
+	}
+
+	/*
+	 * Now check that the caller's descriptor can decode this particular
+	 * tuple, including any physically NULL dropped-column placeholders.
+	 */
+	verify_tupledesc_compatibility(tup, descForTuple, callerDesc);
+
+	ReleaseTupleDesc(descForTuple);
+}
+
+/*
+ * Try to verify that it is safe to coerce tup to have targetDesc's type.
+ *
+ * This will often be used when the types don't actually differ, so we try to
+ * avoid unnecessary checks.
+ */
+static void
+heap_datum_check_coercion(HeapTupleHeader tup, TupleDesc targetDesc)
+{
+	Oid			tupTypeid = HeapTupleHeaderGetTypeId(tup);
+	int32		tupTypmod = HeapTupleHeaderGetTypMod(tup);
+
+	Assert(HeapTupleHeaderIsDatum(tup));
+
+	if (unlikely(composite_type_mismatch == COMPOSITE_TYPE_MISMATCH_DISABLED))
+		return;
+
+	/* can't check if this is wrongly marked as a datum tuple */
+	if (!HeapTupleHeaderReallyIsDatum(tup))
+		return;
+
+	/*
+	 * Source tuple has an ephemeral row type, so we can't fetch the tuple's
+	 * desc to cross-check against.
+	 */
+	if (tupTypeid == RECORDOID && tupTypmod == -1)
+		return;
+
+	if (tupTypeid != targetDesc->tdtypeid ||
+		(targetDesc->tdtypeid == RECORDOID &&
+		 tupTypmod != targetDesc->tdtypmod))
+	{
+		/*
+		 * The tuple's type and the target type differ, cross check the tuple
+		 * descriptors against each other.
+		 */
+		heap_datum_fetch_compare_tupledesc(tup, tupTypeid, tupTypmod, targetDesc);
+	}
+	else if (HeapTupleHeaderIsVersionedDatum(tup) &&
+			 TupleDescGetVersion(targetDesc) != HeapTupleHeaderGetVersion(tup))
+	{
+		/*
+		 * While the tuple's type and the target type are the same, their
+		 * versions differ. Make sure that's OK.
+		 */
+		heap_datum_check(tup, targetDesc);
+	}
+}
+
+/*
+ * Check that a versioned datum tuple can be safely decoded with the
+ * tupleDesc, raise an error if not.
+ *
+ * It is an error to call this for an unversioned datum, callers need to check
+ * HeapTupleHeaderIsVersionedDatum() first.
+ *
+ * This function implements the attribute versioning checks described in
+ * src/backend/catalog/README.attver.md.  For partially historical reasons, it
+ * needs to handle some corner cases, described below.
+ *
+ * In addition to the versioning checks, this also, if the descriptor and the
+ * tuple are for different types, tries to check that the datum's and the
+ * descriptor's types are compatible.  We should work towards making such
+ * mismatches errors, but until then the additional checks are helpful.
+ */
+void
+heap_datum_check(HeapTupleHeader tup, TupleDesc tupleDesc)
+{
+	XLogRecPtr	descVersion = TupleDescGetVersion(tupleDesc);
+	Oid			tupTypeid = HeapTupleHeaderGetTypeId(tup);
+	int32		tupTypmod = HeapTupleHeaderGetTypMod(tup);
+	XLogRecPtr	tupVersion;
+
+	if (unlikely(composite_type_mismatch == COMPOSITE_TYPE_MISMATCH_DISABLED))
+		return;
+
+	/*
+	 * This should not be reachable, but given this is new infrastructure and
+	 * out-of-tree code might be doing unexpected things, it seems better to
+	 * verify with a runtime check than just an Assert().
+	 */
+	if (unlikely(!HeapTupleHeaderIsVersionedDatum(tup)))
+		elog(ERROR, "heap_datum_check() called on an unversioned datum");
+
+	/* can't check if this is wrongly marked as a datum tuple */
+	if (unlikely(!HeapTupleHeaderReallyIsDatum(tup)))
+		return;
+
+	tupVersion = HeapTupleHeaderGetVersion(tup);
+
+	if (unlikely(tupleDesc->tdtypeid == RECORDOID))
+	{
+		/*
+		 * It's possible that we will get called with a RECORDOID tupledesc
+		 * but the datum has a different type, e.g. because some function just
+		 * updated the descriptor's type to RECORDOID.  In that case it's
+		 * really the caller's responsibility to have made sure that the type
+		 * is right. But we better make sure anyway.
+		 *
+		 * While it's not cheap, we can make sure this is safe by first
+		 * fetching the tuple descriptor for the tuple, verifying that its
+		 * version matches, and then checking that the two tuple descriptors
+		 * are compatible.
+		 *
+		 * The known paths reaching here involve per-row triggers, and
+		 * EvalPlanQual rechecks of whole-row references to function scans,
+		 * where the cost of the additional checking is acceptable.
+		 */
+		heap_datum_fetch_compare_tupledesc(tup, tupTypeid, tupTypmod,
+										   tupleDesc);
+	}
+	else if (unlikely(tupTypeid == InvalidOid))
+	{
+		/*
+		 * This could happen if code does a heap_form_tuple() and then
+		 * overwrites typeid etc with invalid fields. However most such code
+		 * is already handled via the HeapTupleHeaderReallyIsDatum() above.
+		 *
+		 * NB: In contrast to some other paths in this function, we can't
+		 * fetch the tuple's "real" tuple descriptor, we lack a valid type
+		 * oid.
+		 */
+		ereport(ERROR,
+				errmsg_internal("datum tuple without type information"),
+				errhint_internal("An extension may need to be updated."));
+	}
+	else if (unlikely(tupTypeid == RECORDOID))
+	{
+		/*
+		 * The tupledesc has a version number, but the tuple is a record
+		 * tuple, for which we do not store a version number (since it has to
+		 * be a blessed tupledesc that can never change and there are no
+		 * catalog entries to associate the version with either).
+		 *
+		 * This should not be reached, we don't mark a datum as versioned for
+		 * RECORDOID, but could be reached if some caller relabels a versioned
+		 * datum as RECORDOID without going through heap_tuple_set_datum().
+		 */
+		elog(ERROR, "processing record datum (%u, %d) with rowtype tupdesc (%u, %d, %X/%X)",
+			 tupTypeid, tupTypmod,
+			 tupleDesc->tdtypeid, tupleDesc->tdtypmod,
+			 LSN_FORMAT_ARGS(descVersion));
+	}
+	else if (unlikely(tupleDesc->tdtypeid != tupTypeid))
+	{
+		/*
+		 * In some partitioned workloads, we currently use the parent
+		 * tupledesc to deform a child tuple, or vice versa. Typically the
+		 * caller will have verified that no conversion is necessary (c.f.
+		 * build_attrmap_by_name_if_req()), but we can't verify that that
+		 * happened here.
+		 *
+		 * XXX: This code pattern seems problematic, but it's probably not
+		 * feasible to fix this in the back branches. Medium term I think the
+		 * tuple conversion paths should update the tuple's typeid even when
+		 * otherwise no conversion is needed.
+		 *
+		 * To make sure this cannot lead to unsafe deforming, we check that
+		 * the tuple descriptor for the tuple (identified by typeid and
+		 * version) and the one used by the caller are compatible.
+		 *
+		 * The known cases leading here are DML with triggers and/or ON
+		 * CONFLICT, where the per-row cost of this check is acceptable.
+		 */
+		heap_datum_fetch_compare_tupledesc(tup, tupTypeid, tupTypmod,
+										   tupleDesc);
+	}
+	else if (unlikely(tupVersion != descVersion))
+	{
+		XLogRecPtr	cmpVersion;
+
+		/*
+		 * The tuple's version does not match the tuple descriptor's.
+		 *
+		 * Check if that's solely because the tuple is shorter (i.e. only new
+		 * columns have been added since the tuple was formed).
+		 *
+		 * Otherwise report the mismatch.
+		 */
+		if (!datum_attribute_version_ok(tupleDesc, HeapTupleHeaderGetNatts(tup),
+										tupVersion, &cmpVersion))
+			heap_datum_version_mismatch_error(tupTypeid, tupleDesc->tdtypeid,
+											  tupVersion, cmpVersion);
+	}
+}
+
+/*
+ * Helper for DatumGetHeapTupleHeader / DatumGetHeapTupleHeaderCopy.
+ *
+ * This implements the "Upgrading from pre-versioning composite datums" logic
+ * in src/backend/catalog/README.attver.md.
+ *
+ * Due to requiring a copy of the input tuple, this isn't exactly cheap, but
+ * there should be fewer and fewer unversioned tuples in clusters over time, as
+ * such datums get re-formed or deleted. We unfortunately can't just fix them
+ * in-place without causing larger issues.
+ */
+static inline HeapTupleHeader
+DatumGetHeapTupleHeaderImpl(Datum t, bool copy, bool *was_datum)
+{
+	struct varlena *tpr = (struct varlena *) DatumGetPointer(t);
+	HeapTupleHeader tp;
+	Oid			tupTypeid;
+
+	if (copy)
+		tp = (HeapTupleHeader) pg_detoast_datum_copy(tpr);
+	else
+	{
+		tp = (HeapTupleHeader) pg_detoast_datum(tpr);
+		copy = ((struct varlena *) tp) != tpr;
+	}
+
+	tupTypeid = HeapTupleHeaderGetTypeId(tp);
+
+	if (was_datum)
+		*was_datum = true;
+
+	if (!HeapTupleHeaderIsDatum(tp))
+	{
+		Assert(HeapTupleHeaderGetDatumLength(tp) > 0);
+
+		if (was_datum)
+			*was_datum = false;
+
+		/*
+		 * We need to modify the tuple header but it hasn't been copied yet
+		 * (not detoasted, not called by DatumGetHeapTupleHeaderCopy), copy it
+		 * now.
+		 */
+		if (!copy)
+		{
+			Size		sz = HeapTupleHeaderGetDatumLength(tp);
+			HeapTupleHeader tp2;
+
+			copy = true;
+
+			tp2 = (HeapTupleHeader) palloc(sz);
+			memcpy(tp2, tp, sz);
+			tp = tp2;
+		}
+
+		/*
+		 * Mark as a datum tuple, versioned at version InvalidXLogRecPtr
+		 * unless it's a RECORDOID style datum.
+		 */
+		HeapTupleHeaderSetDatum(tp);
+		if (tupTypeid != RECORDOID)
+			HeapTupleHeaderSetVersion(tp, InvalidXLogRecPtr);
+	}
+
+	Assert(HeapTupleHeaderReallyIsDatum(tp));
+
+	return tp;
+}
+
+HeapTupleHeader
+DatumGetHeapTupleHeader(Datum t)
+{
+	return DatumGetHeapTupleHeaderImpl(t, false, NULL);
+}
+
+/*
+ * Like DatumGetHeapTupleHeader but returns whether the datum was already
+ * marked as a datum in *was_datum.
+ */
+HeapTupleHeader
+DatumGetHeapTupleHeaderExt(Datum t, bool *was_datum)
+{
+	return DatumGetHeapTupleHeaderImpl(t, false, was_datum);
+}
+
+HeapTupleHeader
+DatumGetHeapTupleHeaderCopy(Datum t)
+{
+	return DatumGetHeapTupleHeaderImpl(t, true, NULL);
 }
 
 /*
@@ -1347,16 +1979,24 @@ heap_deform_tuple(HeapTuple tuple, TupleDesc tupleDesc,
 				  Datum *values, bool *isnull)
 {
 	HeapTupleHeader tup = tuple->t_data;
+	CompactAttribute *cattr;
 	bool		hasnulls = HeapTupleHasNulls(tuple);
 	int			tdesc_natts = tupleDesc->natts;
 	int			natts;			/* number of atts to extract */
 	int			attnum;
 	char	   *tp;				/* ptr to tuple data */
 	uint32		off;			/* offset in tuple data */
-	bits8	   *bp = tup->t_bits;	/* ptr to null bitmap in tuple */
-	bool		slow = false;	/* can we use/set attcacheoff? */
+	uint8	   *bp = tup->t_bits;	/* ptr to null bitmap in tuple */
+	int			firstNonCacheOffsetAttr;
+	int			firstNullAttr;
+
+	if (HeapTupleHeaderIsVersionedDatum(tup))
+		heap_datum_check(tup, tupleDesc);
 
 	natts = HeapTupleHeaderGetNatts(tup);
+
+	/* Did someone forget to call TupleDescFinalize()? */
+	Assert(tupleDesc->firstNonCachedOffsetAttr >= 0);
 
 	/*
 	 * In inheritance situations, it is possible that the given tuple actually
@@ -1364,60 +2004,84 @@ heap_deform_tuple(HeapTuple tuple, TupleDesc tupleDesc,
 	 * the caller's arrays.
 	 */
 	natts = Min(natts, tdesc_natts);
+	firstNonCacheOffsetAttr = Min(tupleDesc->firstNonCachedOffsetAttr, natts);
+
+	if (hasnulls)
+	{
+		firstNullAttr = first_null_attr(bp, natts);
+
+		/*
+		 * XXX: it'd be nice to use populate_isnull_array() here, but that
+		 * requires that the isnull array's size is rounded up to the next
+		 * multiple of 8.  Doing that would require adjusting many locations
+		 * that allocate the array.
+		 */
+		firstNonCacheOffsetAttr = Min(firstNonCacheOffsetAttr, firstNullAttr);
+	}
+	else
+		firstNullAttr = natts;
 
 	tp = (char *) tup + tup->t_hoff;
+	attnum = 0;
 
-	off = 0;
-
-	for (attnum = 0; attnum < natts; attnum++)
+	if (firstNonCacheOffsetAttr > 0)
 	{
-		CompactAttribute *thisatt = TupleDescCompactAttr(tupleDesc, attnum);
+#ifdef USE_ASSERT_CHECKING
+		/* In Assert enabled builds, verify attcacheoff is correct */
+		int			offcheck = 0;
+#endif
+		do
+		{
+			isnull[attnum] = false;
+			cattr = TupleDescCompactAttr(tupleDesc, attnum);
+			off = cattr->attcacheoff;
 
-		if (hasnulls && att_isnull(attnum, bp))
+#ifdef USE_ASSERT_CHECKING
+			offcheck = att_nominal_alignby(offcheck, cattr->attalignby);
+			Assert(offcheck == cattr->attcacheoff);
+			offcheck += cattr->attlen;
+#endif
+
+			values[attnum] = fetch_att_noerr(tp + off,
+											 cattr->attbyval,
+											 cattr->attlen);
+		} while (++attnum < firstNonCacheOffsetAttr);
+		off += cattr->attlen;
+	}
+	else
+		off = 0;
+
+	for (; attnum < firstNullAttr; attnum++)
+	{
+		isnull[attnum] = false;
+		cattr = TupleDescCompactAttr(tupleDesc, attnum);
+		values[attnum] = align_fetch_then_add(tp,
+											  &off,
+											  cattr->attbyval,
+											  cattr->attlen,
+											  cattr->attalignby);
+	}
+
+	for (; attnum < natts; attnum++)
+	{
+		Assert(hasnulls);
+
+		if (att_isnull(attnum, bp))
 		{
 			values[attnum] = (Datum) 0;
 			isnull[attnum] = true;
-			slow = true;		/* can't use attcacheoff anymore */
 			continue;
 		}
 
 		isnull[attnum] = false;
+		cattr = TupleDescCompactAttr(tupleDesc, attnum);
 
-		if (!slow && thisatt->attcacheoff >= 0)
-			off = thisatt->attcacheoff;
-		else if (thisatt->attlen == -1)
-		{
-			/*
-			 * We can only cache the offset for a varlena attribute if the
-			 * offset is already suitably aligned, so that there would be no
-			 * pad bytes in any case: then the offset will be valid for either
-			 * an aligned or unaligned value.
-			 */
-			if (!slow &&
-				off == att_nominal_alignby(off, thisatt->attalignby))
-				thisatt->attcacheoff = off;
-			else
-			{
-				off = att_pointer_alignby(off, thisatt->attalignby, -1,
-										  tp + off);
-				slow = true;
-			}
-		}
-		else
-		{
-			/* not varlena, so safe to use att_nominal_alignby */
-			off = att_nominal_alignby(off, thisatt->attalignby);
-
-			if (!slow)
-				thisatt->attcacheoff = off;
-		}
-
-		values[attnum] = fetchatt(thisatt, tp + off);
-
-		off = att_addlength_pointer(off, thisatt->attlen, tp + off);
-
-		if (thisatt->attlen <= 0)
-			slow = true;		/* can't use attcacheoff anymore */
+		/* align 'off', fetch the attr's value, and increment off beyond it */
+		values[attnum] = align_fetch_then_add(tp,
+											  &off,
+											  cattr->attbyval,
+											  cattr->attlen,
+											  cattr->attalignby);
 	}
 
 	/*
@@ -1502,7 +2166,6 @@ heap_form_minimal_tuple(TupleDesc tupleDescriptor,
 	 * Allocate and zero the space needed.
 	 */
 	mem = palloc0(len + extra);
-	memset(mem, 0, extra);
 	tuple = (MinimalTuple) (mem + extra);
 
 	/*
@@ -1597,6 +2260,22 @@ minimal_tuple_from_heap_tuple(HeapTuple htup, Size extra)
 	memset(mem, 0, extra);
 	result = (MinimalTuple) (mem + extra);
 	memcpy(result, (char *) htup->t_data + MINIMAL_TUPLE_OFFSET, len);
+
+	/*
+	 * A minimal tuple won't have the necessary fields to be treated as a
+	 * datum tuple, so we better reset those fields lest they trigger assert
+	 * failures at a later point.
+	 *
+	 * XXX: It'd be good to call heap_datum_check() before losing the ability
+	 * to do so, but we don't have the tupledesc, so we can't trivially do so.
+	 * We could try to fetch the tupledesc from typeid and verify that way?
+	 * But that's not cheap.
+	 */
+	if (HeapTupleHeaderIsDatum(htup->t_data))
+	{
+		/* like HeapTupleHeaderClearDatum() */
+		result->t_infomask &= ~HEAP_IS_DATUM;
+	}
 
 	result->t_len = len;
 	return result;

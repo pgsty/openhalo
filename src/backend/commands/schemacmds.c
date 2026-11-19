@@ -3,7 +3,7 @@
  * schemacmds.c
  *	  schema creation/manipulation commands
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,7 +25,6 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
-#include "commands/dbcommands.h"
 #include "commands/event_trigger.h"
 #include "commands/schemacmds.h"
 #include "miscadmin.h"
@@ -34,6 +33,7 @@
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -49,7 +49,7 @@ static void AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerI
  * a subquery.
  */
 Oid
-CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
+CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
 					int stmt_location, int stmt_len)
 {
 	const char *schemaName = stmt->schemaname;
@@ -194,7 +194,8 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 	 * we cannot, in general, run parse analysis on one statement until we
 	 * have actually executed the prior ones.
 	 */
-	parsetree_list = transformCreateSchemaStmtElements(stmt->schemaElts,
+	parsetree_list = transformCreateSchemaStmtElements(pstate,
+													   stmt->schemaElts,
 													   schemaName);
 
 	/*
@@ -215,10 +216,11 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 		wrapper->utilityStmt = stmt;
 		wrapper->stmt_location = stmt_location;
 		wrapper->stmt_len = stmt_len;
+		wrapper->planOrigin = PLAN_STMT_INTERNAL;
 
 		/* do this step */
 		ProcessUtility(wrapper,
-					   queryString,
+					   pstate->p_sourcetext,
 					   false,
 					   PROCESS_UTILITY_SUBCOMMAND,
 					   NULL,
@@ -248,23 +250,27 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 ObjectAddress
 RenameSchema(const char *oldname, const char *newname)
 {
+	ObjectAddress address;
 	Oid			nspOid;
 	HeapTuple	tup;
 	Relation	rel;
 	AclResult	aclresult;
-	ObjectAddress address;
 	Form_pg_namespace nspform;
+
+	/* Locking before priv checks is bad, but DROP SCHEMA does the same. */
+	address = get_object_address(OBJECT_SCHEMA,
+								 (Node *) makeString(pstrdup(oldname)),
+								 NULL,
+								 AccessExclusiveLock, false);
+	nspOid = address.objectId;
 
 	rel = table_open(NamespaceRelationId, RowExclusiveLock);
 
-	tup = SearchSysCacheCopy1(NAMESPACENAME, CStringGetDatum(oldname));
+	tup = SearchSysCacheCopy1(NAMESPACEOID, ObjectIdGetDatum(nspOid));
 	if (!HeapTupleIsValid(tup))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_SCHEMA),
-				 errmsg("schema \"%s\" does not exist", oldname)));
+		elog(ERROR, "cache lookup failed for schema %u", nspOid);
 
 	nspform = (Form_pg_namespace) GETSTRUCT(tup);
-	nspOid = nspform->oid;
 
 	/* make sure the new name doesn't exist */
 	if (OidIsValid(get_namespace_oid(newname, true)))
@@ -294,8 +300,6 @@ RenameSchema(const char *oldname, const char *newname)
 	CatalogTupleUpdate(rel, &tup->t_self, tup);
 
 	InvokeObjectPostAlterHook(NamespaceRelationId, nspOid, 0);
-
-	ObjectAddressSet(address, NamespaceRelationId, nspOid);
 
 	table_close(rel, NoLock);
 	heap_freetuple(tup);

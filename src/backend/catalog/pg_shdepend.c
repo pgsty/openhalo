@@ -3,7 +3,7 @@
  * pg_shdepend.c
  *	  routines to support manipulation of the pg_shdepend relation
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -61,6 +61,7 @@
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 
@@ -103,7 +104,8 @@ static void storeObjectDescription(StringInfo descs,
 								   ObjectAddress *object,
 								   SharedDependencyType deptype,
 								   int count);
-static void shdepReassignOwned_Owner(Form_pg_shdepend sdepForm, Oid newrole);
+static void shdepReassignOwned_Owner(Form_pg_shdepend sdepForm,
+									 Oid oldrole, Oid newrole);
 static void shdepReassignOwned_InitAcl(Form_pg_shdepend sdepForm,
 									   Oid oldrole, Oid newrole);
 
@@ -791,7 +793,7 @@ checkSharedDependencies(Oid classId, Oid objectId,
 			}
 			if (!stored)
 			{
-				dep = (remoteDep *) palloc(sizeof(remoteDep));
+				dep = palloc_object(remoteDep);
 				dep->dbOid = sdepForm->dbid;
 				dep->count = 1;
 				remDeps = lappend(remDeps, dep);
@@ -913,7 +915,7 @@ copyTemplateDependencies(Oid templateDbId, Oid newDbId)
 	 * know that they will be used.
 	 */
 	max_slots = MAX_CATALOG_MULTI_INSERT_BYTES / sizeof(FormData_pg_shdepend);
-	slot = palloc(sizeof(TupleTableSlot *) * max_slots);
+	slot = palloc_array(TupleTableSlot *, max_slots);
 
 	indstate = CatalogOpenIndexes(sdepRel);
 
@@ -956,12 +958,12 @@ copyTemplateDependencies(Oid templateDbId, Oid newDbId)
 		shdep = (Form_pg_shdepend) GETSTRUCT(tup);
 
 		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_dbid - 1] = ObjectIdGetDatum(newDbId);
-		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_classid - 1] = shdep->classid;
-		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_objid - 1] = shdep->objid;
-		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_objsubid - 1] = shdep->objsubid;
-		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_refclassid - 1] = shdep->refclassid;
-		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_refobjid - 1] = shdep->refobjid;
-		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_deptype - 1] = shdep->deptype;
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_classid - 1] = ObjectIdGetDatum(shdep->classid);
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_objid - 1] = ObjectIdGetDatum(shdep->objid);
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_objsubid - 1] = Int32GetDatum(shdep->objsubid);
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_refclassid - 1] = ObjectIdGetDatum(shdep->refclassid);
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_refobjid - 1] = ObjectIdGetDatum(shdep->refobjid);
+		slot[slot_stored_count]->tts_values[Anum_pg_shdepend_deptype - 1] = CharGetDatum(shdep->deptype);
 
 		ExecStoreVirtualTuple(slot[slot_stored_count]);
 		slot_stored_count++;
@@ -1202,15 +1204,14 @@ classIdGetDbId(Oid classId)
 /*
  * shdepLockAndCheckObject
  *
- * Lock the object that we are about to record a dependency on.
- * After it's locked, verify that it hasn't been dropped while we
- * weren't looking.  If the object has been dropped, this function
- * does not return!
+ * Acquire an AccessShareLock on a shared object and verify that it still
+ * exists.  This is used when recording a dependency or performing another
+ * operation that must protect the object against a concurrent DROP.
  */
 void
 shdepLockAndCheckObject(Oid classId, Oid objectId)
 {
-	/* AccessShareLock should be OK, since we are not modifying the object */
+	/* AccessShareLock is sufficient to prevent a concurrent DROP. */
 	LockSharedObject(classId, objectId, 0, AccessShareLock);
 
 	switch (classId)
@@ -1415,8 +1416,8 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 				case SHARED_DEPENDENCY_POLICY:
 
 					/*
-					 * Try to remove role from policy; if unable to, remove
-					 * policy.
+					 * Try to remove role from policy; if that would leave the
+					 * policy with no roles, remove the policy.
 					 */
 					if (!RemoveRoleFromObjectPolicy(roleid,
 													sdepForm->classid,
@@ -1453,12 +1454,29 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 					 */
 					if (sdepForm->classid != AuthMemRelationId)
 					{
+						/*
+						 * Lock tablespaces before updating their catalog
+						 * tuple.
+						 */
+						if (sdepForm->classid == TableSpaceRelationId)
+						{
+							LockSharedObject(sdepForm->classid,
+											 sdepForm->objid, 0,
+											 AccessShareLock);
+							if (!systable_recheck_tuple(scan, tuple))
+							{
+								UnlockSharedObject(sdepForm->classid,
+												   sdepForm->objid, 0,
+												   AccessShareLock);
+								break;
+							}
+						}
 						RemoveRoleFromObjectACL(roleid,
 												sdepForm->classid,
 												sdepForm->objid);
 						break;
 					}
-					/* FALLTHROUGH */
+					pg_fallthrough;
 
 				case SHARED_DEPENDENCY_OWNER:
 
@@ -1525,6 +1543,25 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
  *
  * Change the owner of objects owned by any of the roles in roleids to
  * newrole.  Grants are not touched.
+ *
+ * This must check the same GetUserId() privileges as individual ALTER
+ * ... OWNER TO commands.
+ *
+ * This should also check the same newrole privileges as ALTER ... OWNER TO
+ * commands.  XXX Today, unlike ALTER TABLE and ALTER TYPE, this doesn't
+ * require newrole to have CREATE privilege on the containing schema.
+ * Long-term, remove the newrole privilege checks from ALTER ... OWNER TO or
+ * cover them here.  The newrole checks are intended to enforce that altering
+ * the owner doesn't do anything you couldn't do by dropping and recreating
+ * the object.  Failing to achieve that goal is a bug but not a vulnerability.
+ *
+ * There's also an ambiguity in the "same newrole privileges" goal.  When
+ * running more than one ALTER ... OWNER TO, order of commands can affect
+ * success of privilege checks.  For example, ALTER SCHEMA ... OWNER TO can
+ * change the success or failure of privilege checks in future ALTER FUNCTION
+ * ... OWNER.  ALTER DATABASE ... OWNER TO can change future ALTER PUBLICATION
+ * ... OWNER.  This operation runs ownership changes in an unspecified order,
+ * currently tied to catalog tuple physical order.
  */
 void
 shdepReassignOwned(List *roleids, Oid newrole)
@@ -1608,7 +1645,21 @@ shdepReassignOwned(List *roleids, Oid newrole)
 			switch (sdepForm->deptype)
 			{
 				case SHARED_DEPENDENCY_OWNER:
-					shdepReassignOwned_Owner(sdepForm, newrole);
+					/* Lock tablespaces before updating their catalog tuple. */
+					if (sdepForm->classid == TableSpaceRelationId)
+					{
+						LockSharedObject(sdepForm->classid,
+										 sdepForm->objid, 0,
+										 AccessShareLock);
+						if (!systable_recheck_tuple(scan, tuple))
+						{
+							UnlockSharedObject(sdepForm->classid,
+											   sdepForm->objid, 0,
+											   AccessShareLock);
+							break;
+						}
+					}
+					shdepReassignOwned_Owner(sdepForm, roleid, newrole);
 					break;
 				case SHARED_DEPENDENCY_INITACL:
 					shdepReassignOwned_InitAcl(sdepForm, roleid, newrole);
@@ -1644,8 +1695,15 @@ shdepReassignOwned(List *roleids, Oid newrole)
  * shdepReassignOwned's processing of SHARED_DEPENDENCY_OWNER entries
  */
 static void
-shdepReassignOwned_Owner(Form_pg_shdepend sdepForm, Oid newrole)
+shdepReassignOwned_Owner(Form_pg_shdepend sdepForm, Oid oldrole, Oid newrole)
 {
+	/* mirror AlterDatabaseOwner() privilege check */
+	if (sdepForm->classid == DatabaseRelationId && oldrole != newrole &&
+		!have_createdb_privilege())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to change owner of database")));
+
 	/* Issue the appropriate ALTER OWNER call */
 	switch (sdepForm->classid)
 	{

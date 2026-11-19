@@ -5,7 +5,7 @@
  *	to control oid and relfilenumber assignment, and do other special
  *	hacks needed for pg_upgrade.
  *
- *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	src/backend/utils/adt/pg_upgrade_support.c
  */
 
@@ -21,12 +21,14 @@
 #include "commands/extension.h"
 #include "miscadmin.h"
 #include "replication/logical.h"
+#include "replication/logicallauncher.h"
 #include "replication/origin.h"
 #include "replication/worker_internal.h"
 #include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 
 
@@ -159,6 +161,51 @@ binary_upgrade_set_next_toast_relfilenode(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/*
+ * Supply the attribute versions, for the next relation to be created, from
+ * the old cluster. See SetBinaryUpgradeAttributeVersions().
+ */
+Datum
+binary_upgrade_set_next_attribute_versions(PG_FUNCTION_ARGS)
+{
+	ArrayType  *array = PG_GETARG_ARRAYTYPE_P(0);
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elems;
+	int			nelems;
+	BinaryUpgradeAttributeVersions *versions;
+
+	CHECK_IS_BINARY_UPGRADE;
+
+	if (array_contains_nulls(array))
+		elog(ERROR, "null attribute version value is not allowed");
+
+	get_typlenbyvalalign(LSNOID, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(array, LSNOID, elmlen, elmbyval, elmalign,
+					  &elems, NULL, &nelems);
+
+	/*
+	 * The array has to outlive this statement, as it is consumed by the next
+	 * one.  Should that statement fail, the versions stay pending and would
+	 * be applied to the next relation created instead.  That cannot happen in
+	 * practice: pg_upgrade restores with pg_restore --exit-on-error, so a
+	 * failed CREATE ends the restore.
+	 */
+	versions = MemoryContextAlloc(TopMemoryContext,
+								  offsetof(BinaryUpgradeAttributeVersions, versions) +
+								  nelems * sizeof(XLogRecPtr));
+	versions->natts = nelems;
+	for (int i = 0; i < nelems; i++)
+		versions->versions[i] = DatumGetLSN(elems[i]);
+
+	if (binary_upgrade_next_attribute_versions != NULL)
+		pfree(binary_upgrade_next_attribute_versions);
+	binary_upgrade_next_attribute_versions = versions;
+
+	PG_RETURN_VOID();
+}
+
 Datum
 binary_upgrade_set_next_pg_enum_oid(PG_FUNCTION_ARGS)
 {
@@ -281,11 +328,12 @@ binary_upgrade_set_missing_value(PG_FUNCTION_ARGS)
  * upgraded without data loss.
  */
 Datum
-binary_upgrade_logical_slot_has_caught_up(PG_FUNCTION_ARGS)
+binary_upgrade_check_logical_slot_pending_wal(PG_FUNCTION_ARGS)
 {
 	Name		slot_name;
 	XLogRecPtr	end_of_wal;
-	bool		found_pending_wal;
+	XLogRecPtr	scan_cutoff_lsn;
+	XLogRecPtr	last_pending_wal;
 
 	CHECK_IS_BINARY_UPGRADE;
 
@@ -296,6 +344,7 @@ binary_upgrade_logical_slot_has_caught_up(PG_FUNCTION_ARGS)
 	Assert(has_rolreplication(GetUserId()));
 
 	slot_name = PG_GETARG_NAME(0);
+	scan_cutoff_lsn = PG_GETARG_LSN(1);
 
 	/* Acquire the given slot */
 	ReplicationSlotAcquire(NameStr(*slot_name), true, true);
@@ -306,12 +355,16 @@ binary_upgrade_logical_slot_has_caught_up(PG_FUNCTION_ARGS)
 	Assert(MyReplicationSlot->data.invalidated == RS_INVAL_NONE);
 
 	end_of_wal = GetFlushRecPtr(NULL);
-	found_pending_wal = LogicalReplicationSlotHasPendingWal(end_of_wal);
+	last_pending_wal = LogicalReplicationSlotCheckPendingWal(end_of_wal,
+															 scan_cutoff_lsn);
 
 	/* Clean up */
 	ReplicationSlotRelease();
 
-	PG_RETURN_BOOL(!found_pending_wal);
+	if (XLogRecPtrIsValid(last_pending_wal))
+		PG_RETURN_LSN(last_pending_wal);
+	else
+		PG_RETURN_NULL();
 }
 
 /*
@@ -371,7 +424,7 @@ binary_upgrade_replorigin_advance(PG_FUNCTION_ARGS)
 	Oid			subid;
 	char	   *subname;
 	char		originname[NAMEDATALEN];
-	RepOriginId node;
+	ReplOriginId node;
 	XLogRecPtr	remote_commit;
 
 	CHECK_IS_BINARY_UPGRADE;
@@ -407,6 +460,24 @@ binary_upgrade_replorigin_advance(PG_FUNCTION_ARGS)
 
 	UnlockRelationOid(ReplicationOriginRelationId, RowExclusiveLock);
 	table_close(rel, RowExclusiveLock);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * binary_upgrade_create_conflict_detection_slot
+ *
+ * Create a replication slot to retain information necessary for conflict
+ * detection such as dead tuples, commit timestamps, and origins.
+ */
+Datum
+binary_upgrade_create_conflict_detection_slot(PG_FUNCTION_ARGS)
+{
+	CHECK_IS_BINARY_UPGRADE;
+
+	CreateConflictDetectionSlot();
+
+	ReplicationSlotRelease();
 
 	PG_RETURN_VOID();
 }

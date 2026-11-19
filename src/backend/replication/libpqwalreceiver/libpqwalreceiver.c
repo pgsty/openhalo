@@ -9,7 +9,7 @@
  * Apart from walreceiver, the libpq-specific routines are now being used by
  * logical replication workers and slot synchronization.
  *
- * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -30,6 +30,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "pqexpbuffer.h"
+#include "replication/slotsync.h"
 #include "replication/walreceiver.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
@@ -63,7 +64,8 @@ static char *libpqrcv_get_conninfo(WalReceiverConn *conn);
 static void libpqrcv_get_senderinfo(WalReceiverConn *conn,
 									char **sender_host, int *sender_port);
 static char *libpqrcv_identify_system(WalReceiverConn *conn,
-									  TimeLineID *primary_tli);
+									  TimeLineID *primary_tli,
+									  XLogRecPtr *server_lsn);
 static char *libpqrcv_get_dbname_from_conninfo(const char *connInfo);
 static char *libpqrcv_get_option_from_conninfo(const char *connInfo,
 											   const char *keyword);
@@ -138,11 +140,11 @@ _PG_init(void)
  *
  * If an error occurs, this function will normally return NULL and set *err
  * to a palloc'ed error message. However, if must_use_password is true and
- * the connection fails to use the password, this function will ereport(ERROR).
- * We do this because in that case the error includes a detail and a hint for
- * consistency with other parts of the system, and it's not worth adding the
- * machinery to pass all of those back to the caller just to cover this one
- * case.
+ * the connection fails to use the password, or if the connection string
+ * contains disallowed options, this function will ereport(ERROR). We do this
+ * because in that case the error includes a detail and a hint for consistency
+ * with other parts of the system, and it's not worth adding the machinery to
+ * pass all of those back to the caller just to cover this one case.
  */
 static WalReceiverConn *
 libpqrcv_connect(const char *conninfo, bool replication, bool logical,
@@ -153,6 +155,7 @@ libpqrcv_connect(const char *conninfo, bool replication, bool logical,
 	const char *vals[6];
 	int			i = 0;
 	char	   *options_val = NULL;
+	bool		allow_unsafe_opts = false;
 
 	/*
 	 * Re-validate connection string. The validation already happened at DDL
@@ -162,6 +165,33 @@ libpqrcv_connect(const char *conninfo, bool replication, bool logical,
 	 * PGPASSWORD.
 	 */
 	libpqrcv_check_conninfo(conninfo, must_use_password);
+
+	if (!must_use_password)
+	{
+		/*
+		 * CVE-2026-14661: Generally speaking, we want to protect any callers
+		 * of walrcv_connect() from connection options that could allow
+		 * elevation of privileges. But we also want to avoid restricting
+		 * primary_conninfo, which the DBA should have broad control over.
+		 *
+		 * For back branches, we detect that case in two ways: either the
+		 * conninfo pointer we were given is literally the primary_conninfo
+		 * GUC variable, or the WAL receiver is starting physical replication.
+		 *
+		 * This exception isn't granted if must_use_password is true, since we
+		 * don't know if unsafe options might allow that restriction to be
+		 * bypassed in other ways. (At time of writing, there are no callers
+		 * in core Postgres that use PrimaryConnInfo in combination with
+		 * must_use_password.)
+		 */
+		if (conninfo == PrimaryConnInfo ||
+			(AmWalReceiverProcess() && replication && !logical))
+			allow_unsafe_opts = true;
+	}
+
+	/* Final security check on the proxied connection options. */
+	if (!allow_unsafe_opts)
+		libpqsrv_check_proxy_conninfo(conninfo);
 
 	/*
 	 * We use the expand_dbname parameter to process the connection string (or
@@ -221,11 +251,14 @@ libpqrcv_connect(const char *conninfo, bool replication, bool logical,
 
 	Assert(i < lengthof(keys));
 
-	conn = palloc0(sizeof(WalReceiverConn));
+	conn = palloc0_object(WalReceiverConn);
 	conn->streamConn =
-		libpqsrv_connect_params(keys, vals,
-								 /* expand_dbname = */ true,
-								WAIT_EVENT_LIBPQWALRECEIVER_CONNECT);
+		libpqsrv_connect_params_start(keys, vals,
+									   /* expand_dbname = */ true);
+	PQsetNoticeReceiver(conn->streamConn, libpqsrv_notice_receiver,
+						"received message via replication");
+	libpqsrv_connect_complete(conn->streamConn,
+							  WAIT_EVENT_LIBPQWALRECEIVER_CONNECT);
 
 	if (options_val != NULL)
 		pfree(options_val);
@@ -288,6 +321,10 @@ bad_connection:
  * an error. If must_use_password is true, the function raises an error
  * if no password is provided in the connection string. In any other case
  * it successfully completes.
+ *
+ * CVE-2026-14661: We don't check for unsafe options here; instead we defer to
+ * libpqrcv_connect() to keep dump/restore from failing. That's not the
+ * greatest UX, and it'd be good to improve this after the initial fix lands.
  */
 static void
 libpqrcv_check_conninfo(const char *conninfo, bool must_use_password)
@@ -418,7 +455,8 @@ libpqrcv_get_senderinfo(WalReceiverConn *conn, char **sender_host,
  * timeline ID of the primary.
  */
 static char *
-libpqrcv_identify_system(WalReceiverConn *conn, TimeLineID *primary_tli)
+libpqrcv_identify_system(WalReceiverConn *conn, TimeLineID *primary_tli,
+						 XLogRecPtr *server_lsn)
 {
 	PGresult   *res;
 	char	   *primary_sysid;
@@ -431,35 +469,27 @@ libpqrcv_identify_system(WalReceiverConn *conn, TimeLineID *primary_tli)
 						"IDENTIFY_SYSTEM",
 						WAIT_EVENT_LIBPQWALRECEIVER_RECEIVE);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		PQclear(res);
 		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("could not receive database system identifier and timeline ID from "
 						"the primary server: %s",
 						pchomp(PQerrorMessage(conn->streamConn)))));
-	}
 
 	/*
 	 * IDENTIFY_SYSTEM returns 3 columns in 9.3 and earlier, and 4 columns in
 	 * 9.4 and onwards.
 	 */
 	if (PQnfields(res) < 3 || PQntuples(res) != 1)
-	{
-		int			ntuples = PQntuples(res);
-		int			nfields = PQnfields(res);
-
-		PQclear(res);
 		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("invalid response from primary server"),
 				 errdetail("Could not identify system: got %d rows and %d fields, expected %d rows and %d or more fields.",
-						   ntuples, nfields, 1, 3)));
-	}
+						   PQntuples(res), PQnfields(res), 1, 3)));
 	primary_sysid = pstrdup(PQgetvalue(res, 0, 0));
 	*primary_tli = pg_strtoint32(PQgetvalue(res, 0, 1));
 
 	/* Column 2 is the server's current WAL flush position */
+	if (server_lsn)
 	{
 		uint32		hi,
 					lo;
@@ -469,7 +499,7 @@ libpqrcv_identify_system(WalReceiverConn *conn, TimeLineID *primary_tli)
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
 					 errmsg("could not parse WAL location \"%s\"",
 							PQgetvalue(res, 0, 2))));
-		WalRcvIdentifySystemLsn = ((uint64) hi) << 32 | lo;
+		*server_lsn = ((uint64) hi) << 32 | lo;
 	}
 
 	PQclear(res);
@@ -601,7 +631,7 @@ libpqrcv_startstreaming(WalReceiverConn *conn,
 	if (options->logical)
 		appendStringInfoString(&cmd, " LOGICAL");
 
-	appendStringInfo(&cmd, " %X/%X", LSN_FORMAT_ARGS(options->startpoint));
+	appendStringInfo(&cmd, " %X/%08X", LSN_FORMAT_ARGS(options->startpoint));
 
 	/*
 	 * Additional options are different depending on if we are doing logical
@@ -662,13 +692,10 @@ libpqrcv_startstreaming(WalReceiverConn *conn,
 		return false;
 	}
 	else if (PQresultStatus(res) != PGRES_COPY_BOTH)
-	{
-		PQclear(res);
 		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("could not start WAL streaming: %s",
 						pchomp(PQerrorMessage(conn->streamConn)))));
-	}
 	PQclear(res);
 	return true;
 }
@@ -776,26 +803,17 @@ libpqrcv_readtimelinehistoryfile(WalReceiverConn *conn,
 						cmd,
 						WAIT_EVENT_LIBPQWALRECEIVER_RECEIVE);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		PQclear(res);
 		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("could not receive timeline history file from "
 						"the primary server: %s",
 						pchomp(PQerrorMessage(conn->streamConn)))));
-	}
 	if (PQnfields(res) != 2 || PQntuples(res) != 1)
-	{
-		int			ntuples = PQntuples(res);
-		int			nfields = PQnfields(res);
-
-		PQclear(res);
 		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("invalid response from primary server"),
 				 errdetail("Expected 1 tuple with 2 fields, got %d tuples with %d fields.",
-						   ntuples, nfields)));
-	}
+						   PQntuples(res), PQnfields(res))));
 	*filename = pstrdup(PQgetvalue(res, 0, 0));
 
 	*len = PQgetlength(res, 0, 1);
@@ -899,13 +917,10 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 			return -1;
 		}
 		else
-		{
-			PQclear(res);
 			ereport(ERROR,
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
 					 errmsg("could not receive data from WAL stream: %s",
 							pchomp(PQerrorMessage(conn->streamConn)))));
-		}
 	}
 	if (rawlen < -1)
 		ereport(ERROR,
@@ -1030,13 +1045,10 @@ libpqrcv_create_slot(WalReceiverConn *conn, const char *slotname,
 	pfree(cmd.data);
 
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		PQclear(res);
 		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("could not create replication slot \"%s\": %s",
 						slotname, pchomp(PQerrorMessage(conn->streamConn)))));
-	}
 
 	/* CREATE_REPLICATION_SLOT returns a single row with four columns */
 	if (PQnfields(res) != 4 || PQntuples(res) != 1)
@@ -1140,6 +1152,7 @@ libpqrcv_processTuples(PGresult *pgres, WalRcvExecResult *walres,
 	for (coln = 0; coln < nRetTypes; coln++)
 		TupleDescInitEntry(walres->tupledesc, (AttrNumber) coln + 1,
 						   PQfname(pgres, coln), retTypes[coln], -1, 0);
+	TupleDescFinalize(walres->tupledesc);
 	attinmeta = TupleDescGetAttInMetadata(walres->tupledesc);
 
 	/* No point in doing more here if there were no tuples returned. */
@@ -1194,7 +1207,7 @@ libpqrcv_exec(WalReceiverConn *conn, const char *query,
 			  const int nRetTypes, const Oid *retTypes)
 {
 	PGresult   *pgres = NULL;
-	WalRcvExecResult *walres = palloc0(sizeof(WalRcvExecResult));
+	WalRcvExecResult *walres = palloc0_object(WalRcvExecResult);
 	char	   *diag_sqlstate;
 
 	if (MyDatabaseId == InvalidOid)

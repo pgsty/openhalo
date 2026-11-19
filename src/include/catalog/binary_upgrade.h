@@ -4,7 +4,7 @@
  *	  variables used for binary upgrades
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/binary_upgrade.h
@@ -14,7 +14,18 @@
 #ifndef BINARY_UPGRADE_H
 #define BINARY_UPGRADE_H
 
+#include "access/xlogdefs.h"
 #include "common/relpath.h"
+
+/*
+ * Per-attribute versions, as they were in the old cluster, for a row-type
+ * bearing relation.
+ */
+typedef struct BinaryUpgradeAttributeVersions
+{
+	int			natts;
+	XLogRecPtr	versions[FLEXIBLE_ARRAY_MEMBER];
+} BinaryUpgradeAttributeVersions;
 
 extern PGDLLIMPORT Oid binary_upgrade_next_pg_tablespace_oid;
 
@@ -29,6 +40,8 @@ extern PGDLLIMPORT Oid binary_upgrade_next_index_pg_class_oid;
 extern PGDLLIMPORT RelFileNumber binary_upgrade_next_index_pg_class_relfilenumber;
 extern PGDLLIMPORT Oid binary_upgrade_next_toast_pg_class_oid;
 extern PGDLLIMPORT RelFileNumber binary_upgrade_next_toast_pg_class_relfilenumber;
+
+extern PGDLLIMPORT BinaryUpgradeAttributeVersions *binary_upgrade_next_attribute_versions;
 
 extern PGDLLIMPORT Oid binary_upgrade_next_pg_enum_oid;
 extern PGDLLIMPORT Oid binary_upgrade_next_pg_authid_oid;

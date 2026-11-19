@@ -3,7 +3,7 @@
  * plsample.c
  *	  Handler for the PL/Sample procedural language
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,6 +21,7 @@
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "funcapi.h"
+#include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -110,6 +111,7 @@ plsample_func_handler(PG_FUNCTION_ARGS)
 	Oid			prorettype;
 	FmgrInfo	result_in_func;
 	int			numargs;
+	int			inargno;
 
 	/* Fetch the function's pg_proc entry. */
 	pl_tuple = SearchSysCache1(PROCOID,
@@ -128,7 +130,7 @@ plsample_func_handler(PG_FUNCTION_ARGS)
 	if (isnull)
 		elog(ERROR, "could not find source text of function \"%s\"",
 			 proname);
-	source = DatumGetCString(DirectFunctionCall1(textout, ret));
+	source = TextDatumGetCString(ret);
 	ereport(NOTICE,
 			(errmsg("source text of function \"%s\": %s",
 					proname, source)));
@@ -148,23 +150,34 @@ plsample_func_handler(PG_FUNCTION_ARGS)
 	 * Iterate through all of the function arguments, printing each input
 	 * value.
 	 */
+	inargno = 0;
 	for (int i = 0; i < numargs; i++)
 	{
-		Oid			argtype = pl_struct->proargtypes.values[i];
+		Oid			argtype = argtypes[i];
 		char	   *value;
+
+		if (argmodes &&
+			(argmodes[i] == PROARGMODE_OUT ||
+			 argmodes[i] == PROARGMODE_TABLE))
+			continue;			/* skip OUT arguments */
 
 		type_tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(argtype));
 		if (!HeapTupleIsValid(type_tuple))
 			elog(ERROR, "cache lookup failed for type %u", argtype);
 
 		type_struct = (Form_pg_type) GETSTRUCT(type_tuple);
-		fmgr_info_cxt(type_struct->typoutput, &(arg_out_func[i]), proc_cxt);
+		fmgr_info_cxt(type_struct->typoutput,
+					  &(arg_out_func[inargno]), proc_cxt);
 		ReleaseSysCache(type_tuple);
 
-		value = OutputFunctionCall(&arg_out_func[i], fcinfo->args[i].value);
+		value = OutputFunctionCall(&arg_out_func[inargno],
+								   fcinfo->args[inargno].value);
 		ereport(NOTICE,
 				(errmsg("argument: %d; name: %s; value: %s",
-						i, argnames[i], value)));
+						inargno,
+						(argnames && argnames[i][0]) ? argnames[i] : "(none)",
+						value)));
+		inargno++;
 	}
 
 	/* Type of the result */
@@ -244,7 +257,7 @@ plsample_trigger_handler(PG_FUNCTION_ARGS)
 	if (isnull)
 		elog(ERROR, "could not find source text of function \"%s\"",
 			 proname);
-	source = DatumGetCString(DirectFunctionCall1(textout, ret));
+	source = TextDatumGetCString(ret);
 	ereport(NOTICE,
 			(errmsg("source text of function \"%s\": %s",
 					proname, source)));
@@ -336,7 +349,7 @@ plsample_trigger_handler(PG_FUNCTION_ARGS)
 		 */
 		for (int i = 0; i < trigdata->tg_trigger->tgnargs; i++)
 			ereport(NOTICE,
-					(errmsg("trigger arg[%i]: %s", i,
+					(errmsg("trigger arg[%d]: %s", i,
 							trigdata->tg_trigger->tgargs[i])));
 	}
 	PG_CATCH();

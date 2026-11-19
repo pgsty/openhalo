@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 # Note: the order of this list determines the order in which the catalog
 # header files are assembled into postgres.bki.  BKI_BOOTSTRAP catalogs
@@ -78,6 +78,7 @@ bki_data = [
   'pg_amop.dat',
   'pg_amproc.dat',
   'pg_authid.dat',
+  'pg_auth_members.dat',
   'pg_cast.dat',
   'pg_class.dat',
   'pg_collation.dat',
@@ -115,7 +116,7 @@ output_install = [
   dir_data,
   dir_include_server / 'catalog',
   dir_include_server / 'catalog',
-  false,
+  dir_include_server / 'catalog',
   dir_include_server / 'catalog',
 ]
 

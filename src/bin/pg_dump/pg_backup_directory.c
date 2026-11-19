@@ -19,7 +19,7 @@
  *	sync.
  *
  *
- *	Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ *	Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *	Portions Copyright (c) 1994, Regents of the University of California
  *	Portions Copyright (c) 2000, Philip Warner
  *
@@ -140,7 +140,7 @@ InitArchiveFmt_Directory(ArchiveHandle *AH)
 	AH->WorkerJobDumpPtr = _WorkerJobDumpDirectory;
 
 	/* Set up our private context */
-	ctx = (lclContext *) pg_malloc0(sizeof(lclContext));
+	ctx = pg_malloc0_object(lclContext);
 	AH->formatData = ctx;
 
 	ctx->dataFH = NULL;
@@ -193,14 +193,14 @@ InitArchiveFmt_Directory(ArchiveHandle *AH)
  * Called by the Archiver when the dumper creates a new TOC entry.
  *
  * We determine the filename for this entry.
-*/
+ */
 static void
 _ArchiveEntry(ArchiveHandle *AH, TocEntry *te)
 {
 	lclTocEntry *tctx;
 	char		fn[MAXPGPATH];
 
-	tctx = (lclTocEntry *) pg_malloc0(sizeof(lclTocEntry));
+	tctx = pg_malloc0_object(lclTocEntry);
 	if (strcmp(te->desc, "BLOBS") == 0)
 	{
 		snprintf(fn, MAXPGPATH, "blobs_%d.toc", te->dumpId);
@@ -252,7 +252,7 @@ _ReadExtraToc(ArchiveHandle *AH, TocEntry *te)
 
 	if (tctx == NULL)
 	{
-		tctx = (lclTocEntry *) pg_malloc0(sizeof(lclTocEntry));
+		tctx = pg_malloc0_object(lclTocEntry);
 		te->formatData = tctx;
 	}
 
@@ -262,6 +262,8 @@ _ReadExtraToc(ArchiveHandle *AH, TocEntry *te)
 		free(tctx->filename);
 		tctx->filename = NULL;
 	}
+	else if (first_dir_separator(tctx->filename) != NULL)
+		pg_fatal("invalid file name in archive: \"%s\"", tctx->filename);
 }
 
 /*
@@ -372,7 +374,7 @@ _PrintFileData(ArchiveHandle *AH, char *filename)
 
 /*
  * Print data for a given TOC entry
-*/
+ */
 static void
 _PrintTocData(ArchiveHandle *AH, TocEntry *te)
 {
@@ -432,6 +434,8 @@ _LoadLOs(ArchiveHandle *AH, TocEntry *te)
 		if (sscanf(line, "%u %" CppAsString2(MAXPGPATH) "s\n", &oid, lofname) != 2)
 			pg_fatal("invalid line in large object TOC file \"%s\": \"%s\"",
 					 tocfname, line);
+		if (first_dir_separator(lofname) != NULL)
+			pg_fatal("invalid file name in archive: \"%s\"", lofname);
 
 		StartRestoreLO(AH, oid, AH->public.ropt->dropSchema);
 		snprintf(path, MAXPGPATH, "%s/%s", ctx->directory, lofname);
@@ -769,7 +773,7 @@ _Clone(ArchiveHandle *AH)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 
-	AH->formatData = (lclContext *) pg_malloc(sizeof(lclContext));
+	AH->formatData = pg_malloc_object(lclContext);
 	memcpy(AH->formatData, ctx, sizeof(lclContext));
 	ctx = (lclContext *) AH->formatData;
 

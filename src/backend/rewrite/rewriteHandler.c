@@ -3,7 +3,7 @@
  * rewriteHandler.c
  *		Primary module of query rewriter.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -194,7 +194,7 @@ AcquireRewriteLocks(Query *parsetree,
 				else
 					lockmode = rte->rellockmode;
 
-				rel = table_open(rte->relid, lockmode);
+				rel = relation_open(rte->relid, lockmode);
 
 				/*
 				 * While we have the relation open, update the RTE's relkind,
@@ -202,7 +202,7 @@ AcquireRewriteLocks(Query *parsetree,
 				 */
 				rte->relkind = rel->rd_rel->relkind;
 
-				table_close(rel, NoLock);
+				relation_close(rel, NoLock);
 				break;
 
 			case RTE_JOIN:
@@ -692,6 +692,19 @@ rewriteRuleAction(Query *parsetree,
 	}
 
 	/*
+	 * If rule_action is INSERT .. ON CONFLICT DO SELECT, the parser should
+	 * have verified that it has a RETURNING clause, but we must also check
+	 * that the triggering query has a RETURNING clause.
+	 */
+	if (rule_action->onConflict &&
+		rule_action->onConflict->action == ONCONFLICT_SELECT &&
+		(!rule_action->returningList || !parsetree->returningList))
+		ereport(ERROR,
+				errcode(ERRCODE_SYNTAX_ERROR),
+				errmsg("ON CONFLICT DO SELECT requires a RETURNING clause"),
+				errdetail("A rule action is INSERT ... ON CONFLICT DO SELECT, which requires a RETURNING clause."));
+
+	/*
 	 * If rule_action has a RETURNING clause, then either throw it away if the
 	 * triggering query has no RETURNING clause, or rewrite it to emit what
 	 * the triggering query's RETURNING clause asks for.  Throw an error if
@@ -959,8 +972,9 @@ rewriteTargetListIU(List *targetList,
 				apply_default = true;
 
 			/*
-			 * Can only insert DEFAULT into generated columns, regardless of
-			 * any OVERRIDING clauses.
+			 * Can only insert DEFAULT into generated columns.  (The
+			 * OVERRIDING clause does not apply to generated columns, so we
+			 * don't consider it here.)
 			 */
 			if (att_tup->attgenerated && !apply_default)
 			{
@@ -2135,7 +2149,7 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 		 * We can use NoLock here since either the parser or
 		 * AcquireRewriteLocks should have locked the rel already.
 		 */
-		rel = table_open(rte->relid, NoLock);
+		rel = relation_open(rte->relid, NoLock);
 
 		/*
 		 * Collect the RIR rules that we must apply
@@ -2245,7 +2259,7 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 			 rte->relkind != RELKIND_PARTITIONED_TABLE))
 			continue;
 
-		rel = table_open(rte->relid, NoLock);
+		rel = relation_open(rte->relid, NoLock);
 
 		/*
 		 * Fetch any new security quals that must be applied to this RTE.
@@ -2684,7 +2698,7 @@ view_col_is_auto_updatable(RangeTblRef *rtr, TargetEntry *tle)
  * view_query_is_auto_updatable - test whether the specified view definition
  * represents an auto-updatable view. Returns NULL (if the view can be updated)
  * or a message string giving the reason that it cannot be.
-
+ *
  * The returned string has not been translated; if it is shown as an error
  * message, the caller should apply _() to translate it.
  *
@@ -3496,7 +3510,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 	 * already have the right lock!)  Since it will become the query target
 	 * relation, RowExclusiveLock is always the right thing.
 	 */
-	base_rel = table_open(base_rte->relid, RowExclusiveLock);
+	base_rel = relation_open(base_rte->relid, RowExclusiveLock);
 
 	/*
 	 * While we have the relation open, update the RTE's relkind, just in case
@@ -3707,11 +3721,12 @@ rewriteTargetView(Query *parsetree, Relation view)
 	}
 
 	/*
-	 * For INSERT .. ON CONFLICT .. DO UPDATE, we must also update assorted
-	 * stuff in the onConflict data structure.
+	 * For INSERT .. ON CONFLICT .. DO SELECT/UPDATE, we must also update
+	 * assorted stuff in the onConflict data structure.
 	 */
 	if (parsetree->onConflict &&
-		parsetree->onConflict->action == ONCONFLICT_UPDATE)
+		(parsetree->onConflict->action == ONCONFLICT_UPDATE ||
+		 parsetree->onConflict->action == ONCONFLICT_SELECT))
 	{
 		Index		old_exclRelIndex,
 					new_exclRelIndex;
@@ -3720,9 +3735,8 @@ rewriteTargetView(Query *parsetree, Relation view)
 		List	   *tmp_tlist;
 
 		/*
-		 * Like the INSERT/UPDATE code above, update the resnos in the
-		 * auxiliary UPDATE targetlist to refer to columns of the base
-		 * relation.
+		 * For ON CONFLICT DO UPDATE, update the resnos in the auxiliary
+		 * UPDATE targetlist to refer to columns of the base relation.
 		 */
 		foreach(lc, parsetree->onConflict->onConflictSet)
 		{
@@ -3741,7 +3755,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 		}
 
 		/*
-		 * Also, create a new RTE for the EXCLUDED pseudo-relation, using the
+		 * Create a new RTE for the EXCLUDED pseudo-relation, using the
 		 * query's new base rel (which may well have a different column list
 		 * from the view, hence we need a new column alias list).  This should
 		 * match transformOnConflictClause.  In particular, note that the
@@ -3848,19 +3862,27 @@ rewriteTargetView(Query *parsetree, Relation view)
 				parsetree->hasSubLinks = checkExprHasSubLink(viewqual);
 		}
 		else
-			AddQual(parsetree, (Node *) viewqual);
+			AddQual(parsetree, viewqual);
 	}
 
 	/*
 	 * For INSERT/UPDATE (or MERGE containing INSERT/UPDATE), if the view has
 	 * the WITH CHECK OPTION, or any parent view specified WITH CASCADED CHECK
 	 * OPTION, add the quals from the view to the query's withCheckOptions
-	 * list.
+	 * list.  For INSERT ... ON CONFLICT DO SELECT/UPDATE, add them to the
+	 * list as a check on the existing row as well, whether or not the view
+	 * has a check option.  (Using a WithCheckOption for a view that has none
+	 * is a bit unorthodox, but it's a good fit for ON CONFLICT.  Unlike with
+	 * a plain UPDATE, we need to throw an error when there's a conflicting
+	 * row that doesn't belong in the target view.)
 	 */
 	if (insert_or_update)
 	{
 		bool		has_wco = RelationHasCheckOption(view);
 		bool		cascaded = RelationHasCascadedCheckOption(view);
+		bool		do_conflict_check = parsetree->onConflict &&
+			(parsetree->onConflict->action == ONCONFLICT_UPDATE ||
+			 parsetree->onConflict->action == ONCONFLICT_SELECT);
 
 		/*
 		 * If the parent view has a cascaded check option, treat this view as
@@ -3883,32 +3905,23 @@ rewriteTargetView(Query *parsetree, Relation view)
 		}
 
 		/*
-		 * Add the new WithCheckOption to the start of the list, so that
+		 * New WithCheckOptions are added to the start of the list, so that
 		 * checks on inner views are run before checks on outer views, as
-		 * required by the SQL standard.
+		 * required by the SQL standard.  When there is an ON CONFLICT check,
+		 * it is prepended first, so that any real check option ends up at the
+		 * head of the list, where the parent-cascade check above expects it.
 		 *
-		 * If the new check is CASCADED, we need to add it even if this view
-		 * has no quals, since there may be quals on child views.  A LOCAL
-		 * check can be omitted if this view has no quals.
+		 * Nothing is added when this view has no quals, except for a CASCADED
+		 * check option, which is needed even then, since there may be quals
+		 * on child views.
 		 */
-		if (has_wco && (cascaded || viewquery->jointree->quals != NULL))
+		if ((has_wco || do_conflict_check) &&
+			(cascaded || viewquery->jointree->quals != NULL))
 		{
-			WithCheckOption *wco;
-
-			wco = makeNode(WithCheckOption);
-			wco->kind = WCO_VIEW_CHECK;
-			wco->relname = pstrdup(RelationGetRelationName(view));
-			wco->polname = NULL;
-			wco->qual = NULL;
-			wco->cascaded = cascaded;
-
-			parsetree->withCheckOptions = lcons(wco,
-												parsetree->withCheckOptions);
-
 			if (viewquery->jointree->quals != NULL)
 			{
-				wco->qual = (Node *) viewquery->jointree->quals;
-				ChangeVarNodes(wco->qual, base_rt_index, new_rt_index, 0);
+				ChangeVarNodes(viewquery->jointree->quals,
+							   base_rt_index, new_rt_index, 0);
 
 				/*
 				 * For INSERT, make sure that the query is marked correctly if
@@ -3918,7 +3931,42 @@ rewriteTargetView(Query *parsetree, Relation view)
 				 */
 				if (!parsetree->hasSubLinks &&
 					parsetree->commandType == CMD_INSERT)
-					parsetree->hasSubLinks = checkExprHasSubLink(wco->qual);
+					parsetree->hasSubLinks =
+						checkExprHasSubLink(viewquery->jointree->quals);
+			}
+
+			/*
+			 * For INSERT ... ON CONFLICT DO SELECT/UPDATE, the conflict
+			 * action acts on an existing row, which must be visible through
+			 * the view
+			 */
+			if (do_conflict_check && viewquery->jointree->quals != NULL)
+			{
+				WithCheckOption *wco = makeNode(WithCheckOption);
+
+				wco->kind = WCO_VIEW_CONFLICT_CHECK;
+				wco->relname = pstrdup(RelationGetRelationName(view));
+				wco->polname = NULL;
+				/* Copy; WCO_VIEW_CHECK entry below owns the original quals */
+				wco->qual = copyObject(viewquery->jointree->quals);
+				wco->cascaded = false;
+
+				parsetree->withCheckOptions = lcons(wco,
+													parsetree->withCheckOptions);
+			}
+
+			if (has_wco)
+			{
+				WithCheckOption *wco = makeNode(WithCheckOption);
+
+				wco->kind = WCO_VIEW_CHECK;
+				wco->relname = pstrdup(RelationGetRelationName(view));
+				wco->polname = NULL;
+				wco->qual = viewquery->jointree->quals;
+				wco->cascaded = cascaded;
+
+				parsetree->withCheckOptions = lcons(wco,
+													parsetree->withCheckOptions);
 			}
 		}
 	}
@@ -4072,7 +4120,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events, int orig_rt_length,
 		 * We can use NoLock here since either the parser or
 		 * AcquireRewriteLocks should have locked the rel already.
 		 */
-		rt_entry_relation = table_open(rt_entry->relid, NoLock);
+		rt_entry_relation = relation_open(rt_entry->relid, NoLock);
 
 		/*
 		 * Rewrite the targetlist as needed for the command type.
@@ -4351,7 +4399,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events, int orig_rt_length,
 									RelationGetRelationName(rt_entry_relation))));
 			}
 
-			rev = (rewrite_event *) palloc(sizeof(rewrite_event));
+			rev = palloc_object(rewrite_event);
 			rev->relation = RelationGetRelid(rt_entry_relation);
 			rev->event = event;
 			rewrite_events = lappend(rewrite_events, rev);

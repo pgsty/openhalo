@@ -22,6 +22,13 @@ static hstoreCheckKeyLen_t hstoreCheckKeyLen_p;
 typedef size_t (*hstoreCheckValLen_t) (size_t len);
 static hstoreCheckValLen_t hstoreCheckValLen_p;
 
+/* Static asserts verify that typedefs above match original declarations */
+StaticAssertVariableIsOfType(&hstoreUpgrade, hstoreUpgrade_t);
+StaticAssertVariableIsOfType(&hstoreUniquePairs, hstoreUniquePairs_t);
+StaticAssertVariableIsOfType(&hstorePairs, hstorePairs_t);
+StaticAssertVariableIsOfType(&hstoreCheckKeyLen, hstoreCheckKeyLen_t);
+StaticAssertVariableIsOfType(&hstoreCheckValLen, hstoreCheckValLen_t);
+
 
 /*
  * Module initialize function: fetch function pointers for cross-module calls.
@@ -29,24 +36,18 @@ static hstoreCheckValLen_t hstoreCheckValLen_p;
 void
 _PG_init(void)
 {
-	/* Asserts verify that typedefs above match original declarations */
-	AssertVariableIsOfType(&hstoreUpgrade, hstoreUpgrade_t);
 	hstoreUpgrade_p = (hstoreUpgrade_t)
 		load_external_function("$libdir/hstore", "hstoreUpgrade",
 							   true, NULL);
-	AssertVariableIsOfType(&hstoreUniquePairs, hstoreUniquePairs_t);
 	hstoreUniquePairs_p = (hstoreUniquePairs_t)
 		load_external_function("$libdir/hstore", "hstoreUniquePairs",
 							   true, NULL);
-	AssertVariableIsOfType(&hstorePairs, hstorePairs_t);
 	hstorePairs_p = (hstorePairs_t)
 		load_external_function("$libdir/hstore", "hstorePairs",
 							   true, NULL);
-	AssertVariableIsOfType(&hstoreCheckKeyLen, hstoreCheckKeyLen_t);
 	hstoreCheckKeyLen_p = (hstoreCheckKeyLen_t)
 		load_external_function("$libdir/hstore", "hstoreCheckKeyLen",
 							   true, NULL);
-	AssertVariableIsOfType(&hstoreCheckValLen, hstoreCheckValLen_t);
 	hstoreCheckValLen_p = (hstoreCheckValLen_t)
 		load_external_function("$libdir/hstore", "hstoreCheckValLen",
 							   true, NULL);
@@ -110,7 +111,8 @@ plperl_to_hstore(PG_FUNCTION_ARGS)
 	Pairs	   *pairs;
 
 	/* Dereference references recursively. */
-	while (SvROK(in))
+	plperl_materialize_sv(in);
+	while (in && SvROK(in))
 	{
 		/*
 		 * It's possible for circular references to make this an infinite
@@ -119,14 +121,20 @@ plperl_to_hstore(PG_FUNCTION_ARGS)
 		 */
 		CHECK_FOR_INTERRUPTS();
 		in = SvRV(in);
+		plperl_materialize_sv(in);
 	}
 
 	/* Now we must have a hash. */
-	if (SvTYPE(in) != SVt_PVHV)
+	if (!in || SvTYPE(in) != SVt_PVHV)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot transform non-hash Perl value to hstore")));
 	hv = (HV *) in;
+
+	/* Hold a reference on the hash while we scan it */
+	ENTER;
+	SAVETMPS;
+	sv_2mortal(newRV((SV *) hv));
 
 	(void) hv_iterinit(hv);
 
@@ -137,7 +145,9 @@ plperl_to_hstore(PG_FUNCTION_ARGS)
 	while ((he = hv_iternext(hv)))
 	{
 		char	   *key = sv2cstr(HeSVKEY_force(he));
-		SV		   *value = HeVAL(he);
+		SV		   *value = hv_iterval(hv, he);
+
+		plperl_materialize_sv(value);
 
 		if (i >= pcount)
 		{
@@ -149,7 +159,7 @@ plperl_to_hstore(PG_FUNCTION_ARGS)
 		pairs[i].keylen = hstoreCheckKeyLen(strlen(pairs[i].key));
 		pairs[i].needfree = true;
 
-		if (!SvOK(value))
+		if (!value || !SvOK(value))
 		{
 			pairs[i].val = NULL;
 			pairs[i].vallen = 0;
@@ -164,6 +174,10 @@ plperl_to_hstore(PG_FUNCTION_ARGS)
 
 		i++;
 	}
+
+	/* release our reference on the hash */
+	FREETMPS;
+	LEAVE;
 
 	pcount = hstoreUniquePairs(pairs, i, &buflen);
 	out = hstorePairs(pairs, pcount, buflen);

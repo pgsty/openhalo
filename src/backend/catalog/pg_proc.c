@@ -3,7 +3,7 @@
  * pg_proc.c
  *	  routines to support manipulation of the pg_proc relation
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,6 +20,7 @@
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
@@ -34,6 +35,7 @@
 #include "parser/parse_coerce.h"
 #include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
+#include "storage/lmgr.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
@@ -141,7 +143,8 @@ ProcedureCreate(const char *procedureName,
 	TupleDesc	tupDesc;
 	bool		is_update;
 	ObjectAddress myself,
-				referenced;
+				referenced,
+				temp_object;
 	char	   *detailmsg;
 	int			i;
 	ObjectAddresses *addrs;
@@ -149,7 +152,7 @@ ProcedureCreate(const char *procedureName,
 	/*
 	 * sanity checks
 	 */
-	Assert(PointerIsValid(prosrc));
+	Assert(prosrc);
 
 	parameterCount = parameterTypes->dim1;
 	if (parameterCount < 0 || parameterCount > FUNC_MAX_ARGS)
@@ -401,6 +404,18 @@ ProcedureCreate(const char *procedureName,
 					(errcode(ERRCODE_DUPLICATE_FUNCTION),
 					 errmsg("function \"%s\" already exists with same argument types",
 							procedureName)));
+
+		/*
+		 * The row-locking on the pg_proc row is generally enough protection
+		 * from concurrently DROPping the function, but acquire a heavy-weight
+		 * lock on the function anyway, so that other DDL commands that depend
+		 * on the details of the function can prevent the function from being
+		 * concurrently modified.  And you get nicer error message on
+		 * conflicting ALTER FUNCTION commands than "row concurrently
+		 * updated".
+		 */
+		LockDatabaseObject(ProcedureRelationId, oldproc->oid, 0, AccessExclusiveLock);
+
 		if (!object_ownercheck(ProcedureRelationId, oldproc->oid, proowner))
 			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_FUNCTION,
 						   procedureName);
@@ -658,23 +673,46 @@ ProcedureCreate(const char *procedureName,
 		add_exact_object_address(&referenced, addrs);
 	}
 
-	record_object_address_dependencies(&myself, addrs, DEPENDENCY_NORMAL);
-	free_object_addresses(addrs);
-
-	/* dependency on SQL routine body */
+	/* dependencies appearing in new-style SQL routine body */
 	if (languageObjectId == SQLlanguageId && prosqlbody)
 	{
 		CheckUsageOnTypesInExpr(prosqlbody, NIL, GetUserId());
-		recordDependencyOnExpr(&myself, prosqlbody, NIL, DEPENDENCY_NORMAL);
+		collectDependenciesOfExpr(addrs, prosqlbody, NIL);
 	}
 
 	/* dependency on parameter default expressions */
 	if (parameterDefaults)
 	{
 		CheckUsageOnTypesInExpr((Node *) parameterDefaults, NIL, GetUserId());
-		recordDependencyOnExpr(&myself, (Node *) parameterDefaults,
-							   NIL, DEPENDENCY_NORMAL);
+		collectDependenciesOfExpr(addrs, (Node *) parameterDefaults, NIL);
 	}
+
+	/*
+	 * Now that we have all the normal dependencies, thumb through them and
+	 * warn if any are to temporary objects.  This informs the user if their
+	 * supposedly non-temp function will silently go away at session exit, due
+	 * to a dependency on a temp object.  However, do not complain when a
+	 * function created in our own pg_temp namespace refers to other objects
+	 * in that namespace, since then they'll have similar lifespans anyway.
+	 */
+	if (find_temp_object(addrs, isTempNamespace(procNamespace), &temp_object))
+		ereport(NOTICE,
+				(errmsg("function \"%s\" will be effectively temporary",
+						procedureName),
+				 errdetail("It depends on temporary %s.",
+						   getObjectDescription(&temp_object, false))));
+
+	/*
+	 * Now record all normal dependencies at once.  This will also remove any
+	 * duplicates in the list.  (Role and extension dependencies are handled
+	 * separately below.  Role dependencies would have to be separate anyway
+	 * since they are shared dependencies.  An extension dependency could be
+	 * folded into the addrs list, but pg_depend.c doesn't make that easy, and
+	 * it won't duplicate anything we've collected so far anyway.)
+	 */
+	record_object_address_dependencies(&myself, addrs, DEPENDENCY_NORMAL);
+
+	free_object_addresses(addrs);
 
 	/* dependency on owner */
 	if (!is_update)
@@ -849,6 +887,10 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 	parse_error_callback_arg callback_arg;
 	ErrorContextCallback sqlerrcontext;
 	bool		haspolyarg;
+	Oid		   *argtypes;
+	char	  **argnames;
+	char	   *argmodes;
+	int			numargs;
 	int			i;
 
 	if (!CheckFunctionValidatorAccess(fcinfo->flinfo->fn_oid, funcoid))
@@ -870,21 +912,31 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 				 errmsg("SQL functions cannot return type %s",
 						format_type_be(proc->prorettype))));
 
-	/* Disallow pseudotypes in arguments */
-	/* except for polymorphic */
+	/* Disallow pseudotypes in arguments (either IN or OUT) */
+	/* except for polymorphic, or RECORD/RECORD[] as an output column type */
 	haspolyarg = false;
-	for (i = 0; i < proc->pronargs; i++)
+	numargs = get_func_arg_info(tuple, &argtypes, &argnames, &argmodes);
+	for (i = 0; i < numargs; i++)
 	{
-		if (get_typtype(proc->proargtypes.values[i]) == TYPTYPE_PSEUDO)
+		char		argmode = argmodes ? argmodes[i] : PROARGMODE_IN;
+
+		if (get_typtype(argtypes[i]) != TYPTYPE_PSEUDO)
+			continue;
+
+		if (IsPolymorphicType(argtypes[i]))
 		{
-			if (IsPolymorphicType(proc->proargtypes.values[i]))
-				haspolyarg = true;
-			else
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("SQL functions cannot have arguments of type %s",
-								format_type_be(proc->proargtypes.values[i]))));
+			haspolyarg = true;
+			continue;
 		}
+
+		if ((argtypes[i] == RECORDOID || argtypes[i] == RECORDARRAYOID) &&
+			(argmode == PROARGMODE_OUT || argmode == PROARGMODE_TABLE))
+			continue;
+
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+				 errmsg("SQL functions cannot have arguments of type %s",
+						format_type_be(argtypes[i]))));
 	}
 
 	/* Postpone body checks if !check_function_bodies */
@@ -1218,6 +1270,6 @@ oid_array_to_list(Datum datum)
 
 	deconstruct_array_builtin(array, OIDOID, &values, NULL, &nelems);
 	for (i = 0; i < nelems; i++)
-		result = lappend_oid(result, values[i]);
+		result = lappend_oid(result, DatumGetObjectId(values[i]));
 	return result;
 }

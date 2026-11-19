@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Test that logical replication respects permissions
 use strict;
@@ -328,6 +328,27 @@ $node_subscriber->wait_for_log(
 	qr/LOG: ( [A-Z0-9]+:)? logical replication worker for subscription \"regression_sub\" will restart because the subscription owner's superuser privileges have been revoked/,
 	$offset);
 
+# Unsafe options are not permitted (at the moment, this is applied to superuser
+# as well).
+grant_superuser("regress_admin");
+
+$offset = -s $node_subscriber->logfile;
+$node_subscriber->safe_psql(
+	'postgres', qq(
+	SET SESSION AUTHORIZATION regress_admin;
+	ALTER SUBSCRIPTION admin_sub CONNECTION '$publisher_connstr sslkeylogfile=/does/not/exist';
+));
+
+# After the worker restarts, connection attempts should fail.
+$offset = $node_subscriber->wait_for_log(
+	qr/ERROR: ( [A-Z0-9]+:)? permission denied to set connection option "sslkeylogfile"/msi,
+	$offset);
+
+$node_subscriber->safe_psql(
+	'postgres', qq(
+	ALTER SUBSCRIPTION admin_sub DISABLE;
+));
+
 # If the subscription connection requires a password ('password_required'
 # is true) then a non-superuser must specify that password in the connection
 # string.
@@ -399,8 +420,9 @@ SKIP:
 	isnt($ret, 0,
 		"non zero exit for subscription whose owner is a non-superuser must specify password parameter of the connection string"
 	);
-	ok( $stderr =~
-		  m/DETAIL:  Non-superusers must provide a password in the connection string./,
+	like(
+		$stderr,
+		qr/DETAIL:  Non-superusers must provide a password in the connection string./,
 		'subscription whose owner is a non-superuser must specify password parameter of the connection string'
 	);
 
