@@ -1597,7 +1597,7 @@ static int64
 varbit_to_int64_checked(VarBit *vb)
 {
 	int32		bitLen = VARBITLEN(vb);
-	bits8	   *sp = VARBITS(vb);
+	uint8	   *sp = VARBITS(vb);
 	uint64		acc = 0;
 	int32		k;
 

@@ -34,6 +34,8 @@
 #include <math.h>
 
 #include "access/xact.h"
+#include "catalog/pg_type_d.h"
+#include "nodes/miscnodes.h"
 #include "common/hashfn.h"
 #include "common/unicode_case.h"
 #include "fmgr.h"
@@ -107,7 +109,7 @@ any_arg_bytes(FunctionCallInfo fcinfo, int argno, int *len, bool *binary)
 	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, argno);
 	Oid			base;
 	Oid			output;
-	bool		varlena;
+	bool		isvarlena;
 	char	   *s;
 
 	if (!OidIsValid(type))
@@ -132,7 +134,7 @@ any_arg_bytes(FunctionCallInfo fcinfo, int argno, int *len, bool *binary)
 	{
 		VarBit	   *b = PG_GETARG_VARBIT_P(argno);
 		int			nbits = VARBITLEN(b);
-		bits8	   *in = VARBITS(b);
+		uint8	   *in = VARBITS(b);
 
 		*len = (nbits + 7) / 8;
 		s = palloc0(*len + 1);
@@ -145,7 +147,7 @@ any_arg_bytes(FunctionCallInfo fcinfo, int argno, int *len, bool *binary)
 		}
 		return s;
 	}
-	getTypeOutputInfo(type, &output, &varlena);
+	getTypeOutputInfo(type, &output, &isvarlena);
 	s = OidOutputFunctionCall(output, PG_GETARG_DATUM(argno));
 	*len = strlen(s);
 	return s;
@@ -258,13 +260,13 @@ timeout_arg(FunctionCallInfo fcinfo, int argno)
 		case NUMERICOID:
 			{
 				Numeric		n = DatumGetNumeric(d);
-				bool		error = false;
+				ErrorSaveContext escontext = {T_ErrorSaveContext};
 				int64		v;
 
 				if (numeric_is_nan(n))
 					return 0;
-				v = numeric_int8_opt_error(n, &error);
-				if (error)
+				v = numeric_int8_safe(n, (Node *) &escontext);
+				if (escontext.error_occurred)
 					return DatumGetBool(DirectFunctionCall2(numeric_lt, d,
 															NumericGetDatum(int64_to_numeric(0)))) ?
 						PG_INT64_MIN : PG_INT64_MAX;

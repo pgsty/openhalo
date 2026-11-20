@@ -242,7 +242,7 @@ varbit_to_mysql_bytes(VarBit *vb, char **out_bytes, size_t *out_len)
 {
 	int32		bitlen = VARBITLEN(vb);
 	size_t		nbytes = (size_t) ((bitlen + 7) / 8);
-	bits8	   *inbits = VARBITS(vb);
+	uint8	   *inbits = VARBITS(vb);
 	uint8	   *buf;
 	size_t		pad;
 	int32		k;

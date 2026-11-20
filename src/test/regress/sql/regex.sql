@@ -2,9 +2,6 @@
 -- Regular expression tests
 --
 
--- Don't want to have to double backslashes in regexes
-set standard_conforming_strings = on;
-
 -- Test simple quantified backrefs
 select 'bbbbb' ~ '^([bc])\1*$' as t;
 select 'ccc' ~ '^([bc])\1*$' as t;
@@ -110,7 +107,7 @@ select 'x' ~ 'x|(?:\M)+';
 select 'x' ~ repeat('x*y*z*', 1000);
 
 -- Test backref in combination with non-greedy quantifier
--- https://core.tcl.tk/tcl/tktview/6585b21ca8fa6f3678d442b97241fdd43dba2ec0
+-- https://core.tcl-lang.org/tcl/tktview/6585b21ca8fa6f3678d442b97241fdd43dba2ec0
 select 'Programmer' ~ '(\w).*?\1' as t;
 select regexp_matches('Programmer', '(\w)(.*?\1)', 'g');
 

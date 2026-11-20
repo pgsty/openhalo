@@ -4,7 +4,7 @@
  *	  prototypes for functions in backend/catalog/heap.c
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/heap.h
@@ -101,6 +101,14 @@ extern void InsertPgAttributeTuples(Relation pg_attribute_rel,
 									Oid new_rel_oid,
 									const FormExtraData_pg_attribute tupdesc_extra[],
 									CatalogIndexState indstate);
+
+extern XLogRecPtr GetNextAttributeVersion(void);
+extern HeapTuple SetAttributeVersionInTuple(Relation attrelation,
+											HeapTuple tuple,
+											XLogRecPtr version);
+extern void SetAttributeVersions(Relation rel, AttrNumber fromAttnum,
+								 XLogRecPtr version);
+extern bool CheckAttributeVersions(TupleDesc td, const char *relname, int elevel);
 
 extern void InsertPgClassTuple(Relation pg_class_desc,
 							   Relation new_rel_desc,

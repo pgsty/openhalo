@@ -2,10 +2,10 @@
 # Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 # contrib/aux_mysql/Makefile
 #
-# aux_mysql: MySQL wire protocol & dialect for PostgreSQL 18 (needs the
-# protocol extension hooks of the OpenHalo 18 kernel).  Built and installed
+# aux_mysql: MySQL wire protocol & dialect for PostgreSQL 19 (needs the
+# protocol extension hooks of the OpenHalo 19 kernel).  Built and installed
 # by the top-level "make && make install"; also builds with PGXS against an
-# installed OpenHalo 18 kernel:  make USE_PGXS=1 PG_CONFIG=.../pg_config
+# installed OpenHalo 19 kernel:  make USE_PGXS=1 PG_CONFIG=.../pg_config
 
 MODULE_big = aux_mysql
 OBJS = \

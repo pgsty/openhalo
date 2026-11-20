@@ -13442,7 +13442,7 @@ AlterSubscriptionStmt:
 				{
 					AlterSubscriptionStmt *n =
 						makeNode(AlterSubscriptionStmt);
-					n->kind = ALTER_SUBSCRIPTION_REFRESH;
+					n->kind = ALTER_SUBSCRIPTION_REFRESH_PUBLICATION;
 					n->subname = $3;
 					n->options = $6;
 					$$ = (Node *)n;
@@ -14377,8 +14377,10 @@ CreateConversionStmt:
 ClusterStmt:
 			CLUSTER opt_verbose qualified_name cluster_index_specification
 				{
-					ClusterStmt *n = makeNode(ClusterStmt);
-					n->relation = $3;
+					RepackStmt *n = makeNode(RepackStmt);
+					n->command = REPACK_COMMAND_CLUSTER;
+					n->usingindex = true;
+					n->relation = makeVacuumRelation($3, InvalidOid, NIL);
 					n->indexname = $4;
 					n->params = NIL;
 					if ($2)
@@ -14388,15 +14390,19 @@ ClusterStmt:
 
 			| CLUSTER '(' utility_option_list ')' qualified_name cluster_index_specification
 				{
-					ClusterStmt *n = makeNode(ClusterStmt);
-					n->relation = $5;
+					RepackStmt *n = makeNode(RepackStmt);
+					n->command = REPACK_COMMAND_CLUSTER;
+					n->usingindex = true;
+					n->relation = makeVacuumRelation($5, InvalidOid, NIL);
 					n->indexname = $6;
 					n->params = $3;
 					$$ = (Node*)n;
 				}
 			| CLUSTER opt_verbose
 				{
-					ClusterStmt *n = makeNode(ClusterStmt);
+					RepackStmt *n = makeNode(RepackStmt);
+					n->command = REPACK_COMMAND_CLUSTER;
+					n->usingindex = true;
 					n->relation = NULL;
 					n->indexname = NULL;
 					n->params = NIL;
@@ -14407,8 +14413,10 @@ ClusterStmt:
 			/* kept for pre-8.3 compatibility */
 			| CLUSTER opt_verbose name ON qualified_name
 				{
-					ClusterStmt *n = makeNode(ClusterStmt);
-					n->relation = $5;
+					RepackStmt *n = makeNode(RepackStmt);
+					n->command = REPACK_COMMAND_CLUSTER;
+					n->usingindex = true;
+					n->relation = makeVacuumRelation($5, InvalidOid, NIL);
 					n->indexname = $3;
 					n->params = NIL;
 					if ($2)

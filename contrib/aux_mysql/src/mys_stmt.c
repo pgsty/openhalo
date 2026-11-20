@@ -1396,12 +1396,12 @@ append_using_value(StringInfo buf, Node *arg, ParseState *pstate)
 	else
 	{
 		Oid			output;
-		bool		varlena;
+		bool		isvarlena;
 		char		category;
 		bool		preferred;
 		char	   *s;
 
-		getTypeOutputInfo(exprType(expr), &output, &varlena);
+		getTypeOutputInfo(exprType(expr), &output, &isvarlena);
 		s = OidOutputFunctionCall(output, value);
 		get_type_category_preferred(type, &category, &preferred);
 		if (category == TYPCATEGORY_NUMERIC)

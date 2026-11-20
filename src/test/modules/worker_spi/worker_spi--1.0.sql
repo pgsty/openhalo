@@ -7,7 +7,9 @@
 CREATE FUNCTION worker_spi_launch(index int4,
   dboid oid DEFAULT 0,
   roleoid oid DEFAULT 0,
-  flags text[] DEFAULT '{}')
+  flags text[] DEFAULT '{}',
+  interruptible boolean DEFAULT false,
+  restart_time int4 DEFAULT -1)
 RETURNS pg_catalog.int4 STRICT
 AS 'MODULE_PATHNAME'
 LANGUAGE C;

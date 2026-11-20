@@ -161,16 +161,14 @@ VACUUM (PARALLEL 2) pvactst;
 UPDATE pvactst SET i = i WHERE i < 1000;
 VACUUM (PARALLEL 0) pvactst; -- disable parallel vacuum
 VACUUM (PARALLEL -1) pvactst; -- error
-ERROR:  parallel workers for vacuum must be between 0 and 1024
+ERROR:  PARALLEL option must be between 0 and 1024
 LINE 1: VACUUM (PARALLEL -1) pvactst;
                 ^
 VACUUM (PARALLEL 2, INDEX_CLEANUP FALSE) pvactst;
 VACUUM (PARALLEL 2, FULL TRUE) pvactst; -- error, cannot use both PARALLEL and FULL
 ERROR:  VACUUM FULL cannot be performed in parallel
 VACUUM (PARALLEL) pvactst; -- error, cannot use PARALLEL option without parallel degree
-ERROR:  parallel option requires a value between 0 and 1024
-LINE 1: VACUUM (PARALLEL) pvactst;
-                ^
+ERROR:  parallel requires an integer value
 -- Test parallel vacuum using the minimum maintenance_work_mem with and without
 -- dead tuples.
 SET maintenance_work_mem TO 64;
@@ -686,3 +684,142 @@ RESET ROLE;
 DROP TABLE vacowned;
 DROP TABLE vacowned_parted;
 DROP ROLE regress_vacuum;
+-- Test checking how new toast values are allocated on rewrite.
+-- Create table with plain storage (forces inline storage initially).
+CREATE TABLE vac_rewrite_toast (id int, f1 TEXT STORAGE plain);
+-- Insert tuple large enough to trigger toast storage on rewrite, still
+-- small enough to fit on a page.
+INSERT INTO vac_rewrite_toast values (1, repeat('a', 7000));
+-- Switch to external storage to force toast table usage.
+ALTER TABLE vac_rewrite_toast ALTER COLUMN f1 SET STORAGE EXTERNAL;
+-- This second tuple is toasted, its value should still be the
+-- same after rewrite.
+INSERT INTO vac_rewrite_toast values (2, repeat('a', 7000));
+SELECT pg_column_toast_chunk_id(f1) AS id_2_chunk FROM vac_rewrite_toast
+  WHERE id = 2 \gset
+-- Check initial state of the data.
+SELECT id, pg_column_toast_chunk_id(f1) IS NULL AS f1_chunk_null,
+  substr(f1, 5, 10) AS f1_data,
+  pg_column_compression(f1) AS f1_comp
+  FROM vac_rewrite_toast ORDER BY id;
+ id | f1_chunk_null |  f1_data   | f1_comp 
+----+---------------+------------+---------
+  1 | t             | aaaaaaaaaa | 
+  2 | f             | aaaaaaaaaa | 
+(2 rows)
+
+-- VACUUM FULL forces toast data rewrite.
+VACUUM FULL vac_rewrite_toast;
+-- Check after rewrite.
+SELECT id, pg_column_toast_chunk_id(f1) IS NULL AS f1_chunk_null,
+  substr(f1, 5, 10) AS f1_data,
+  pg_column_compression(f1) AS f1_comp
+  FROM vac_rewrite_toast ORDER BY id;
+ id | f1_chunk_null |  f1_data   | f1_comp 
+----+---------------+------------+---------
+  1 | f             | aaaaaaaaaa | 
+  2 | f             | aaaaaaaaaa | 
+(2 rows)
+
+-- The same value is reused for the tuple toasted before the rewrite.
+SELECT pg_column_toast_chunk_id(f1) = :'id_2_chunk' AS same_chunk
+  FROM vac_rewrite_toast WHERE id = 2;
+ same_chunk 
+------------
+ t
+(1 row)
+
+DROP TABLE vac_rewrite_toast;
+-- Test estimates when on-access VM setting lets VACUUM skip most pages.
+CREATE TEMP TABLE vac_reltuples_new AS
+  SELECT g AS a, repeat('x', 100) AS b FROM generate_series(1, 4000) g;
+SELECT count(*) FROM vac_reltuples_new;
+ count 
+-------
+  4000
+(1 row)
+
+VACUUM vac_reltuples_new;
+SELECT reltuples = -1 AS reltuples_unknown
+  FROM pg_class WHERE oid = 'vac_reltuples_new'::regclass;
+ reltuples_unknown 
+-------------------
+ t
+(1 row)
+
+ANALYZE vac_reltuples_new;
+SELECT reltuples = 4000 AS reltuples_updated
+  FROM pg_class WHERE oid = 'vac_reltuples_new'::regclass;
+ reltuples_updated 
+-------------------
+ t
+(1 row)
+
+-- Likewise for a relation that was empty when it was last vacuumed.
+TRUNCATE vac_reltuples_new;
+VACUUM vac_reltuples_new;
+INSERT INTO vac_reltuples_new
+  SELECT g, repeat('x', 100) FROM generate_series(1, 4000) g;
+SELECT count(*) FROM vac_reltuples_new;
+ count 
+-------
+  4000
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+VACUUM vac_reltuples_new;
+SELECT reltuples = -1 AS reltuples_unknown
+  FROM pg_class WHERE oid = 'vac_reltuples_new'::regclass;
+ reltuples_unknown 
+-------------------
+ t
+(1 row)
+
+SELECT n_live_tup = 4000 AS n_live_tup_preserved
+  FROM pg_stat_all_tables WHERE relid = 'vac_reltuples_new'::regclass;
+ n_live_tup_preserved 
+----------------------
+ t
+(1 row)
+
+-- Preserve a valid estimate when the only scanned tail pages were new.
+CREATE TEMP TABLE vac_reltuples_known AS
+  SELECT g AS a, repeat('x', 100) AS b FROM generate_series(1, 4000) g;
+ANALYZE vac_reltuples_known;
+SELECT count(*) FROM vac_reltuples_known;
+ count 
+-------
+  4000
+(1 row)
+
+VACUUM vac_reltuples_known;
+SELECT reltuples = 4000 AS reltuples_preserved
+  FROM pg_class WHERE oid = 'vac_reltuples_known'::regclass;
+ reltuples_preserved 
+---------------------
+ t
+(1 row)
+
+-- Scale a valid prior density when the relation has grown.
+INSERT INTO vac_reltuples_known
+  SELECT g, repeat('x', 100) FROM generate_series(4001, 8000) g;
+SELECT count(*) FROM vac_reltuples_known;
+ count 
+-------
+  8000
+(1 row)
+
+VACUUM vac_reltuples_known;
+SELECT reltuples BETWEEN 7600 AND 8400 AS reltuples_ok
+  FROM pg_class WHERE oid = 'vac_reltuples_known'::regclass;
+ reltuples_ok 
+--------------
+ t
+(1 row)
+
+DROP TABLE vac_reltuples_new, vac_reltuples_known;

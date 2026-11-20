@@ -158,7 +158,6 @@ GlobalSystemVariablesShmemInit(void)
 	hashctl.keysize = SYSTEM_VAR_NAME_MAX_LEN;
 	hashctl.entrysize = sizeof(SystemVar);
 	globalSystemVars = ShmemInitHash("MySQL Global System Variables",
-									 SYSTEM_VAR_INT_NUM,
 									 SYSTEM_VAR_MAX_NUM,
 									 &hashctl,
 									 HASH_ELEM | HASH_STRINGS);
@@ -1039,7 +1038,7 @@ readBaseVariablesTable(void)
 
 	relation = table_open(tableId, AccessShareLock);
 	snapshot = RegisterSnapshot(GetLatestSnapshot());
-	scan = table_beginscan(relation, snapshot, 0, NULL);
+	scan = table_beginscan(relation, snapshot, 0, NULL, 0);
 	slot = table_slot_create(relation, NULL);
 	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 	{

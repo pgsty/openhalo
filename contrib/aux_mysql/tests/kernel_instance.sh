@@ -2,12 +2,12 @@
 # Copyright (c) 2026, PGSTY PTE. LTD.
 # Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
 # Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
-# Create and start an aux_mysql test instance on any PG18-based kernel
+# Create and start an aux_mysql test instance on any PG19-based kernel
 # (inside the ohdev container).  The kernel must carry the protocol-hook
 # patch, and aux_mysql must be installed into its prefix.
 #
 #   kernel_instance.sh <prefix> <pgdata> <pgport> <mysqlport> [initdb options...]
-#   e.g. kernel_instance.sh /usr/local/pgsql /home/pg/oh18 5442 3316
+#   e.g. kernel_instance.sh /usr/local/pgsql /home/pg/oh19 5442 3316
 #        EXTRA_PRELOAD=orioledb kernel_instance.sh /root/forks/oriole /home/pg/oriole 5452 3326
 #
 # Runs the server as OS user $OSUSER (default pg).  TLS uses $CERT_DIR/server.{crt,key}
@@ -31,7 +31,7 @@ if [ ! -f "$DATA/PG_VERSION" ]; then
   fi
   chown $OSUSER: "$DATA"/server.* && chmod 600 "$DATA/server.key"
   # keep what the kernel preloads itself (IvorySQL: liboracle_parser, ivorysql_ora;
-  # OpenHalo 18: aux_mysql)
+  # OpenHalo 19: aux_mysql)
   PRELOAD=$(su $OSUSER -c "$BIN/postgres -D $DATA -C shared_preload_libraries")
   # EXTRA_PRELOAD: libraries the kernel's own extensions need (orioledb, pg_tde)
   PRELOAD=${PRELOAD:+$PRELOAD, }${EXTRA_PRELOAD:+$EXTRA_PRELOAD, }

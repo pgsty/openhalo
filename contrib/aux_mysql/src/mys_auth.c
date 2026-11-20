@@ -138,7 +138,6 @@ mys_auth_shmem_startup(void)
 	info.entrysize = sizeof(MysAuthCacheEntry);
 	auth_cache = ShmemInitHash("aux_mysql auth cache",
 							   halo_mysql_auth_cache_size,
-							   halo_mysql_auth_cache_size,
 							   &info,
 							   HASH_ELEM | HASH_STRINGS | HASH_FIXED_SIZE);
 }

@@ -4,7 +4,7 @@
  *	  Low level infrastructure related to expression evaluation
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/execExpr.h
@@ -552,14 +552,11 @@ typedef struct ExprEvalStep
 			/* original expression node */
 			FieldStore *fstore;
 
-			/* cached descriptor for composite type - filled at runtime */
-			/* note that a DEFORM and FORM pair share the same cache */
-			ExprEvalRowtypeCache *rowcache;
+			TupleDesc	tupdesc;	/* descriptor for result tuples */
 
 			/* workspace for column values */
 			Datum	   *values;
 			bool	   *nulls;
-			int			ncolumns;
 		}			fieldstore;
 
 		/* for EEOP_SBSREF_SUBSCRIPTS */

@@ -40,6 +40,7 @@
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "utils/tuplestore.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -608,7 +609,7 @@ mys_sync_auto_increment(Oid relid)
 	}
 
 	snapshot = RegisterSnapshot(GetLatestSnapshot());
-	scan = table_beginscan(rel, snapshot, 0, NULL);
+	scan = table_beginscan(rel, snapshot, 0, NULL, 0);
 	slot = table_slot_create(rel, NULL);
 	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 	{
@@ -638,7 +639,7 @@ static bool
 table_is_empty(Relation rel)
 {
 	Snapshot	snapshot = RegisterSnapshot(GetLatestSnapshot());
-	TableScanDesc scan = table_beginscan(rel, snapshot, 0, NULL);
+	TableScanDesc scan = table_beginscan(rel, snapshot, 0, NULL, 0);
 	TupleTableSlot *slot = table_slot_create(rel, NULL);
 	bool		empty = !table_scan_getnextslot(scan, ForwardScanDirection, slot);
 
@@ -1505,7 +1506,7 @@ mys_column_generation(PG_FUNCTION_ARGS)
 	Node	   *expr = NULL;
 	char	   *text;
 	bool		save_quote = quote_all_identifiers;
-	bool		save_strings = standard_conforming_strings;
+
 	GeneratedDisplay display = {0};
 
 	if (rel == NULL)
@@ -1525,9 +1526,9 @@ mys_column_generation(PG_FUNCTION_ARGS)
 	expr = generated_refs_to_columns(expr, rel);
 	expr = generated_display_constants(expr, NULL);
 
-	/* every identifier delimited; literals with plain backslashes */
+	/* PG19 always deparses standard strings; delimit every identifier. */
 	quote_all_identifiers = true;
-	standard_conforming_strings = true;
+
 	PG_TRY();
 	{
 		display.namespace = deparse_context_for(RelationGetRelationName(rel), relid);
@@ -1538,7 +1539,7 @@ mys_column_generation(PG_FUNCTION_ARGS)
 	PG_FINALLY();
 	{
 		quote_all_identifiers = save_quote;
-		standard_conforming_strings = save_strings;
+
 	}
 	PG_END_TRY();
 	text = mysql_expression_text(text, RelationGetDescr(rel), display.calls);
@@ -1628,7 +1629,7 @@ mys_column_default(PG_FUNCTION_ARGS)
 	Relation rel = try_relation_open(relid, AccessShareLock);
 	Node *expr = NULL;
 	char *result;
-	bool save_strings = standard_conforming_strings;
+
 
 	if (rel == NULL)
 		PG_RETURN_NULL();
@@ -1671,16 +1672,8 @@ mys_column_default(PG_FUNCTION_ARGS)
 			PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 		}
 	}
-	standard_conforming_strings = true;
-	PG_TRY();
-	{
-		result = deparse_expression(expr, deparse_context_for(RelationGetRelationName(rel), relid), false, false);
-	}
-	PG_FINALLY();
-	{
-		standard_conforming_strings = save_strings;
-	}
-	PG_END_TRY();
+
+	result = deparse_expression(expr, deparse_context_for(RelationGetRelationName(rel), relid), false, false);
 	result = mysql_expression_text(result, RelationGetDescr(rel), NIL);
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_TEXT_P(cstring_to_text(result));
@@ -1725,7 +1718,7 @@ mys_show_create_view(PG_FUNCTION_ARGS)
 	char *definition;
 	StringInfoData buf;
 	bool save_quote = quote_all_identifiers;
-	bool save_strings = standard_conforming_strings;
+
 
 	if (cl->relkind != RELKIND_VIEW)
 		ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("%s is not a view", name)));
@@ -1740,7 +1733,7 @@ mys_show_create_view(PG_FUNCTION_ARGS)
 			target->resname = pstrdup(NameStr(TupleDescAttr(RelationGetDescr(view),
 														 target->resno - 1)->attname));
 	quote_all_identifiers = true;
-	standard_conforming_strings = true;
+
 	PG_TRY();
 	{
 		definition = pg_get_querydef(query, false);
@@ -1748,7 +1741,7 @@ mys_show_create_view(PG_FUNCTION_ARGS)
 	PG_FINALLY();
 	{
 		quote_all_identifiers = save_quote;
-		standard_conforming_strings = save_strings;
+
 	}
 	PG_END_TRY();
 	relation_close(view, AccessShareLock);

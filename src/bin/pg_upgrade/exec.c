@@ -3,7 +3,7 @@
  *
  *	execution functions
  *
- *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	Portions Copyright (c) 2026, PGSTY PTE. LTD.
  *	Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
  *	src/bin/pg_upgrade/exec.c
@@ -14,6 +14,7 @@
 #include <fcntl.h>
 
 #include "common/string.h"
+#include "fe_utils/version.h"
 #include "pg_upgrade.h"
 
 static void check_data_dir(ClusterInfo *cluster);
@@ -62,7 +63,7 @@ get_bin_version(ClusterInfo *cluster)
 	if (cluster == &old_cluster &&
 		sscanf(cmd_output, "%*s %*s %d.%d.%d.%d", &v1, &v2, &v3, &v4) == 4 &&
 		v1 == 1 && v2 == 0 && v3 == 14)
-		pg_fatal("direct pg_upgrade from OpenHalo 14 is not supported; use a reviewed logical schema/data migration to OpenHalo 18 (see contrib/aux_mysql/MIGRATION.md)");
+		pg_fatal("direct pg_upgrade from OpenHalo 14 is not supported; use a reviewed logical schema/data migration to OpenHalo 19 (see contrib/aux_mysql/MIGRATION.md)");
 
 	if (v1 < 10)
 	{
@@ -93,7 +94,7 @@ get_bin_version(ClusterInfo *cluster)
  */
 bool
 exec_prog(const char *log_filename, const char *opt_log_file,
-		  bool report_error, bool exit_on_error, const char *fmt,...)
+		  bool report_error, bool exit_on_error, const char *fmt, ...)
 {
 	int			result = 0;
 	int			written;
@@ -353,8 +354,8 @@ check_data_dir(ClusterInfo *cluster)
 	const char *pg_data = cluster->pgdata;
 
 	/* get the cluster version */
-	cluster->major_version = get_major_server_version(cluster);
-
+	cluster->major_version = get_pg_version(cluster->pgdata,
+											&cluster->major_version_str);
 	check_single_dir(pg_data, "");
 	check_single_dir(pg_data, "base");
 	check_single_dir(pg_data, "global");

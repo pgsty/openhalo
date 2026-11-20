@@ -384,8 +384,9 @@ class Checks:
         for value in (b'123.456',b'123456789123',b'-123456789123',b'1e100'):
             for target in ('DECIMAL','DECIMAL(5,2)','DECIMAL(3,3)'):
                 self.both("SELECT CAST(UNHEX('"+value.hex()+"') AS "+target+")")
-        pg = subprocess.check_output([os.getenv('PSQL','psql'),'-h','/tmp','-p',
-             str(self.oh.conn.port+2000),'-U','postgres','-AtX','-c',
+        pg = subprocess.check_output([os.getenv('PSQL', os.path.join(os.getenv('PGBIN', ''), 'psql')),
+             '-h', os.getenv('PGHOST', '/tmp'), '-p', os.getenv('PGPORT', str(self.oh.conn.port+2000)),
+             '-U', os.getenv('PGUSER', 'postgres'), '-AtX', '-c',
              "SELECT decode('3432','hex')::int8"],text=True).strip()
         assert pg == '13362', pg
         self.count += 1

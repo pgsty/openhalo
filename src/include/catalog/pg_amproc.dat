@@ -3,7 +3,7 @@
 # pg_amproc.dat
 #    Initial contents of the pg_amproc system catalog.
 #
-# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/include/catalog/pg_amproc.dat
@@ -30,9 +30,6 @@
 { amprocfamily => 'btree/bpchar_ops', amproclefttype => 'bpchar',
   amprocrighttype => 'bpchar', amprocnum => '2',
   amproc => 'bpchar_sortsupport' },
-{ amprocfamily => 'btree/bpchar_ops', amproclefttype => 'bpchar',
-  amprocrighttype => 'bpchar', amprocnum => '4',
-  amproc => 'btvarstrequalimage' },
 { amprocfamily => 'btree/bytea_ops', amproclefttype => 'bytea',
   amprocrighttype => 'bytea', amprocnum => '1', amproc => 'byteacmp' },
 { amprocfamily => 'btree/bytea_ops', amproclefttype => 'bytea',
@@ -213,11 +210,17 @@
   amprocrighttype => 'oid', amprocnum => '4', amproc => 'btequalimage' },
 { amprocfamily => 'btree/oid_ops', amproclefttype => 'oid',
   amprocrighttype => 'oid', amprocnum => '6', amproc => 'btoidskipsupport' },
+{ amprocfamily => 'btree/oid8_ops', amproclefttype => 'oid8',
+  amprocrighttype => 'oid8', amprocnum => '1', amproc => 'btoid8cmp' },
+{ amprocfamily => 'btree/oid8_ops', amproclefttype => 'oid8',
+  amprocrighttype => 'oid8', amprocnum => '2', amproc => 'btoid8sortsupport' },
+{ amprocfamily => 'btree/oid8_ops', amproclefttype => 'oid8',
+  amprocrighttype => 'oid8', amprocnum => '4', amproc => 'btequalimage' },
+{ amprocfamily => 'btree/oid8_ops', amproclefttype => 'oid8',
+  amprocrighttype => 'oid8', amprocnum => '6', amproc => 'btoid8skipsupport' },
 { amprocfamily => 'btree/oidvector_ops', amproclefttype => 'oidvector',
   amprocrighttype => 'oidvector', amprocnum => '1',
   amproc => 'btoidvectorcmp' },
-{ amprocfamily => 'btree/oidvector_ops', amproclefttype => 'oidvector',
-  amprocrighttype => 'oidvector', amprocnum => '4', amproc => 'btequalimage' },
 { amprocfamily => 'btree/text_ops', amproclefttype => 'text',
   amprocrighttype => 'text', amprocnum => '1', amproc => 'bttextcmp' },
 { amprocfamily => 'btree/text_ops', amproclefttype => 'text',
@@ -265,8 +268,6 @@
 { amprocfamily => 'btree/bpchar_pattern_ops', amproclefttype => 'bpchar',
   amprocrighttype => 'bpchar', amprocnum => '2',
   amproc => 'btbpchar_pattern_sortsupport' },
-{ amprocfamily => 'btree/bpchar_pattern_ops', amproclefttype => 'bpchar',
-  amprocrighttype => 'bpchar', amprocnum => '4', amproc => 'btequalimage' },
 { amprocfamily => 'btree/money_ops', amproclefttype => 'money',
   amprocrighttype => 'money', amprocnum => '1', amproc => 'cash_cmp' },
 { amprocfamily => 'btree/money_ops', amproclefttype => 'money',
@@ -432,6 +433,10 @@
   amprocrighttype => 'xid8', amprocnum => '1', amproc => 'hashxid8' },
 { amprocfamily => 'hash/xid8_ops', amproclefttype => 'xid8',
   amprocrighttype => 'xid8', amprocnum => '2', amproc => 'hashxid8extended' },
+{ amprocfamily => 'hash/oid8_ops', amproclefttype => 'oid8',
+  amprocrighttype => 'oid8', amprocnum => '1', amproc => 'hashoid8' },
+{ amprocfamily => 'hash/oid8_ops', amproclefttype => 'oid8',
+  amprocrighttype => 'oid8', amprocnum => '2', amproc => 'hashoid8extended' },
 { amprocfamily => 'hash/cid_ops', amproclefttype => 'cid',
   amprocrighttype => 'cid', amprocnum => '1', amproc => 'hashcid' },
 { amprocfamily => 'hash/cid_ops', amproclefttype => 'cid',

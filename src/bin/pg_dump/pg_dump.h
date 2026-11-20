@@ -3,7 +3,7 @@
  * pg_dump.h
  *	  Common header file for the pg_dump utility
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_dump/pg_dump.h
@@ -364,6 +364,8 @@ typedef struct _tableInfo
 	char	   *attalign;		/* attribute align, used by binary_upgrade */
 	bool	   *attislocal;		/* true if attr has local definition */
 	char	  **attoptions;		/* per-attribute options */
+	uint64	   *attversion;		/* per-attribute row-type version (or 0);
+								 * restored only in binary-upgrade mode */
 	Oid		   *attcollation;	/* per-attribute collation selection */
 	char	   *attcompression; /* per-attribute compression method */
 	char	  **attfdwoptions;	/* per-attribute fdw options */
@@ -448,6 +450,7 @@ typedef struct _indexAttachInfo
 typedef struct _relStatsInfo
 {
 	DumpableObject dobj;
+	Oid			relid;
 	int32		relpages;
 	char	   *reltuples;
 	int32		relallvisible;
@@ -604,6 +607,7 @@ typedef struct _fdwInfo
 	const char *rolname;
 	char	   *fdwhandler;
 	char	   *fdwvalidator;
+	char	   *fdwconnection;
 	char	   *fdwoptions;
 } FdwInfo;
 
@@ -669,12 +673,14 @@ typedef struct _PublicationInfo
 	DumpableObject dobj;
 	const char *rolname;
 	bool		puballtables;
+	bool		puballsequences;
 	bool		pubinsert;
 	bool		pubupdate;
 	bool		pubdelete;
 	bool		pubtruncate;
 	bool		pubviaroot;
 	PublishGencolsType pubgencols_type;
+	SimplePtrList except_tables;
 } PublicationInfo;
 
 /*
@@ -716,9 +722,13 @@ typedef struct _SubscriptionInfo
 	bool		subpasswordrequired;
 	bool		subrunasowner;
 	bool		subfailover;
+	bool		subretaindeadtuples;
+	int			submaxretention;
+	char	   *subservername;
 	char	   *subconninfo;
 	char	   *subslotname;
 	char	   *subsynccommit;
+	char	   *subwalrcvtimeout;
 	char	   *subpublications;
 	char	   *suborigin;
 	char	   *suboriginremotelsn;
@@ -827,6 +837,6 @@ extern void getPublicationNamespaces(Archive *fout);
 extern void getPublicationTables(Archive *fout, TableInfo tblinfo[],
 								 int numTables);
 extern void getSubscriptions(Archive *fout);
-extern void getSubscriptionTables(Archive *fout);
+extern void getSubscriptionRelations(Archive *fout);
 
 #endif							/* PG_DUMP_H */

@@ -3,7 +3,7 @@
  * readfuncs.c
  *	  Reader functions for Postgres tree nodes.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, PGSTY PTE. LTD.
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
@@ -27,8 +27,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-
-#include <math.h>
 
 #include "miscadmin.h"
 #include "nodes/bitmapset.h"
@@ -257,9 +255,8 @@ readBitmapset(void)
 
 #include "readfuncs.funcs.c"
 
-/* Stored rules and SQL function bodies from before aux_mysql 1.9 omit the
- * dialect flags. Keep their positional format intact and default to native
- * semantics. Also accept the leading fields used by development snapshots. */
+/* Follow PG19's stored-query layout, with optional trailing dialect flags.
+ * Native stored rules and SQL function bodies default to native semantics. */
 static OnConflictExpr *
 _readOnConflictExpr(void)
 {
@@ -276,6 +273,7 @@ _readOnConflictExpr(void)
 	READ_NODE_FIELD(arbiterElems);
 	READ_NODE_FIELD(arbiterWhere);
 	READ_OID_FIELD(constraint);
+	READ_ENUM_FIELD(lockStrength, LockClauseStrength);
 	READ_NODE_FIELD(onConflictSet);
 	READ_NODE_FIELD(onConflictWhere);
 	READ_INT_FIELD(exclRelIndex);
@@ -635,8 +633,7 @@ parseNodeString(void)
 Datum
 readDatum(bool typbyval)
 {
-	Size		length,
-				i;
+	Size		length;
 	int			tokenLength;
 	const char *token;
 	Datum		res;
@@ -659,18 +656,18 @@ readDatum(bool typbyval)
 			elog(ERROR, "byval datum but length = %zu", length);
 		res = (Datum) 0;
 		s = (char *) (&res);
-		for (i = 0; i < (Size) sizeof(Datum); i++)
+		for (Size i = 0; i < (Size) sizeof(Datum); i++)
 		{
 			token = pg_strtok(&tokenLength);
 			s[i] = (char) atoi(token);
 		}
 	}
 	else if (length <= 0)
-		res = (Datum) NULL;
+		res = (Datum) 0;
 	else
 	{
 		s = (char *) palloc(length);
-		for (i = 0; i < length; i++)
+		for (Size i = 0; i < length; i++)
 		{
 			token = pg_strtok(&tokenLength);
 			s[i] = (char) atoi(token);

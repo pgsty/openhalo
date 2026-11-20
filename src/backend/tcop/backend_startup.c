@@ -3,7 +3,7 @@
  * backend_startup.c
  *	  Backend startup code
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, PGSTY PTE. LTD.
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
@@ -61,10 +61,23 @@ char	   *log_connections_string = NULL;
  */
 ConnectionTiming conn_timing = {.ready_for_use = TIMESTAMP_MINUS_INFINITY};
 
+/*
+ * Cancel request parsed from a startup packet.
+ */
+#define STARTUP_CANCEL_KEY_MAX 256
+typedef struct PendingCancelRequest
+{
+	bool		valid;
+	int			backendPID;
+	int			cancel_key_len;
+	uint8		cancel_key[STARTUP_CANCEL_KEY_MAX];
+} PendingCancelRequest;
+
 static void BackendInitialize(ClientSocket *client_sock, CAC_state cac);
 static int	ProcessSSLStartup(Port *port);
-static int	ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done);
-static void ProcessCancelRequestPacket(Port *port, void *pkt, int pktlen);
+static int	ProcessStartupPacket(Port *port, PendingCancelRequest *cancel_req);
+static void ProcessCancelRequestPacket(Port *port, void *pkt, int pktlen,
+									   PendingCancelRequest *cancel_req);
 static void SendNegotiateProtocolVersion(List *unrecognized_protocol_options);
 static void process_startup_packet_die(SIGNAL_ARGS);
 static void StartupPacketTimeoutHandler(void);
@@ -151,6 +164,7 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 	char		remote_port[NI_MAXSERV];
 	StringInfoData ps_data;
 	MemoryContext oldcontext;
+	PendingCancelRequest cancel_req = {0};
 
 	/* Tell fd.c about the long-lived FD associated with the client_sock */
 	ReserveExternalFD();
@@ -320,15 +334,14 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 	}
 	else
 	{
-		/* Handle direct SSL handshake */
+		/* Handle direct SSL handshake before the native startup packet. */
 		status = ProcessSSLStartup(port);
 
 		/*
-		 * Receive the startup packet (which might turn out to be a cancel
-		 * request packet).
+		 * Receive the startup packet; cancel requests are dispatched later.
 		 */
 		if (status == STATUS_OK)
-			status = ProcessStartupPacket(port, false, false);
+			status = ProcessStartupPacket(port, &cancel_req);
 	}
 
 	/*
@@ -400,6 +413,15 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 	 * handlers unfortunately, since pq_init() already registered one.)
 	 */
 	check_on_shmem_exit_lists_are_empty();
+
+	/*
+	 * Now that STARTUP_PACKET_TIMEOUT is disabled and SIGTERM is blocked, it
+	 * is safe to touch shared memory.  Fire the cancel request.
+	 */
+	if (cancel_req.valid)
+		SendCancelRequest(cancel_req.backendPID,
+						  cancel_req.cancel_key,
+						  cancel_req.cancel_key_len);
 
 	/*
 	 * Stop here if it was bad or a cancel packet.  ProcessStartupPacket
@@ -518,20 +540,27 @@ reject:
  * send anything to the client, which would typically be appropriate
  * if we detect a communications failure.)
  *
- * Set ssl_done and/or gss_done when negotiation of an encrypted layer
- * (currently, TLS or GSSAPI) is completed. A successful negotiation of either
- * encryption layer sets both flags, but a rejected negotiation sets only the
- * flag for that layer, since the client may wish to try the other one. We
- * should make no assumption here about the order in which the client may make
- * requests.
  */
 static int
-ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done)
+ProcessStartupPacket(Port *port, PendingCancelRequest *cancel_req)
 {
 	int32		len;
-	char	   *buf;
+	char	   *buf = NULL;
 	ProtocolVersion proto;
 	MemoryContext oldcontext;
+	bool		gss_done;
+	bool		ssl_done;
+
+	/*
+	 * Set ssl_done and/or gss_done when negotiation of an encrypted layer
+	 * (currently, TLS or GSSAPI) is completed.  A successful negotiation of
+	 * either encryption layer sets both flags, but a rejected negotiation
+	 * sets only the flag for that layer, since the client may wish to try the
+	 * other one.  We should make no assumption here about the order in which
+	 * the client may make requests.
+	 */
+	gss_done = false;
+	ssl_done = false;
 
 retry:
 	pq_startmsgread();
@@ -554,7 +583,7 @@ retry:
 		 * scanners, which may be less benign, but it's not really our job to
 		 * notice those.)
 		 */
-		return STATUS_ERROR;
+		goto fail;
 	}
 
 	if (pq_getbytes(((char *) &len) + 1, 3) == EOF)
@@ -564,7 +593,7 @@ retry:
 			ereport(COMMERROR,
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
 					 errmsg("incomplete startup packet")));
-		return STATUS_ERROR;
+		goto fail;
 	}
 
 	len = pg_ntoh32(len);
@@ -576,7 +605,7 @@ retry:
 		ereport(COMMERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("invalid length of startup packet")));
-		return STATUS_ERROR;
+		goto fail;
 	}
 
 	/*
@@ -592,7 +621,7 @@ retry:
 		ereport(COMMERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("incomplete startup packet")));
-		return STATUS_ERROR;
+		goto fail;
 	}
 	pq_endmsgread();
 
@@ -604,9 +633,9 @@ retry:
 
 	if (proto == CANCEL_REQUEST_CODE)
 	{
-		ProcessCancelRequestPacket(port, buf, len);
+		ProcessCancelRequestPacket(port, buf, len, cancel_req);
 		/* Not really an error, but we don't want to proceed further */
-		return STATUS_ERROR;
+		goto fail;
 	}
 
 	if (proto == NEGOTIATE_SSL_CODE && !ssl_done)
@@ -645,13 +674,16 @@ retry:
 			ereport(COMMERROR,
 					(errcode_for_socket_access(),
 					 errmsg("failed to send SSL negotiation response: %m")));
-			return STATUS_ERROR;	/* close the connection */
+			goto fail;			/* close the connection */
 		}
 
 #ifdef USE_SSL
 		if (SSLok == 'S' && secure_open_server(port) == -1)
-			return STATUS_ERROR;
+			goto fail;
 #endif
+
+		pfree(buf);
+		buf = NULL;
 
 		/*
 		 * At this point we should have no data already buffered.  If we do,
@@ -713,13 +745,16 @@ retry:
 			ereport(COMMERROR,
 					(errcode_for_socket_access(),
 					 errmsg("failed to send GSSAPI negotiation response: %m")));
-			return STATUS_ERROR;	/* close the connection */
+			goto fail;			/* close the connection */
 		}
 
 #ifdef ENABLE_GSS
 		if (GSSok == 'G' && secure_open_gssapi(port) == -1)
-			return STATUS_ERROR;
+			goto fail;
 #endif
+
+		pfree(buf);
+		buf = NULL;
 
 		/*
 		 * At this point we should have no data already buffered.  If we do,
@@ -882,6 +917,8 @@ retry:
 		if (PG_PROTOCOL_MINOR(proto) > PG_PROTOCOL_MINOR(PG_PROTOCOL_LATEST) ||
 			unrecognized_protocol_options != NIL)
 			SendNegotiateProtocolVersion(unrecognized_protocol_options);
+
+		list_free_deep(unrecognized_protocol_options);
 	}
 
 	/* Check a user name was given. */
@@ -903,10 +940,9 @@ retry:
 	if (strlen(port->user_name) >= NAMEDATALEN)
 		port->user_name[NAMEDATALEN - 1] = '\0';
 
+	Assert(MyBackendType == B_BACKEND || MyBackendType == B_DEAD_END_BACKEND);
 	if (am_walsender)
 		MyBackendType = B_WAL_SENDER;
-	else
-		MyBackendType = B_BACKEND;
 
 	/*
 	 * Normal walsender backends, e.g. for streaming replication, are not
@@ -924,16 +960,27 @@ retry:
 	 */
 	MemoryContextSwitchTo(oldcontext);
 
+	pfree(buf);
+
 	return STATUS_OK;
+
+fail:
+	/* be tidy, just to avoid Valgrind complaints */
+	if (buf)
+		pfree(buf);
+
+	return STATUS_ERROR;
 }
 
 /*
  * The client has sent a cancel request packet, not a normal
- * start-a-new-connection packet.  Perform the necessary processing.  Nothing
- * is sent back to the client.
+ * start-a-new-connection packet.  Parse, validate, then stash the parsed
+ * request in *cancel_req so that BackendInitialize() can dispatch it later
+ * to SendCancelRequest().  Nothing is sent back to the client.
  */
 static void
-ProcessCancelRequestPacket(Port *port, void *pkt, int pktlen)
+ProcessCancelRequestPacket(Port *port, void *pkt, int pktlen,
+						   PendingCancelRequest *cancel_req)
 {
 	CancelRequestPacket *canc;
 	int			len;
@@ -946,7 +993,7 @@ ProcessCancelRequestPacket(Port *port, void *pkt, int pktlen)
 		return;
 	}
 	len = pktlen - offsetof(CancelRequestPacket, cancelAuthCode);
-	if (len == 0 || len > 256)
+	if (len == 0 || len > STARTUP_CANCEL_KEY_MAX)
 	{
 		ereport(COMMERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
@@ -955,7 +1002,10 @@ ProcessCancelRequestPacket(Port *port, void *pkt, int pktlen)
 	}
 
 	canc = (CancelRequestPacket *) pkt;
-	SendCancelRequest(pg_ntoh32(canc->backendPID), canc->cancelAuthCode, len);
+	cancel_req->backendPID = pg_ntoh32(canc->backendPID);
+	cancel_req->cancel_key_len = len;
+	memcpy(cancel_req->cancel_key, canc->cancelAuthCode, len);
+	cancel_req->valid = true;
 }
 
 /*

@@ -1,10 +1,11 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 backend_sources += files(
   'auth-oauth.c',
   'auth-sasl.c',
   'auth-scram.c',
   'auth.c',
+  'be-fe-helpers.c',
   'be-fsstubs.c',
   'be-secure-common.c',
   'be-secure.c',
@@ -31,5 +32,6 @@ endif
 install_data(
   'pg_hba.conf.sample',
   'pg_ident.conf.sample',
+  'pg_hosts.conf.sample',
   install_dir: dir_data,
 )

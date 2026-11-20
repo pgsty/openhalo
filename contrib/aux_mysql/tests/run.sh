@@ -15,7 +15,8 @@ LOG_DIR=$(cd "$LOG_DIR" && pwd)
 DRIVER_DIR=${DRIVER_DIR:-$LOG_DIR/drivers}
 JAR=${JAR:-/root/drivers/mysql-connector-j-8.4.0.jar}
 PSQL=("$PGBIN/psql" -h "${PGHOST:-127.0.0.1}" -p "${PGPORT:-5432}" -U "${PGUSER:-postgres}" -d "${PGDATABASE:-postgres}" -XqAt -v ON_ERROR_STOP=1)
-M=(mysql -h127.0.0.1 -P"$MYSQL_PORT" -udbuser_mysql -pMysql.123)
+export MYSQL_PWD=${MYSQL_PWD:-Mysql.123}
+M=(mysql -h127.0.0.1 -P"$MYSQL_PORT" -udbuser_mysql --default-character-set=utf8mb4)
 passed=0 failed=0 skipped=0
 : > "$LOG_DIR/status.tsv"
 record() {
@@ -38,21 +39,22 @@ if ! "${PSQL[@]}" -c 'drop schema if exists test cascade' -c 'create schema test
 fi
 for f in m1_pgsyntax.sql m2_basic.sql m3_ddl.sql m4_more.sql; do
  rc=0
- "${M[@]}" test --force -t < "$f" > "$LOG_DIR/$f.log" 2>&1 || rc=$?
+ # Keep streams separate: buffered stdout can split an ERROR line in two.
+ "${M[@]}" test --force -t < "$f" > "$LOG_DIR/$f.log" 2> "$LOG_DIR/$f.err" || rc=$?
  # --force intentionally continues past two negative tests in m1. Every
  # other error (including connection failures) is an unexpected failure.
- sed -nE 's/^ERROR ([0-9]+) .* at line ([0-9]+):.*/\2 \1/p' "$LOG_DIR/$f.log" > "$LOG_DIR/$f.errors"
+ sed -nE 's/^ERROR ([0-9]+) .* at line ([0-9]+):.*/\2 \1/p' "$LOG_DIR/$f.err" > "$LOG_DIR/$f.errors"
  awk -v f="$f" '$1==f {print $2, $3}' expected/mysql-errors.tsv > "$LOG_DIR/$f.expected-errors"
  if [ "$rc" -eq 0 ] && diff -u "$LOG_DIR/$f.expected-errors" "$LOG_DIR/$f.errors" > "$LOG_DIR/$f.diff" &&
-    ! grep '^ERROR' "$LOG_DIR/$f.log" | grep -v ' at line ' >/dev/null; then record PASS "$f"
- else record FAIL "$f"; cat "$LOG_DIR/$f.diff"; fi
+    ! grep '^ERROR' "$LOG_DIR/$f.err" | grep -v ' at line ' >/dev/null; then record PASS "$f"
+ else record FAIL "$f"; cat "$LOG_DIR/$f.diff" "$LOG_DIR/$f.err"; fi
 done
 for f in p*_*.sql; do
  [ -f "$f" ] || continue
  name=${f%.sql}
  rc=0
- "${M[@]}" test --force -t < "$f" > "$LOG_DIR/$name.log" 2>&1 || rc=$?
- if [ "$rc" -eq 0 ] && diff -u "expected/$name.out" "$LOG_DIR/$name.log" > "$LOG_DIR/$name.diff"; then record PASS "$f"
+ "${M[@]}" test --force -t < "$f" > "$LOG_DIR/$name.log" 2> "$LOG_DIR/$name.err" || rc=$?
+ if [ "$rc" -eq 0 ] && python3 compare_sql_output.py "expected/$name.out" "$LOG_DIR/$name.log" "$LOG_DIR/$name.err" > "$LOG_DIR/$name.diff"; then record PASS "$f"
  else record FAIL "$f"; head -40 "$LOG_DIR/$name.diff"; fi
 done
 run_case pymysql python3 app_pymysql.py
@@ -61,17 +63,21 @@ if python3 -c 'import pymysql, psycopg2' > "$LOG_DIR/ab-dependencies.log" 2>&1; 
 else record SKIP ab-python-dependencies; fi
 if [[ " $SECTIONS " == *" stmt "* ]]; then run_case raw-stmt python3 stmt_raw.py; fi
 run_case flush-auth "${PSQL[@]}" -c 'select mysql.flush_auth_cache()'
+case "$(mysql --version)" in
+ *MariaDB*) tls_opts=(--ssl); plain_opts=(--skip-ssl) ;;
+ *) tls_opts=(--ssl-mode=REQUIRED); plain_opts=(--ssl-mode=DISABLED --get-server-public-key) ;;
+esac
 for name in rsa fast tls; do
- opts=(); [ "$name" != tls ] || opts+=(--ssl)
+ opts=("${plain_opts[@]}"); [ "$name" != tls ] || opts=("${tls_opts[@]}")
  if "${M[@]}" "${opts[@]}" test -N -e "select 'ok'" > "$LOG_DIR/auth-$name.log" 2>&1 &&
     [ "$(cat "$LOG_DIR/auth-$name.log")" = ok ]; then record PASS "auth-$name"
  else record FAIL "auth-$name"; fi
 done
-if mysql -h127.0.0.1 -P"$MYSQL_PORT" -udbuser_mysql -pbad test -e 'select 1' > "$LOG_DIR/auth-wrong.log" 2>&1; then
+if MYSQL_PWD=bad mysql -h127.0.0.1 -P"$MYSQL_PORT" -udbuser_mysql test -e 'select 1' > "$LOG_DIR/auth-wrong.log" 2>&1; then
  record FAIL auth-wrong
 elif grep -q 'ERROR 1045' "$LOG_DIR/auth-wrong.log"; then record PASS auth-wrong
 else record FAIL auth-wrong; fi
-run_case mysqlslap mysqlslap -h127.0.0.1 -P"$MYSQL_PORT" -udbuser_mysql -pMysql.123 --create-schema=test \
+run_case mysqlslap mysqlslap -h127.0.0.1 -P"$MYSQL_PORT" -udbuser_mysql --create-schema=test \
  --concurrency=8 --iterations=1 --number-of-queries=800 --query='select 1'
 mkdir -p "$DRIVER_DIR"
 if command -v go >/dev/null; then

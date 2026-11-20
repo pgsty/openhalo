@@ -1,6 +1,6 @@
 # Contributing
 
-OpenHalo 18 is developed at [`pgsty/openHalo`](https://github.com/pgsty/openHalo). Bug
+OpenHalo 19 is developed at [`pgsty/openHalo`](https://github.com/pgsty/openHalo). Bug
 reports and pull requests are welcome. For a compatibility bug, the most useful report
 is the statement, what MySQL returns and what OpenHalo returns.
 
@@ -8,17 +8,19 @@ is the statement, what MySQL returns and what OpenHalo returns.
 
 | Branch | Content |
 | :--- | :--- |
-| `master` | OpenHalo 18: PostgreSQL 18.6 with protocol and execution hooks, plus `contrib/aux_mysql` |
-| `pg14` | openHalo 1.0 on PostgreSQL 14 (tag `v1.0-pg14`); also the source the MySQL grammar and SQL layer are generated from |
+| `codex/pg19.0` | OpenHalo 19: PostgreSQL 19.0 with protocol and execution hooks, plus `contrib/aux_mysql` |
+| `pg14` | openHalo 1.0 on PostgreSQL 14 (tag `v1.0-pg14`); historical source of the imported MySQL grammar and SQL layer |
 
-Releases are tagged `v<PostgreSQL version>.<revision>` on `master`; see [`CHANGELOG.md`](CHANGELOG.md).
+Releases are tagged `v<PostgreSQL version>.<revision>` on the release branch; see [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Build
 
 Build with GNU make (Meson is not supported). A development build with assertions:
 
 ```sh
-./configure --prefix=$HOME/openhalo --with-openssl --enable-debug --enable-cassert --enable-depend
+mkdir -p /path/to/build-openhalo
+cd /path/to/build-openhalo
+/path/to/source/configure --prefix=$HOME/openhalo --with-openssl --enable-debug --enable-cassert --enable-depend
 make -j$(nproc) && make install             # kernel and contrib/aux_mysql
 ```
 
@@ -29,8 +31,9 @@ trees, data directories and logs outside the repository.
 ## Test
 
 ```sh
-python3 contrib/aux_mysql/tests/check_generated.py       # generated files match their generators
-make check                                               # PostgreSQL regression tests
+printf '%s\n' 'mysql.listener_on = off' > /tmp/openhalo-regression.conf
+make -C /path/to/build-openhalo check TEMP_CONFIG=/tmp/openhalo-regression.conf
+cd /path/to/source
 contrib/aux_mysql/tests/kernel_instance.sh <prefix> <pgdata> <pgport> <mysqlport>
 PGBIN=<prefix>/bin PGPORT=<pgport> MYSQL_PORT=<mysqlport> contrib/aux_mysql/tests/run.sh
 ```
@@ -45,11 +48,10 @@ suites take a reference port and run the same statements against both servers.
 
 ## Changing `aux_mysql`
 
-- **Generated files.** `src/parser/mys_gram.y` and `sql/aux_mysql.sql` are generated from
-  the `pg14` branch by `tools/port_grammar.py` and `tools/port_aux_sql.py`. Change the
-  generator, regenerate, and keep `tests/check_generated.py` passing; do not edit the
-  outputs by hand. [`UPSTREAM.md`](contrib/aux_mysql/UPSTREAM.md) records how upstream
-  commits were ported.
+- **Parser and SQL sources.** Maintain `src/parser/mys_gram.y`, `mys_scan.l` and
+  `sql/aux_mysql--2.0.sql` directly. GNU make generates the C parser, scanner and
+  keyword headers in the build directory. The PG14 import generators belonged
+  to the earlier port; [`UPSTREAM.md`](contrib/aux_mysql/UPSTREAM.md) is its historical log.
 - **SQL objects.** A change to the extension's SQL objects needs a new extension version
   with an update script from the last released one, so that existing installations can
   run `ALTER EXTENSION aux_mysql UPDATE`. The `Makefile` shows how the install and update

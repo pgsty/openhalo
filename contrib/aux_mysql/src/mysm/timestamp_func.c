@@ -321,8 +321,8 @@ timestamp_part_common(PG_FUNCTION_ARGS, bool retnumeric)
 
 			case DTK_JULIAN:
 				if (retnumeric)
-					PG_RETURN_NUMERIC(numeric_add_opt_error(int64_to_numeric(date2j(tm->tm_year, tm->tm_mon, tm->tm_mday)),
-															numeric_div_opt_error(int64_to_numeric(((((tm->tm_hour * MINS_PER_HOUR) + tm->tm_min) * SECS_PER_MINUTE) + tm->tm_sec) * INT64CONST(1000000) + fsec),
+					PG_RETURN_NUMERIC(numeric_add_safe(int64_to_numeric(date2j(tm->tm_year, tm->tm_mon, tm->tm_mday)),
+															numeric_div_safe(int64_to_numeric(((((tm->tm_hour * MINS_PER_HOUR) + tm->tm_min) * SECS_PER_MINUTE) + tm->tm_sec) * INT64CONST(1000000) + fsec),
 																				  int64_to_numeric(SECS_PER_DAY * INT64CONST(1000000)),
 																				  NULL),
 															NULL));
@@ -375,7 +375,7 @@ timestamp_part_common(PG_FUNCTION_ARGS, bool retnumeric)
 						result = int64_div_fast_to_numeric(timestamp - epoch, 6);
 					else
 					{
-						result = numeric_div_opt_error(numeric_sub_opt_error(int64_to_numeric(timestamp),
+						result = numeric_div_safe(numeric_sub_safe(int64_to_numeric(timestamp),
 																			 int64_to_numeric(epoch),
 																			 NULL),
 													   int64_to_numeric(1000000),

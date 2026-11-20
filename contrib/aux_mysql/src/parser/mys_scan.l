@@ -84,8 +84,6 @@ fprintf_to_ereport(const char *fmt, const char *msg)
  * But we shall have to live with it until we can remove these variables.
  *
  * int			backslash_quote = BACKSLASH_QUOTE_SAFE_ENCODING;
- * bool		escape_string_warning = true;
- * bool		standard_conforming_strings = true;
  */
 
 /*
@@ -155,8 +153,6 @@ static int	process_integer_literal(const char *token, YYSTYPE *lval);
 
 #define lexer_errposition()  mys_scanner_errposition(*(yylloc), yyscanner)
 
-static void check_string_escape_warning(unsigned char ychar, core_yyscan_t yyscanner);
-static void check_escape_warning(core_yyscan_t yyscanner);
 
 /*
  * Work around a bug in flex 2.5.35: it emits a couple of functions that
@@ -646,10 +642,8 @@ other			.
 				}
 
 {xqstart}		{
-					yyextra->warn_on_first_escape = false;
 					yyextra->saw_non_ascii = false;
 					SET_YYLLOC();
-					// if (yyextra->standard_conforming_strings)
 					// 	BEGIN(xq);
 					// else
 					// 	BEGIN(xe);
@@ -755,7 +749,6 @@ other			.
 					}
                     if(yytext[1] == '0')
                         yytext[1] = '\0';
-					check_string_escape_warning(yytext[1], yyscanner);
 					if (yytext[1] == '%' || yytext[1] == '_')
 					{
 						/*
@@ -777,10 +770,8 @@ other			.
 <xq,xe><<EOF>>		{ yyerror("unterminated quoted string"); }
 
 {xdqstart}		{
-					yyextra->warn_on_first_escape = false;
 					yyextra->saw_non_ascii = false;
 					SET_YYLLOC();
-					// if (yyextra->standard_conforming_strings)
 					// 	BEGIN(xdq);
 					// else
 					// 	BEGIN(xde);
@@ -878,7 +869,6 @@ other			.
 					}
                     if(yytext[1] == '0')
                         yytext[1] = '\0';
-					check_string_escape_warning(yytext[1], yyscanner);
 					if (yytext[1] == '%' || yytext[1] == '_')
 					{
 						/*
@@ -1500,8 +1490,6 @@ mys_scanner_init_len(const char *str,
 	yyext->keyword_tokens = keyword_tokens;
 
 	yyext->backslash_quote = backslash_quote;
-	yyext->escape_string_warning = escape_string_warning;
-	yyext->standard_conforming_strings = standard_conforming_strings;
     MYS_YYEXTRA(yyext)->saw_underscore_binary = false;
 	MYS_YYEXTRA(yyext)->normalizing = false;
 	MYS_YYEXTRA(yyext)->in_exec_comment = false;
@@ -1700,45 +1688,6 @@ unescape_single_char(unsigned char c, core_yyscan_t yyscanner)
 
 			return c;
 	}
-}
-
-static void
-check_string_escape_warning(unsigned char ychar, core_yyscan_t yyscanner)
-{
-	if (ychar == '\'')
-	{
-		if (yyextra->warn_on_first_escape && yyextra->escape_string_warning)
-			ereport(WARNING,
-					(errcode(ERRCODE_NONSTANDARD_USE_OF_ESCAPE_CHARACTER),
-					 errmsg("nonstandard use of \\' in a string literal"),
-					 errhint("Use '' to write quotes in strings, or use the escape string syntax (E'...')."),
-					 lexer_errposition()));
-		yyextra->warn_on_first_escape = false;	/* warn only once per string */
-	}
-	else if (ychar == '\\')
-	{
-		if (yyextra->warn_on_first_escape && yyextra->escape_string_warning)
-			ereport(WARNING,
-					(errcode(ERRCODE_NONSTANDARD_USE_OF_ESCAPE_CHARACTER),
-					 errmsg("nonstandard use of \\\\ in a string literal"),
-					 errhint("Use the escape string syntax for backslashes, e.g., E'\\\\'."),
-					 lexer_errposition()));
-		yyextra->warn_on_first_escape = false;	/* warn only once per string */
-	}
-	else
-		check_escape_warning(yyscanner);
-}
-
-static void
-check_escape_warning(core_yyscan_t yyscanner)
-{
-	if (yyextra->warn_on_first_escape && yyextra->escape_string_warning)
-		ereport(WARNING,
-				(errcode(ERRCODE_NONSTANDARD_USE_OF_ESCAPE_CHARACTER),
-				 errmsg("nonstandard use of escape in a string literal"),
-		errhint("Use the escape string syntax for escapes, e.g., E'\\r\\n'."),
-				 lexer_errposition()));
-	yyextra->warn_on_first_escape = false;		/* warn only once per string */
 }
 
 /*

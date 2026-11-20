@@ -2,7 +2,7 @@
 -- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
 -- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 --
--- aux_mysql 2.0: MySQL compatibility extension for OpenHalo 18.6.2
+-- aux_mysql 2.0: MySQL compatibility extension for OpenHalo 19.0
 \echo Use "CREATE EXTENSION aux_mysql" to load this file. \quit
 
 CREATE SCHEMA IF NOT EXISTS mysql;

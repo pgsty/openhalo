@@ -2507,12 +2507,12 @@ uses_application_table(List *rtable)
 /* Defaults are expanded by the rewriter, after post_parse_analyze_hook. */
 static PlannedStmt *
 mys_planner(Query *query, const char *queryString, int cursorOptions,
-			ParamListInfo params)
+			ParamListInfo params, ExplainState *es)
 {
 	mys_assign_bool_as_int(query);
 	if (prev_planner)
-		return prev_planner(query, queryString, cursorOptions, params);
-	return standard_planner(query, queryString, cursorOptions, params);
+		return prev_planner(query, queryString, cursorOptions, params, es);
+	return standard_planner(query, queryString, cursorOptions, params, es);
 }
 
 /*

@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2025, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 use strict;
 use warnings FATAL => 'all';
@@ -529,7 +529,7 @@ for (my $tupidx = 0; $tupidx < $ROWCOUNT; $tupidx++)
 		$tup->{t_infomask2} |= HEAP_NATTS_MASK;
 
 		push @expected,
-		  qr/${$header}number of attributes 2047 exceeds maximum expected for table 3/;
+		  qr/${$header}number of attributes 2047 exceeds maximum 3 expected for table/;
 	}
 	elsif ($offnum == 10)
 	{
@@ -552,7 +552,7 @@ for (my $tupidx = 0; $tupidx < $ROWCOUNT; $tupidx++)
 		$tup->{t_hoff} = 32;
 
 		push @expected,
-		  qr/${$header}number of attributes 67 exceeds maximum expected for table 3/;
+		  qr/${$header}number of attributes 67 exceeds maximum 3 expected for table/;
 	}
 	elsif ($offnum == 12)
 	{
@@ -593,8 +593,11 @@ for (my $tupidx = 0; $tupidx < $ROWCOUNT; $tupidx++)
 		$tup->{t_infomask} |= HEAP_XMAX_IS_MULTI;
 		$tup->{t_xmax} = 4;
 
+		# HEAP_XMAX_INVALID is still set, so this also looks like a datum
+		# tuple
 		push @expected,
-		  qr/${header}multitransaction ID 4 equals or exceeds next valid multitransaction ID 1/;
+		  qr/${header}multitransaction ID 4 equals or exceeds next valid multitransaction ID 1/,
+		  qr/${header}tuple marked as datum tuple in table/;
 	}
 	elsif ($offnum == 15)
 	{
@@ -603,8 +606,11 @@ for (my $tupidx = 0; $tupidx < $ROWCOUNT; $tupidx++)
 		$tup->{t_infomask} |= HEAP_XMAX_IS_MULTI;
 		$tup->{t_xmax} = 4000000000;
 
+		# HEAP_XMAX_INVALID is still set, so this also looks like a datum
+		# tuple
 		push @expected,
-		  qr/${header}multitransaction ID 4000000000 precedes relation minimum multitransaction ID threshold 1/;
+		  qr/${header}multitransaction ID 4000000000 precedes relation minimum multitransaction ID threshold 1/,
+		  qr/${header}tuple marked as datum tuple in table/;
 	}
 	elsif ($offnum == 16)    # Last offnum must equal ROWCOUNT
 	{

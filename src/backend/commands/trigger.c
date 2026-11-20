@@ -3,7 +3,7 @@
  * trigger.c
  *	  PostgreSQL TRIGGERs support code.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, PGSTY PTE. LTD.
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
@@ -22,6 +22,7 @@
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/tupconvert.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
@@ -33,9 +34,9 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
-#include "commands/dbcommands.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "nodes/bitmapset.h"
 #include "nodes/makefuncs.h"
@@ -94,7 +95,7 @@ static bool TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
 static HeapTuple ExecCallTriggerFunc(TriggerData *trigdata,
 									 int tgindx,
 									 FmgrInfo *finfo,
-									 Instrumentation *instr,
+									 TriggerInstrumentation *instr,
 									 MemoryContext per_tuple_context);
 static void AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 								  ResultRelInfo *src_partinfo,
@@ -161,7 +162,7 @@ static HeapTuple check_modified_virtual_generated(TupleDesc tupdesc, HeapTuple t
  * (but see CloneRowTriggersToPartition).
  */
 ObjectAddress
-CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
+CreateTrigger(const CreateTrigStmt *stmt, const char *queryString,
 			  Oid relOid, Oid refRelOid, Oid constraintOid, Oid indexOid,
 			  Oid funcoid, Oid parentTriggerOid, Node *whenClause,
 			  bool isInternal, bool in_partition)
@@ -178,7 +179,7 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
  * (always/origin/replica/disabled) can be specified.
  */
 ObjectAddress
-CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
+CreateTriggerFiringOn(const CreateTrigStmt *stmt, const char *queryString,
 					  Oid relOid, Oid refRelOid, Oid constraintOid,
 					  Oid indexOid, Oid funcoid, Oid parentTriggerOid,
 					  Node *whenClause, bool isInternal, bool in_partition,
@@ -875,7 +876,7 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 															 CStringGetDatum(trigname));
 	values[Anum_pg_trigger_tgfoid - 1] = ObjectIdGetDatum(funcoid);
 	values[Anum_pg_trigger_tgtype - 1] = Int16GetDatum(tgtype);
-	values[Anum_pg_trigger_tgenabled - 1] = trigger_fires_when;
+	values[Anum_pg_trigger_tgenabled - 1] = CharGetDatum(trigger_fires_when);
 	values[Anum_pg_trigger_tgisinternal - 1] = BoolGetDatum(isInternal);
 	values[Anum_pg_trigger_tgconstrrelid - 1] = ObjectIdGetDatum(constrrelid);
 	values[Anum_pg_trigger_tgconstrindid - 1] = ObjectIdGetDatum(indexOid);
@@ -887,8 +888,17 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 	{
 		ListCell   *le;
 		char	   *args;
-		int16		nargs = list_length(stmt->args);
+		int			nargs = list_length(stmt->args);
 		int			len = 0;
+
+		Assert(nargs >= 0);
+		if (nargs > PG_INT16_MAX)
+			ereport(ERROR,
+					errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+					errmsg_plural("triggers cannot have more than %d argument",
+								  "triggers cannot have more than %d arguments",
+								  PG_INT16_MAX,
+								  PG_INT16_MAX));
 
 		foreach(le, stmt->args)
 		{
@@ -2000,7 +2010,7 @@ RelationBuildTriggers(Relation relation)
 	}
 
 	/* Build trigdesc */
-	trigdesc = (TriggerDesc *) palloc0(sizeof(TriggerDesc));
+	trigdesc = palloc0_object(TriggerDesc);
 	trigdesc->triggers = triggers;
 	trigdesc->numtriggers = numtrigs;
 	for (i = 0; i < numtrigs; i++)
@@ -2105,7 +2115,7 @@ CopyTriggerDesc(TriggerDesc *trigdesc)
 	if (trigdesc == NULL || trigdesc->numtriggers <= 0)
 		return NULL;
 
-	newdesc = (TriggerDesc *) palloc(sizeof(TriggerDesc));
+	newdesc = palloc_object(TriggerDesc);
 	memcpy(newdesc, trigdesc, sizeof(TriggerDesc));
 
 	trigger = (Trigger *) palloc(trigdesc->numtriggers * sizeof(Trigger));
@@ -2318,7 +2328,7 @@ static HeapTuple
 ExecCallTriggerFunc(TriggerData *trigdata,
 					int tgindx,
 					FmgrInfo *finfo,
-					Instrumentation *instr,
+					TriggerInstrumentation *instr,
 					MemoryContext per_tuple_context)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -2353,7 +2363,7 @@ ExecCallTriggerFunc(TriggerData *trigdata,
 	 * If doing EXPLAIN ANALYZE, start charging time to this trigger.
 	 */
 	if (instr)
-		InstrStartNode(instr + tgindx);
+		InstrStartTrigger(instr + tgindx);
 
 	/*
 	 * Do the function evaluation in the per-tuple memory context, so that
@@ -2398,10 +2408,10 @@ ExecCallTriggerFunc(TriggerData *trigdata,
 
 	/*
 	 * If doing EXPLAIN ANALYZE, stop charging time to this trigger, and count
-	 * one "tuple returned" (really the number of firings).
+	 * the firing of the trigger.
 	 */
 	if (instr)
-		InstrStopNode(instr + tgindx, 1);
+		InstrStopTrigger(instr + tgindx, 1);
 
 	return (HeapTuple) DatumGetPointer(result);
 }
@@ -3951,7 +3961,7 @@ static void AfterTriggerExecute(EState *estate,
 								ResultRelInfo *dst_relInfo,
 								TriggerDesc *trigdesc,
 								FmgrInfo *finfo,
-								Instrumentation *instr,
+								TriggerInstrumentation *instr,
 								MemoryContext per_tuple_context,
 								TupleTableSlot *trig_tuple_slot1,
 								TupleTableSlot *trig_tuple_slot2);
@@ -4345,7 +4355,7 @@ AfterTriggerExecute(EState *estate,
 					ResultRelInfo *src_relInfo,
 					ResultRelInfo *dst_relInfo,
 					TriggerDesc *trigdesc,
-					FmgrInfo *finfo, Instrumentation *instr,
+					FmgrInfo *finfo, TriggerInstrumentation *instr,
 					MemoryContext per_tuple_context,
 					TupleTableSlot *trig_tuple_slot1,
 					TupleTableSlot *trig_tuple_slot2)
@@ -4386,7 +4396,7 @@ AfterTriggerExecute(EState *estate,
 	 * to include time spent re-fetching tuples in the trigger cost.
 	 */
 	if (instr)
-		InstrStartNode(instr + tgindx);
+		InstrStartTrigger(instr + tgindx);
 
 	/*
 	 * Fetch the required tuple(s).
@@ -4407,7 +4417,7 @@ AfterTriggerExecute(EState *estate,
 											 trig_tuple_slot2))
 					elog(ERROR, "failed to fetch tuple2 for AFTER trigger");
 			}
-			/* fall through */
+			pg_fallthrough;
 		case AFTER_TRIGGER_FDW_REUSE:
 
 			/*
@@ -4603,10 +4613,10 @@ AfterTriggerExecute(EState *estate,
 
 	/*
 	 * If doing EXPLAIN ANALYZE, stop charging time to this trigger, and count
-	 * one "tuple returned" (really the number of firings).
+	 * the firing of the trigger.
 	 */
 	if (instr)
-		InstrStopNode(instr + tgindx, 1);
+		InstrStopTrigger(instr + tgindx, 1);
 }
 
 
@@ -4722,7 +4732,7 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 	Relation	rel = NULL;
 	TriggerDesc *trigdesc = NULL;
 	FmgrInfo   *finfo = NULL;
-	Instrumentation *instr = NULL;
+	TriggerInstrumentation *instr = NULL;
 	TupleTableSlot *slot1 = NULL,
 			   *slot2 = NULL;
 
@@ -4905,7 +4915,7 @@ GetAfterTriggersTableData(Oid relid, CmdType cmdType)
 
 	oldcxt = MemoryContextSwitchTo(CurTransactionContext);
 
-	table = (AfterTriggersTableData *) palloc0(sizeof(AfterTriggersTableData));
+	table = palloc0_object(AfterTriggersTableData);
 	table->relid = relid;
 	table->cmdType = cmdType;
 	qs->tables = lappend(qs->tables, table);
@@ -5074,7 +5084,7 @@ MakeTransitionCaptureState(TriggerDesc *trigdesc, Oid relid, CmdType cmdType)
 	MemoryContextSwitchTo(oldcxt);
 
 	/* Now build the TransitionCaptureState struct, in caller's context */
-	state = (TransitionCaptureState *) palloc0(sizeof(TransitionCaptureState));
+	state = palloc0_object(TransitionCaptureState);
 	state->tcs_delete_old_table = need_old_del;
 	state->tcs_update_old_table = need_old_upd;
 	state->tcs_update_new_table = need_new_upd;

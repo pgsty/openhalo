@@ -21,6 +21,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "nodes/miscnodes.h"
 
 #include <math.h>
 
@@ -464,7 +465,7 @@ mys_hexlit_varbit(PG_FUNCTION_ARGS)
 	int			sig = nbits;
 	int			bitlen;
 	VarBit	   *result;
-	bits8	   *r;
+	uint8	   *r;
 
 	for (int i = 0; i < len; i++)
 	{
@@ -508,7 +509,7 @@ mys_varbit_numeric(PG_FUNCTION_ARGS)
 {
 	VarBit	   *v = PG_GETARG_VARBIT_P(0);
 	int			bitlen = VARBITLEN(v);
-	bits8	   *p = VARBITS(v);
+	uint8	   *p = VARBITS(v);
 	uint64		r = 0;
 
 	for (int i = 0; i < bitlen; i++)
@@ -532,15 +533,15 @@ mys_varbit_numeric(PG_FUNCTION_ARGS)
 static uint64
 numeric_uint64(Numeric num)
 {
-	bool		have_error = false;
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
 	int64		v;
 	char	   *s;
 	unsigned long long u;
 
 	if (numeric_is_nan(num) || numeric_is_inf(num))
 		return PG_UINT64_MAX;
-	v = numeric_int8_opt_error(num, &have_error);
-	if (!have_error)
+	v = numeric_int8_safe(num, (Node *) &escontext);
+	if (!escontext.error_occurred)
 		return (uint64) v;
 	/* beyond int8: 2^63 .. 2^64 - 1 still fits */
 	s = DatumGetCString(DirectFunctionCall1(numeric_out,
@@ -678,7 +679,7 @@ mys_hex_varbit(PG_FUNCTION_ARGS)
 {
 	VarBit	   *v = PG_GETARG_VARBIT_P(0);
 	int			bitlen = VARBITLEN(v);
-	bits8	   *p = VARBITS(v);
+	uint8	   *p = VARBITS(v);
 	StringInfoData buf;
 	int			nibbles = (bitlen + 3) / 4;
 	int			lead = nibbles * 4 - bitlen;
@@ -1301,7 +1302,7 @@ binary_arg(FunctionCallInfo fcinfo, int i)
 {
 	Oid t = get_fn_expr_argtype(fcinfo->flinfo, i);
 	Oid base = mys_binary_base_type(t), out;
-	bool varlena;
+	bool isvarlena;
 
 	if (base == BYTEAOID || base == TEXTOID || base == VARCHAROID)
 		return PG_GETARG_BYTEA_PP(i);
@@ -1309,7 +1310,7 @@ binary_arg(FunctionCallInfo fcinfo, int i)
 		return mys_bpchar_bytes(PG_GETARG_DATUM(i));
 	if (base == BOOLOID)
 		return (bytea *) cstring_to_text(PG_GETARG_BOOL(i) ? "1" : "0");
-	getTypeOutputInfo(t, &out, &varlena);
+	getTypeOutputInfo(t, &out, &isvarlena);
 	return (bytea *) cstring_to_text(OidOutputFunctionCall(out, PG_GETARG_DATUM(i)));
 }
 
@@ -1546,13 +1547,13 @@ mys_elt_index(PG_FUNCTION_ARGS)
 		case INT8OID: index = PG_GETARG_INT64(0); break;
 		case NUMERICOID:
 		{
-			bool error = false;
+			ErrorSaveContext escontext = {T_ErrorSaveContext};
 			Numeric n = PG_GETARG_NUMERIC(0);
 
 			if (numeric_is_nan(n) || numeric_is_inf(n))
 				PG_RETURN_INT32(0);
-			index = numeric_int8_opt_error(n, &error);
-			if (error)
+			index = numeric_int8_safe(n, (Node *) &escontext);
+			if (escontext.error_occurred)
 			{
 				mys_add_warning(1292, "Truncated incorrect DECIMAL value");
 				PG_RETURN_INT32(0);
@@ -1889,7 +1890,7 @@ mys_group_concat_binary(PG_FUNCTION_ARGS)
 	ArrayIterator iterator = array_create_iterator(array, 0, NULL);
 	Oid base = mys_binary_base_type(ARR_ELEMTYPE(array));
 	Oid output = InvalidOid;
-	bool varlena;
+	bool isvarlena;
 	StringInfoData out;
 	Datum value;
 	bool isnull;
@@ -1897,7 +1898,7 @@ mys_group_concat_binary(PG_FUNCTION_ARGS)
 
 	if (base != BYTEAOID && base != TEXTOID && base != VARCHAROID &&
 		base != BPCHAROID && base != BOOLOID)
-		getTypeOutputInfo(ARR_ELEMTYPE(array), &output, &varlena);
+		getTypeOutputInfo(ARR_ELEMTYPE(array), &output, &isvarlena);
 	initStringInfo(&out);
 	while (array_iterate(iterator, &value, &isnull))
 	{

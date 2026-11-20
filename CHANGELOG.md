@@ -1,12 +1,10 @@
 # Changelog
 
-Release notes for OpenHalo 18 ([`pgsty/openHalo`](https://github.com/pgsty/openHalo)).
+Release notes for OpenHalo ([`pgsty/openHalo`](https://github.com/pgsty/openHalo)).
 
-Versions are `<PostgreSQL version>.<OpenHalo revision>`: `v18.6.1` is the first OpenHalo
-revision after `v18.6`, still on PostgreSQL 18.6. The kernel keeps reporting PostgreSQL's
-own version (`PG_VERSION` `18.6`, `PG_VERSION_NUM` `180006`), so extension builds and
-client tools see a regular PostgreSQL 18.6. The MySQL layer is versioned separately as
-the `aux_mysql` extension.
+Versions are `<PostgreSQL version>.<OpenHalo revision>`. The kernel reports the
+upstream PostgreSQL version; this development branch reports `19.0` and
+`PG_VERSION_NUM=190000`. `aux_mysql` is versioned separately.
 
 | Release | PostgreSQL | `aux_mysql` | Date |
 | :--- | :--- | :--- | :--- |
@@ -14,6 +12,19 @@ the `aux_mysql` extension.
 | [`v18.6`](#v186) | 18.6 | 1.5 | 2026-11-07 |
 
 ---
+
+## 19.0 development
+
+- Rebase the kernel onto the verified PostgreSQL 19.0 release source, preserving
+  the protocol, execution, sequence, foreign-key and collation extension points.
+- Adapt `aux_mysql 2.0` to PG19's planner, scanner, numeric, shared-memory, table
+  scan, collation and index access method interfaces.
+- Preserve the new native `ON CONFLICT DO SELECT` locking fields in stored queries,
+  native cancellation/TLS startup, sequence synchronization and the FK fast path.
+- Keep the MySQL grammar and consolidated 2.0 SQL as maintained source files.
+  A 1.x → 2.0 extension upgrade path is not included in this branch.
+- See [`PG19.md`](contrib/aux_mysql/PG19.md) for source provenance, validation and
+  migration boundaries. This is development work, not a published release.
 
 ## v18.6.1
 

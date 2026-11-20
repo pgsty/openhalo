@@ -39,6 +39,7 @@
 #include "commands/discard.h"
 #include "common/string.h"
 #include "funcapi.h"
+#include "utils/tuplestore.h"
 #include "libpq/auth.h"
 #include "libpq/crypt.h"
 #include "libpq/hba.h"

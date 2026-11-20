@@ -12,7 +12,7 @@
  * respective utility commands.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, PGSTY PTE. LTD.
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
@@ -25,6 +25,7 @@
 #include "postgres.h"
 
 #include "access/amapi.h"
+#include "access/attmap.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/reloptions.h"
@@ -100,6 +101,7 @@ typedef struct
 /* State shared by transformCreateSchemaStmtElements and its subroutines */
 typedef struct
 {
+	ParseState *pstate;			/* overall parse state */
 	const char *schemaname;		/* name of schema */
 	List	   *sequences;		/* CREATE SEQUENCE items */
 	List	   *tables;			/* CREATE TABLE items */
@@ -107,6 +109,7 @@ typedef struct
 	List	   *indexes;		/* CREATE INDEX items */
 	List	   *triggers;		/* CREATE TRIGGER items */
 	List	   *grants;			/* GRANT items */
+	List	   *foreign_keys;	/* generated ALTER ADD FOREIGN KEY items */
 } CreateSchemaStmtContext;
 
 
@@ -132,10 +135,13 @@ static void transformFKConstraints(CreateStmtContext *cxt,
 								   bool isAddConstraint);
 static void transformCheckConstraints(CreateStmtContext *cxt,
 									  bool skipValidation);
-static void transformConstraintAttrs(CreateStmtContext *cxt,
+static void transformConstraintAttrs(ParseState *pstate,
 									 List *constraintList);
 static void transformColumnType(CreateStmtContext *cxt, ColumnDef *column);
-static void setSchemaName(const char *context_schema, char **stmt_schema_name);
+static void setSchemaNameRV(CreateSchemaStmtContext *cxt, RangeVar *relation);
+static CreateStmt *transformCreateSchemaCreateTable(ParseState *pstate,
+													CreateStmt *stmt,
+													List **fk_elements);
 static void transformPartitionCmd(CreateStmtContext *cxt, PartitionCmd *cmd);
 static List *transformPartitionRangeBounds(ParseState *pstate, List *blist,
 										   Relation parent);
@@ -702,7 +708,7 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 	}
 
 	/* Process column constraints, if any... */
-	transformConstraintAttrs(cxt, column->constraints);
+	transformConstraintAttrs(cxt->pstate, column->constraints);
 
 	/*
 	 * First, scan the column's constraints to see if a not-null constraint
@@ -917,7 +923,7 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 							 errmsg("primary key constraints are not supported on foreign tables"),
 							 parser_errposition(cxt->pstate,
 												constraint->location)));
-				/* FALL THRU */
+				pg_fallthrough;
 
 			case CONSTR_UNIQUE:
 				if (cxt->isforeign)
@@ -1971,6 +1977,8 @@ generateClonedIndexStmt(RangeVar *heapRel, Relation source_idx,
 			}
 		}
 
+		iparam->location = -1;
+
 		index->indexParams = lappend(index->indexParams, iparam);
 	}
 
@@ -2001,6 +2009,8 @@ generateClonedIndexStmt(RangeVar *heapRel, Relation source_idx,
 
 		/* Copy the original index column name */
 		iparam->indexcolname = pstrdup(NameStr(attr->attname));
+
+		iparam->location = -1;
 
 		index->indexIncludingParams = lappend(index->indexIncludingParams, iparam);
 	}
@@ -2590,7 +2600,7 @@ transformIndexConstraint(Constraint *constraint, CreateStmtContext *cxt)
 		}
 
 		/* Close the index relation but keep the lock */
-		relation_close(index_rel, NoLock);
+		index_close(index_rel, NoLock);
 
 		index->indexOid = index_oid;
 	}
@@ -2836,6 +2846,7 @@ transformIndexConstraint(Constraint *constraint, CreateStmtContext *cxt)
 			iparam->opclassopts = NIL;
 			iparam->ordering = SORTBY_DEFAULT;
 			iparam->nulls_ordering = SORTBY_NULLS_DEFAULT;
+			iparam->location = -1;
 			index->indexParams = lappend(index->indexParams, iparam);
 		}
 
@@ -2952,6 +2963,7 @@ transformIndexConstraint(Constraint *constraint, CreateStmtContext *cxt)
 		iparam->collation = NIL;
 		iparam->opclass = NIL;
 		iparam->opclassopts = NIL;
+		iparam->location = -1;
 		index->indexIncludingParams = lappend(index->indexIncludingParams, iparam);
 	}
 
@@ -3911,9 +3923,12 @@ transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
  * NOTE: currently, attributes are only supported for FOREIGN KEY, UNIQUE,
  * EXCLUSION, and PRIMARY KEY constraints, but someday they ought to be
  * supported for other constraint types.
+ *
+ * NOTE: this must be idempotent in non-error cases; see
+ * transformCreateSchemaCreateTable.
  */
 static void
-transformConstraintAttrs(CreateStmtContext *cxt, List *constraintList)
+transformConstraintAttrs(ParseState *pstate, List *constraintList)
 {
 	Constraint *lastprimarycon = NULL;
 	bool		saw_deferrability = false;
@@ -3942,12 +3957,12 @@ transformConstraintAttrs(CreateStmtContext *cxt, List *constraintList)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("misplaced DEFERRABLE clause"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				if (saw_deferrability)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				saw_deferrability = true;
 				lastprimarycon->deferrable = true;
 				break;
@@ -3957,12 +3972,12 @@ transformConstraintAttrs(CreateStmtContext *cxt, List *constraintList)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("misplaced NOT DEFERRABLE clause"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				if (saw_deferrability)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				saw_deferrability = true;
 				lastprimarycon->deferrable = false;
 				if (saw_initially &&
@@ -3970,7 +3985,7 @@ transformConstraintAttrs(CreateStmtContext *cxt, List *constraintList)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("constraint declared INITIALLY DEFERRED must be DEFERRABLE"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				break;
 
 			case CONSTR_ATTR_DEFERRED:
@@ -3978,12 +3993,12 @@ transformConstraintAttrs(CreateStmtContext *cxt, List *constraintList)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("misplaced INITIALLY DEFERRED clause"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				if (saw_initially)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("multiple INITIALLY IMMEDIATE/DEFERRED clauses not allowed"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				saw_initially = true;
 				lastprimarycon->initdeferred = true;
 
@@ -3996,7 +4011,7 @@ transformConstraintAttrs(CreateStmtContext *cxt, List *constraintList)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("constraint declared INITIALLY DEFERRED must be DEFERRABLE"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				break;
 
 			case CONSTR_ATTR_IMMEDIATE:
@@ -4004,12 +4019,12 @@ transformConstraintAttrs(CreateStmtContext *cxt, List *constraintList)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("misplaced INITIALLY IMMEDIATE clause"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				if (saw_initially)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("multiple INITIALLY IMMEDIATE/DEFERRED clauses not allowed"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				saw_initially = true;
 				lastprimarycon->initdeferred = false;
 				break;
@@ -4021,12 +4036,12 @@ transformConstraintAttrs(CreateStmtContext *cxt, List *constraintList)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("misplaced ENFORCED clause"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				if (saw_enforced)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("multiple ENFORCED/NOT ENFORCED clauses not allowed"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				saw_enforced = true;
 				lastprimarycon->is_enforced = true;
 				break;
@@ -4038,12 +4053,12 @@ transformConstraintAttrs(CreateStmtContext *cxt, List *constraintList)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("misplaced NOT ENFORCED clause"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				if (saw_enforced)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("multiple ENFORCED/NOT ENFORCED clauses not allowed"),
-							 parser_errposition(cxt->pstate, con->location)));
+							 parser_errposition(pstate, con->location)));
 				saw_enforced = true;
 				lastprimarycon->is_enforced = false;
 
@@ -4101,36 +4116,42 @@ transformColumnType(CreateStmtContext *cxt, ColumnDef *column)
  * transformCreateSchemaStmtElements -
  *	  analyzes the elements of a CREATE SCHEMA statement
  *
- * Split the schema element list from a CREATE SCHEMA statement into
- * individual commands and place them in the result list in an order
- * such that there are no forward references (e.g. GRANT to a table
- * created later in the list). Note that the logic we use for determining
- * forward references is presently quite incomplete.
+ * This presently has two responsibilities.  We ensure that no subcommands
+ * are trying to create objects outside the new schema.  We also attempt to
+ * re-order the subcommands such that there are no forward references
+ * (e.g. GRANT to a table created later in the list).  Note that the logic
+ * we use for determining forward references is presently quite incomplete,
+ * and it's unlikely that we can do significantly better while working with
+ * non-parse-analyzed commands.  The only case that the SQL standard calls
+ * out as required is to support forward references in foreign-key constraint
+ * clauses in CREATE TABLE subcommands.  We do handle that, by pulling out
+ * such clauses and converting them to ALTER TABLE ADD CONSTRAINT commands
+ * appended to the list.
  *
  * "schemaName" is the name of the schema that will be used for the creation
- * of the objects listed, that may be compiled from the schema name defined
+ * of the objects listed.  It may be obtained from the schema name defined
  * in the statement or a role specification.
- *
- * SQL also allows constraints to make forward references, so thumb through
- * the table columns and move forward references to a posterior alter-table
- * command.
  *
  * The result is a list of parse nodes that still need to be analyzed ---
  * but we can't analyze the later commands until we've executed the earlier
  * ones, because of possible inter-object references.
  *
- * Note: this breaks the rules a little bit by modifying schema-name fields
- * within passed-in structs.  However, the transformation would be the same
- * if done over, so it should be all right to scribble on the input to this
- * extent.
+ * Note it's important that we not modify the input data structure.  We create
+ * a new result List, and we copy any CREATE TABLE subcommands that we might
+ * modify.
  */
 List *
-transformCreateSchemaStmtElements(List *schemaElts, const char *schemaName)
+transformCreateSchemaStmtElements(ParseState *pstate, List *schemaElts,
+								  const char *schemaName)
 {
 	CreateSchemaStmtContext cxt;
 	List	   *result;
 	ListCell   *elements;
 
+	/* We fill in schema names below, so work on a copy */
+	schemaElts = copyObject(schemaElts);
+
+	cxt.pstate = pstate;
 	cxt.schemaname = schemaName;
 	cxt.sequences = NIL;
 	cxt.tables = NIL;
@@ -4138,10 +4159,11 @@ transformCreateSchemaStmtElements(List *schemaElts, const char *schemaName)
 	cxt.indexes = NIL;
 	cxt.triggers = NIL;
 	cxt.grants = NIL;
+	cxt.foreign_keys = NIL;
 
 	/*
-	 * Run through each schema element in the schema element list. Separate
-	 * statements by type, and do preliminary analysis.
+	 * Run through each schema element in the schema element list.  Set target
+	 * schema names, separate statements by type, and do preliminary analysis.
 	 */
 	foreach(elements, schemaElts)
 	{
@@ -4153,7 +4175,7 @@ transformCreateSchemaStmtElements(List *schemaElts, const char *schemaName)
 				{
 					CreateSeqStmt *elp = (CreateSeqStmt *) element;
 
-					setSchemaName(cxt.schemaname, &elp->sequence->schemaname);
+					setSchemaNameRV(&cxt, elp->sequence);
 					cxt.sequences = lappend(cxt.sequences, element);
 				}
 				break;
@@ -4162,12 +4184,16 @@ transformCreateSchemaStmtElements(List *schemaElts, const char *schemaName)
 				{
 					CreateStmt *elp = (CreateStmt *) element;
 
-					setSchemaName(cxt.schemaname, &elp->relation->schemaname);
+					setSchemaNameRV(&cxt, elp->relation);
+					/* Pull out any foreign key clauses, add to fk_elements */
+					elp = transformCreateSchemaCreateTable(pstate,
+														   elp,
+														   &cxt.foreign_keys);
 
 					/*
-					 * XXX todo: deal with constraints
+					 * XXX todo: deal with other constraints
 					 */
-					cxt.tables = lappend(cxt.tables, element);
+					cxt.tables = lappend(cxt.tables, elp);
 				}
 				break;
 
@@ -4175,7 +4201,7 @@ transformCreateSchemaStmtElements(List *schemaElts, const char *schemaName)
 				{
 					ViewStmt   *elp = (ViewStmt *) element;
 
-					setSchemaName(cxt.schemaname, &elp->view->schemaname);
+					setSchemaNameRV(&cxt, elp->view);
 
 					/*
 					 * XXX todo: deal with references between views
@@ -4188,7 +4214,7 @@ transformCreateSchemaStmtElements(List *schemaElts, const char *schemaName)
 				{
 					IndexStmt  *elp = (IndexStmt *) element;
 
-					setSchemaName(cxt.schemaname, &elp->relation->schemaname);
+					setSchemaNameRV(&cxt, elp->relation);
 					cxt.indexes = lappend(cxt.indexes, element);
 				}
 				break;
@@ -4197,7 +4223,7 @@ transformCreateSchemaStmtElements(List *schemaElts, const char *schemaName)
 				{
 					CreateTrigStmt *elp = (CreateTrigStmt *) element;
 
-					setSchemaName(cxt.schemaname, &elp->relation->schemaname);
+					setSchemaNameRV(&cxt, elp->relation);
 					cxt.triggers = lappend(cxt.triggers, element);
 				}
 				break;
@@ -4219,25 +4245,197 @@ transformCreateSchemaStmtElements(List *schemaElts, const char *schemaName)
 	result = list_concat(result, cxt.indexes);
 	result = list_concat(result, cxt.triggers);
 	result = list_concat(result, cxt.grants);
+	result = list_concat(result, cxt.foreign_keys);
 
 	return result;
 }
 
 /*
- * setSchemaName
- *		Set or check schema name in an element of a CREATE SCHEMA command
+ * setSchemaNameRV
+ *		Set or check schema name in an element of a CREATE SCHEMA command,
+ *		where the element's name is given by a RangeVar
+ *
+ * If the command doesn't specify a target schema name, fill in the new
+ * schema's name.  But if a target schema name is given, it had better match.
+ * We also have to check that the command doesn't say CREATE TEMP, since
+ * that would likewise put the object into the wrong schema.
  */
 static void
-setSchemaName(const char *context_schema, char **stmt_schema_name)
+setSchemaNameRV(CreateSchemaStmtContext *cxt, RangeVar *relation)
 {
-	if (*stmt_schema_name == NULL)
-		*stmt_schema_name = unconstify(char *, context_schema);
-	else if (strcmp(context_schema, *stmt_schema_name) != 0)
+	if (relation->schemaname == NULL)
+		relation->schemaname = pstrdup(cxt->schemaname);
+	else if (strcmp(cxt->schemaname, relation->schemaname) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_SCHEMA_DEFINITION),
 				 errmsg("CREATE specifies a schema (%s) "
 						"different from the one being created (%s)",
-						*stmt_schema_name, context_schema)));
+						relation->schemaname, cxt->schemaname),
+				 parser_errposition(cxt->pstate, relation->location)));
+
+	if (relation->relpersistence == RELPERSISTENCE_TEMP)
+	{
+		/* spell this error the same as in RangeVarAdjustRelationPersistence */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("cannot create temporary relation in non-temporary schema"),
+				 parser_errposition(cxt->pstate, relation->location)));
+	}
+}
+
+/*
+ * transformCreateSchemaCreateTable
+ *		Process one CreateStmt for transformCreateSchemaStmtElements.
+ *
+ * We remove any foreign-key clauses in the statement and convert them into
+ * ALTER TABLE commands, which we append to *fk_elements.
+ */
+static CreateStmt *
+transformCreateSchemaCreateTable(ParseState *pstate,
+								 CreateStmt *stmt,
+								 List **fk_elements)
+{
+	CreateStmt *newstmt;
+	List	   *newElts = NIL;
+	ListCell   *lc;
+
+	/*
+	 * Flat-copy the CreateStmt node, allowing us to replace its tableElts
+	 * list without damaging the input data structure.  Most sub-nodes will be
+	 * shared with the input, though.
+	 */
+	newstmt = makeNode(CreateStmt);
+	memcpy(newstmt, stmt, sizeof(CreateStmt));
+
+	/* Scan for foreign-key constraints */
+	foreach(lc, stmt->tableElts)
+	{
+		Node	   *element = lfirst(lc);
+		AlterTableStmt *alterstmt;
+		AlterTableCmd *altercmd;
+
+		if (IsA(element, Constraint))
+		{
+			Constraint *constr = (Constraint *) element;
+
+			if (constr->contype != CONSTR_FOREIGN)
+			{
+				/* Other constraint types pass through unchanged */
+				newElts = lappend(newElts, constr);
+				continue;
+			}
+
+			/* Make it into an ALTER TABLE ADD CONSTRAINT command */
+			altercmd = makeNode(AlterTableCmd);
+			altercmd->subtype = AT_AddConstraint;
+			altercmd->name = NULL;
+			altercmd->def = (Node *) copyObject(constr);
+
+			alterstmt = makeNode(AlterTableStmt);
+			alterstmt->relation = copyObject(stmt->relation);
+			alterstmt->cmds = list_make1(altercmd);
+			alterstmt->objtype = OBJECT_TABLE;
+
+			*fk_elements = lappend(*fk_elements, alterstmt);
+		}
+		else if (IsA(element, ColumnDef))
+		{
+			ColumnDef  *entry = (ColumnDef *) element;
+			ColumnDef  *newentry;
+			List	   *entryconstraints;
+			bool		afterFK = false;
+
+			/*
+			 * We must preprocess the list of column constraints to attach
+			 * attributes such as DEFERRED to the appropriate constraint node.
+			 * Do this on a copy.  (But execution of the CreateStmt will run
+			 * transformConstraintAttrs on the copy, so we are nonetheless
+			 * relying on transformConstraintAttrs to be idempotent.)
+			 */
+			entryconstraints = copyObject(entry->constraints);
+			transformConstraintAttrs(pstate, entryconstraints);
+
+			/* Scan the column constraints ... */
+			foreach_node(Constraint, colconstr, entryconstraints)
+			{
+				switch (colconstr->contype)
+				{
+					case CONSTR_FOREIGN:
+						/* colconstr is already a copy, OK to modify */
+						colconstr->fk_attrs = list_make1(makeString(entry->colname));
+
+						/* Make it into an ALTER TABLE ADD CONSTRAINT command */
+						altercmd = makeNode(AlterTableCmd);
+						altercmd->subtype = AT_AddConstraint;
+						altercmd->name = NULL;
+						altercmd->def = (Node *) colconstr;
+
+						alterstmt = makeNode(AlterTableStmt);
+						alterstmt->relation = copyObject(stmt->relation);
+						alterstmt->cmds = list_make1(altercmd);
+						alterstmt->objtype = OBJECT_TABLE;
+
+						*fk_elements = lappend(*fk_elements, alterstmt);
+
+						/* Remove the Constraint node from entryconstraints */
+						entryconstraints =
+							foreach_delete_current(entryconstraints, colconstr);
+
+						/*
+						 * Immediately-following attribute constraints should
+						 * be dropped, too.
+						 */
+						afterFK = true;
+						break;
+
+						/*
+						 * Column constraint lists separate a Constraint node
+						 * from its attributes (e.g. NOT ENFORCED); so a
+						 * column-level foreign key constraint may be
+						 * represented by multiple Constraint nodes.  After
+						 * transformConstraintAttrs, the foreign key
+						 * Constraint node contains all required information,
+						 * making it okay to put into *fk_elements as a
+						 * stand-alone Constraint.  But since we removed the
+						 * foreign key Constraint node from entryconstraints,
+						 * we must remove any dependent attribute nodes too,
+						 * else the later re-execution of
+						 * transformConstraintAttrs will misbehave.
+						 */
+					case CONSTR_ATTR_DEFERRABLE:
+					case CONSTR_ATTR_NOT_DEFERRABLE:
+					case CONSTR_ATTR_DEFERRED:
+					case CONSTR_ATTR_IMMEDIATE:
+					case CONSTR_ATTR_ENFORCED:
+					case CONSTR_ATTR_NOT_ENFORCED:
+						if (afterFK)
+							entryconstraints =
+								foreach_delete_current(entryconstraints,
+													   colconstr);
+						break;
+
+					default:
+						/* Any following constraint attributes are unrelated */
+						afterFK = false;
+						break;
+				}
+			}
+
+			/* Now make a modified ColumnDef to put into newElts */
+			newentry = makeNode(ColumnDef);
+			memcpy(newentry, entry, sizeof(ColumnDef));
+			newentry->constraints = entryconstraints;
+			newElts = lappend(newElts, newentry);
+		}
+		else
+		{
+			/* Other node types pass through unchanged */
+			newElts = lappend(newElts, element);
+		}
+	}
+
+	newstmt->tableElts = newElts;
+	return newstmt;
 }
 
 /*

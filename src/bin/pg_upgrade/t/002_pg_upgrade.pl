@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 # Set of tests for pg_upgrade, including cross-version checks.
 use strict;
@@ -36,6 +36,24 @@ sub generate_db
 	$node->command_ok(
 		[ 'createdb', $dbname ],
 		"created database with ASCII characters from $from_char to $to_char");
+}
+
+sub generate_unsafe_foreign_connections
+{
+	my ($node, $dbname) = @_;
+
+	# XXX ALTER ... ENABLE stresses the PG17-era subscription upgrade with
+	# unsafe options, but it also fills the server logs with failure messages
+	# from the apply bgworkers.
+	$node->safe_psql(
+		$dbname, qq{
+		CREATE SUBSCRIPTION regress_upgrade_sub_unsafe
+			   CONNECTION 'dbname=regress_doesnotexist sslkeylogfile=./noexist/log'
+			   PUBLICATION foo
+			   WITH (connect = false);
+
+		ALTER SUBSCRIPTION regress_upgrade_sub_unsafe ENABLE;
+	});
 }
 
 # Filter the contents of a dump before its use in a content comparison for
@@ -86,7 +104,7 @@ sub get_dump_for_comparison
 	$node->run_log(
 		[
 			'pg_dump', '--no-sync',
-			'--restrict-key=test',
+			'--restrict-key' => 'test',
 			'-d' => $node->connstr($db),
 			'-f' => $dumpfile
 		]);
@@ -225,6 +243,10 @@ $oldnode->init(%old_node_params);
 # Override log_statement=all set by Cluster.pm.  This avoids large amounts
 # of log traffic that slow this test down even more when run under valgrind.
 $oldnode->append_conf('postgresql.conf', 'log_statement = none');
+
+# Set wal_level = replica to run the regression tests in the same
+# wal_level as when 'make check' runs.
+$oldnode->append_conf('postgresql.conf', 'wal_level = replica');
 $oldnode->start;
 
 my $result;
@@ -276,32 +298,24 @@ else
 	# --inputdir points to the path of the input files.
 	my $inputdir = "$srcdir/src/test/regress";
 
-	note 'running regression tests in old instance';
-	my $rc =
-	  system($ENV{PG_REGRESS}
-		  . " $extra_opts "
-		  . "--dlpath=\"$dlpath\" "
-		  . "--bindir= "
-		  . "--host="
-		  . $oldnode->host . " "
-		  . "--port="
-		  . $oldnode->port . " "
-		  . "--schedule=$srcdir/src/test/regress/parallel_schedule "
-		  . "--max-concurrent-tests=20 "
-		  . "--inputdir=\"$inputdir\" "
-		  . "--outputdir=\"$outputdir\"");
-	if ($rc != 0)
-	{
-		# Dump out the regression diffs file, if there is one
-		my $diffs = "$outputdir/regression.diffs";
-		if (-e $diffs)
-		{
-			print "=== dumping $diffs ===\n";
-			print slurp_file($diffs);
-			print "=== EOF ===\n";
-		}
-	}
-	is($rc, 0, 'regression tests pass');
+	command_ok(
+		[
+			$ENV{PG_REGRESS},
+			split(' ', $extra_opts),
+			"--dlpath=$dlpath",
+			'--bindir=',
+			'--host=' . $oldnode->host,
+			'--port=' . $oldnode->port,
+			"--schedule=$srcdir/src/test/regress/parallel_schedule",
+			'--max-concurrent-tests=20',
+			"--inputdir=$inputdir",
+			"--outputdir=$outputdir"
+		],
+		'regression tests in old instance');
+
+	# CVE-2026-14661: push some unsafe options into subscriptions to ensure
+	# that upgrade doesn't fall over if they're encountered.
+	generate_unsafe_foreign_connections($oldnode, 'regression');
 }
 
 # Initialize a new node for the upgrade.
@@ -428,7 +442,7 @@ SKIP:
 # that we need to use pg_dumpall from the new node here.
 my @dump_command = (
 	'pg_dumpall', '--no-sync',
-	'--restrict-key=test',
+	'--restrict-key' => 'test',
 	'--dbname' => $oldnode->connstr('postgres'),
 	'--file' => $dump1_file);
 # --extra-float-digits is needed when upgrading from a version older than 11.
@@ -626,7 +640,7 @@ is( $result,
 # Second dump from the upgraded instance.
 @dump_command = (
 	'pg_dumpall', '--no-sync',
-	'--restrict-key=test',
+	'--restrict-key' => 'test',
 	'--dbname' => $newnode->connstr('postgres'),
 	'--file' => $dump2_file);
 # --extra-float-digits is needed when upgrading from a version older than 11.

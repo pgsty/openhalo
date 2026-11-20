@@ -1,4 +1,4 @@
-# aux_mysql 1.9 integration checks
+# aux_mysql 2.0 / PostgreSQL 19 integration checks
 
 Use disposable instances with the matching kernel and extension. Build debug
 (`--enable-debug --enable-cassert`) and release binaries separately; enable
@@ -27,6 +27,9 @@ bash tests/run.sh
 The smoke suite checks 26 groups, including 46 AB cases, prepared packets,
 comments, authentication, Go and Connector/J. Missing dependencies are incomplete
 verification, not a pass. `JAR` selects the Connector/J jar.
+The SQL checks select UTF8MB4 explicitly and compare stdout and stderr
+separately. Only MariaDB's failed-statement echo is omitted; result tables and
+error numbers, SQLSTATEs, line numbers, messages and order still match exactly.
 
 The following suites create unique application schemas and remove them on exit:
 
@@ -81,80 +84,25 @@ against MySQL 5.7 directly. `release_dml.py` accepts `MYSQL_REFERENCE_PORT` to
 repeat SQL/concurrency cases; `release_txn.py --ports 3771` runs its session-only
 reference cases without changing global flags.
 
-Upgrade and recovery checks:
+PG19-specific and recovery checks:
 
 ```sh
-python3 tests/release_upgrade.py
-export MYSQLDUMP=/path/to/mysql57/bin/mysqldump
-export MYSQL_CLIENT=/path/to/mysql57/bin/mysql
-# Optional: also restore the same unmodified dump into the reference server.
-export MYSQL_REFERENCE_PORT=3771
+python3 tests/pg19_kernel.py
+python3 tests/pg19_upgrade.py --old-prefix /path/to/openhalo18-aux2 \
+  --new-prefix /path/to/openhalo19 --work-dir /tmp/openhalo-major-upgrade
 python3 tests/release_roundtrip.py
-# Run only with no concurrent clients: briefly redirects the MySQL listener.
-python3 tests/release_online_upgrade.py --allow-listener-reload
 ```
 
-`release_upgrade.py` requires the original 1.6 installation SQL in the isolated
-installation's extension directory. It creates two temporary PG databases,
-compares 1.6→1.7→1.8→1.9 with a fresh 1.9, and checks old index names, binary
-bytes, stored ON CONFLICT trees and safe FK enforcement. The 1.6 fixture must be
-built from the original release SQL, not today's generator output.
+`pg19_kernel.py` verifies serialized `ON CONFLICT DO SELECT FOR UPDATE`, actual
+row-lock contention, native query cancellation, PostgreSQL direct TLS negotiation,
+MySQL TLS, escaped literals and default-expression round trips. It needs `PGBIN`,
+PG/MySQL connection settings, psycopg2 and PyMySQL, and a TLS-enabled fixture.
+`release_roundtrip.py` also needs Oracle MySQL 5.7 dump/restore clients; select them
+with `MYSQLDUMP` and `MYSQL_CLIENT`.
 
-`release_roundtrip.py` uses matching `pg_dump`/`pg_restore` and Oracle MySQL
-5.7+ clients. MariaDB 10.5 mysqldump includes generated values even when reading
-a real MySQL 5.7 server, producing INSERTs MySQL itself rejects; it is not a valid
-generated-column round-trip oracle. The test checks all tables and a view,
-NUL/binary data, binary defaults, generated values and prefix PRIMARY semantics.
-It also preserves historical orphan rows and missing-parent FK declarations,
-then checks that new invalid writes fail and cascades work after restore.
-
-`release_online_upgrade.py` temporarily changes `mysql.database` to its own
-database and restores the prior configuration on exit. It verifies new binaries
-with 1.8 SQL and keeps the same MySQL connection open across ALTER EXTENSION:
-binary, generated-column and prefix-index availability must refresh without a
-reconnect. It needs an otherwise idle disposable instance and the original 1.6
-installation SQL used to construct the 1.8 fixture.
-
-The released 1.5 path needs an actual old server, not a new server installing old
-SQL. In ohdev, build the tag outside the repository, then run the restart test
-with an empty work directory and unused ports:
-
-```sh
-export UPGRADE_WORK=/tmp/aux-real-upgrade
-mkdir -p "$UPGRADE_WORK/source-v18.6" "$UPGRADE_WORK/build-v18.6"
-git archive v18.6 | tar -x -C "$UPGRADE_WORK/source-v18.6"
-cd "$UPGRADE_WORK/build-v18.6"
-../source-v18.6/configure --prefix="$UPGRADE_WORK/v18.6" --with-openssl --enable-depend
-make -j12 && make install
-cd /w/openhalo/contrib/aux_mysql
-ss -ltn
-python3 tests/release_real_upgrade.py --old-prefix "$UPGRADE_WORK/v18.6" \
-  --new-prefix /path/to/new/install --work-dir "$UPGRADE_WORK/run-debug" \
-  --mysql-port 3807 --pg-port 5807 --reference-port 3771
-```
-
-Repeat with the release prefix and another empty work directory. The script runs
-the server as OS user `pg`, disables 1.5's racing background auto-installer,
-keeps a MySQL connection open over SQL upgrade, verifies another new connection,
-and stops the server on exit. Logs, original DDL/data, full catalog definitions
-and differences remain outside the repository. Every application object is
-created over MySQL protocol. Old procedures use the accepted BEGIN ATOMIC body;
-a native DO block supplies the trigger function because 1.5 has no MySQL trigger
-body parser. CREATE TRIGGER itself is sent through MySQL protocol.
-
-For the separate unreleased 1.6→1.7→1.8→1.9 chain, construct its original
-installation SQL from the historical commit, never today's generator:
-
-```sh
-git show da426c5:contrib/aux_mysql/sql/aux_mysql.sql > /path/to/new/install/share/postgresql/extension/aux_mysql--1.6.sql
-git show da426c5:contrib/aux_mysql/sql/aux_mysql_additions.sql >> /path/to/new/install/share/postgresql/extension/aux_mysql--1.6.sql
-python3 tests/release_upgrade.py
-```
-
-The shared catalog comparator covers membership, complete function and view
-definitions, view descriptors, casts, operators and opclass support members.
-Only the explicitly reported historical EXTRA collation is allowed to differ on
-the unreleased chain; released 1.5→1.9 must match the fresh catalog exactly.
+Historical 1.5 → 1.9 extension upgrade suites and PG14 import generators were
+removed by the 2.0 source cleanup. They belong to the PG18 release checkout.
+See [PG19 validation](PG19.md) for the major-version migration scope.
 
 Run PostgreSQL's own regression suite against the debug kernel with the cluster's
 bootstrap superuser and a writable build tree:
@@ -164,21 +112,11 @@ PGHOST=/path/to/socket PGPORT=5792 PGUSER=bootstrap_user \
   make -C /path/to/build-debug/src/test/regress installcheck
 ```
 
-The standalone binary/prefix harnesses provide additional focused coverage on
-stock PG18. They build private modules/clusters under `BUILD_DIR`, never install
-into the selected PostgreSQL prefix, and are supplements to the wire tests:
+## Route A compatibility checks
 
-```sh
-PG_CONFIG=/path/to/pg18/bin/pg_config BUILD_DIR=/tmp/aux-prefix-check \
-  python3 tests/indexes_standalone.py
-BINARY_FIX_READONLY_REPO=/path/to/openhalo PG_CONFIG=/path/to/pg18/bin/pg_config \
-  BUILD_DIR=/tmp/aux-binary-check tests/binary_fix/run.sh
-```
+The standalone PG18 harnesses are historical aids; validate this port against the
+matching OpenHalo 19 kernel and extension.
 
-## Route A release recheck
-
-`python3 tests/check_generated.py` regenerates all tracked grammar/SQL outputs
-from `pg14` in a temporary directory and compares their bytes.
 `python3 tests/route_a.py --port "$MYSQL_PORT" --reference-port 3771 --wp text`
 asserts character functions, mixed expressions, value/HEX assignments, and the
 intentional 1366 boundary for NUL in every character family and write mode.
@@ -189,10 +127,9 @@ SHOW COLLATION (221 names), on VARCHAR/CHAR/TEXT, checking all substring-search
 entry points and their UTF8 logical results. Binary-character-set columns are
 covered by `binary`. Language/encoding approximations explicitly assert 1105.
 The numeric CAST check also uses
-`PSQL` (or psql on PATH) over PG at the MySQL port plus 2000.
-The standalone expression harness omits executor-only conflict node assignments
-when compiled against stock PG18 headers; production parser byte identity is
-checked independently and DML is verified by the full wire suites.
+`PSQL` (or `PGBIN/psql`, then psql on PATH) and honors `PGHOST`, `PGPORT`
+and `PGUSER`. Without those settings it uses `/tmp`, the MySQL port plus 2000
+and user `postgres`.
 
 `release_fixes.py` covers the final release review corrections: FIND_IN_SET
 trailing spaces in both directions without changing FIELD/STRCMP/LIKE/IN;
@@ -212,7 +149,3 @@ and uint64 statement/trigger rollback inside an explicit transaction.
 `route_a.py --wp uint64` also seeds an existing INT64_MAX key before above-uint64
 INSERT, IGNORE, INSERT SELECT, UPDATE, ODKU and REPLACE. Never restore the old
 INT64_MAX clipping expectation: it hid wrong-row updates and deletions.
-
-`release_real_upgrade.py` creates character boolean defaults using the released
-1.5 binary and checks writes in both sql_modes and same/new sessions after the
-upgrade, including repeated prepared executions and a genuine quoted default.

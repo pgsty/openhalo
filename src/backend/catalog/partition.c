@@ -3,7 +3,7 @@
  * partition.c
  *		  Partitioning related data structures and functions.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -125,6 +125,11 @@ get_partition_parent_worker(Relation inhRel, Oid relid, bool *detach_pending)
  * Returns a list of ancestors of the given relation.  The list is ordered:
  * The first element is the immediate parent and the last one is the topmost
  * parent in the partition hierarchy.
+ *
+ * A partition pending concurrent detach is treated as having no parent. The
+ * list can therefore be empty even if the relation is still marked as a
+ * partition in pg_class. If an ancestor is pending detach, the list ends at
+ * that ancestor.
  *
  * Note: Because this function assumes that the relation whose OID is passed
  * as an argument and each ancestor will have precisely one parent, it should

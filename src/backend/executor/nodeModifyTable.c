@@ -3,7 +3,7 @@
  * nodeModifyTable.c
  *	  routines to handle ModifyTable nodes.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, PGSTY PTE. LTD.
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
@@ -14,7 +14,8 @@
  *
  *-------------------------------------------------------------------------
  */
-/* INTERFACE ROUTINES
+/*
+ * INTERFACE ROUTINES
  *		ExecInitModifyTable - initialize the ModifyTable node
  *		ExecModifyTable		- retrieve the next tuple from the node
  *		ExecEndModifyTable	- shut down the ModifyTable node
@@ -57,20 +58,24 @@
 
 #include "access/htup_details.h"
 #include "access/tableam.h"
+#include "access/tupconvert.h"
 #include "access/xact.h"
 #include "commands/trigger.h"
 #include "executor/execPartition.h"
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "executor/nodeModifyTable.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/injection_point.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -180,7 +185,19 @@ static void ExecCrossPartitionUpdateForeignKey(ModifyTableContext *context,
 											   ItemPointer tupleid,
 											   TupleTableSlot *oldslot,
 											   TupleTableSlot *newslot);
+static bool ExecOnConflictLockRow(ModifyTableContext *context,
+								  TupleTableSlot *existing,
+								  ItemPointer conflictTid,
+								  Relation relation,
+								  LockTupleMode lockmode,
+								  bool isUpdate);
 static bool ExecOnConflictUpdate(ModifyTableContext *context,
+								 ResultRelInfo *resultRelInfo,
+								 ItemPointer conflictTid,
+								 TupleTableSlot *excludedSlot,
+								 bool canSetTag,
+								 TupleTableSlot **returning);
+static bool ExecOnConflictSelect(ModifyTableContext *context,
 								 ResultRelInfo *resultRelInfo,
 								 ItemPointer conflictTid,
 								 TupleTableSlot *excludedSlot,
@@ -191,7 +208,8 @@ static TupleTableSlot *ExecPrepareTupleRouting(ModifyTableState *mtstate,
 											   PartitionTupleRouting *proute,
 											   ResultRelInfo *targetRelInfo,
 											   TupleTableSlot *slot,
-											   ResultRelInfo **partRelInfo);
+											   ResultRelInfo **partRelInfo,
+											   TupleTableSlot **tcs_original_insert_tuple);
 
 static TupleTableSlot *ExecMerge(ModifyTableContext *context,
 								 ResultRelInfo *resultRelInfo,
@@ -307,7 +325,7 @@ ExecCheckPlanOutput(Relation resultRel, List *targetList)
  *
  * context: context for the ModifyTable operation
  * resultRelInfo: current result rel
- * cmdType: operation/merge action performed (INSERT, UPDATE, or DELETE)
+ * isDelete: true if the operation/merge action is a DELETE
  * oldSlot: slot holding old tuple deleted or updated
  * newSlot: slot holding new tuple inserted or updated
  * planSlot: slot holding tuple returned by top subplan node
@@ -316,12 +334,15 @@ ExecCheckPlanOutput(Relation resultRel, List *targetList)
  * econtext's scan tuple and its old & new tuples are not needed (FDW direct-
  * modify is disabled if the RETURNING list refers to any OLD/NEW values).
  *
+ * Note: For the SELECT path of INSERT ... ON CONFLICT DO SELECT, oldSlot and
+ * newSlot are both the existing tuple, since it's not changed.
+ *
  * Returns a slot holding the result tuple
  */
 static TupleTableSlot *
 ExecProcessReturning(ModifyTableContext *context,
 					 ResultRelInfo *resultRelInfo,
-					 CmdType cmdType,
+					 bool isDelete,
 					 TupleTableSlot *oldSlot,
 					 TupleTableSlot *newSlot,
 					 TupleTableSlot *planSlot)
@@ -331,23 +352,17 @@ ExecProcessReturning(ModifyTableContext *context,
 	ExprContext *econtext = projectReturning->pi_exprContext;
 
 	/* Make tuple and any needed join variables available to ExecProject */
-	switch (cmdType)
+	if (isDelete)
 	{
-		case CMD_INSERT:
-		case CMD_UPDATE:
-			/* return new tuple by default */
-			if (newSlot)
-				econtext->ecxt_scantuple = newSlot;
-			break;
-
-		case CMD_DELETE:
-			/* return old tuple by default */
-			if (oldSlot)
-				econtext->ecxt_scantuple = oldSlot;
-			break;
-
-		default:
-			elog(ERROR, "unrecognized commandType: %d", (int) cmdType);
+		/* return old tuple by default */
+		if (oldSlot)
+			econtext->ecxt_scantuple = oldSlot;
+	}
+	else
+	{
+		/* return new tuple by default */
+		if (newSlot)
+			econtext->ecxt_scantuple = newSlot;
 	}
 	econtext->ecxt_outertuple = planSlot;
 
@@ -614,8 +629,8 @@ ExecComputeStoredGenerated(ResultRelInfo *resultRelInfo,
 
 	oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
-	values = palloc(sizeof(*values) * natts);
-	nulls = palloc(sizeof(*nulls) * natts);
+	values = palloc_array(Datum, natts);
+	nulls = palloc_array(bool, natts);
 
 	slot_getallattrs(slot);
 	memcpy(nulls, slot->tts_isnull, sizeof(*nulls) * natts);
@@ -874,10 +889,6 @@ ExecGetUpdateNewTuple(ResultRelInfo *relinfo,
  *		*inserted_tuple is the tuple that's effectively inserted;
  *		*insert_destrel is the relation where it was inserted.
  *		These are only set on success.
- *
- *		This may change the currently active tuple conversion map in
- *		mtstate->mt_transition_capture, so the callers must take care to
- *		save the previous value to avoid losing track of it.
  * ----------------------------------------------------------------
  */
 static TupleTableSlot *
@@ -895,6 +906,7 @@ ExecInsert(ModifyTableContext *context,
 	TupleTableSlot *planSlot = context->planSlot;
 	TupleTableSlot *result = NULL;
 	TransitionCaptureState *ar_insert_trig_tcs;
+	TupleTableSlot *tcs_original_insert_tuple = NULL;
 	ModifyTable *node = (ModifyTable *) mtstate->ps.plan;
 	OnConflictAction onconflict = node->onConflictAction;
 	uint64		conflict_deleted = 0;
@@ -911,7 +923,8 @@ ExecInsert(ModifyTableContext *context,
 
 		slot = ExecPrepareTupleRouting(mtstate, estate, proute,
 									   resultRelInfo, slot,
-									   &partRelInfo);
+									   &partRelInfo,
+									   &tcs_original_insert_tuple);
 		resultRelInfo = partRelInfo;
 	}
 
@@ -1005,10 +1018,8 @@ ExecInsert(ModifyTableContext *context,
 
 			if (resultRelInfo->ri_Slots == NULL)
 			{
-				resultRelInfo->ri_Slots = palloc(sizeof(TupleTableSlot *) *
-												 resultRelInfo->ri_BatchSize);
-				resultRelInfo->ri_PlanSlots = palloc(sizeof(TupleTableSlot *) *
-													 resultRelInfo->ri_BatchSize);
+				resultRelInfo->ri_Slots = palloc_array(TupleTableSlot *, resultRelInfo->ri_BatchSize);
+				resultRelInfo->ri_PlanSlots = palloc_array(TupleTableSlot *, resultRelInfo->ri_BatchSize);
 			}
 
 			/*
@@ -1222,6 +1233,26 @@ ExecInsert(ModifyTableContext *context,
 					else
 						goto vlock;
 				}
+				else if (onconflict == ONCONFLICT_SELECT)
+				{
+					/*
+					 * In case of ON CONFLICT DO SELECT, optionally lock the
+					 * conflicting tuple, fetch it and project RETURNING on
+					 * it. Be prepared to retry if locking fails because of a
+					 * concurrent UPDATE/DELETE to the conflict tuple.
+					 */
+					TupleTableSlot *returning = NULL;
+
+					if (ExecOnConflictSelect(context, resultRelInfo,
+											 &conflictTid, slot, canSetTag,
+											 &returning))
+					{
+						InstrCountTuples2(&mtstate->ps, 1);
+						return returning;
+					}
+					else
+						goto vlock;
+				}
 				else
 				{
 					/*
@@ -1259,6 +1290,7 @@ ExecInsert(ModifyTableContext *context,
 			 * if we're going to go ahead with the insertion, instead of
 			 * waiting for the whole transaction to complete.
 			 */
+			INJECTION_POINT("exec-insert-before-insert-speculative", NULL);
 			specToken = SpeculativeInsertionLockAcquire(GetCurrentTransactionId());
 
 			/* insert the tuple, with the speculative token */
@@ -1270,10 +1302,9 @@ ExecInsert(ModifyTableContext *context,
 
 			/* insert index entries for tuple */
 			recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
-												   slot, estate, false, true,
-												   &specConflict,
-												   arbiterIndexes,
-												   false);
+												   estate, EIIT_NO_DUPE_ERROR,
+												   slot, arbiterIndexes,
+												   &specConflict);
 
 			/* adjust the tuple's state accordingly */
 			table_tuple_complete_speculative(resultRelationDesc, slot,
@@ -1313,10 +1344,9 @@ ExecInsert(ModifyTableContext *context,
 
 			/* insert index entries for tuple */
 			if (resultRelInfo->ri_NumIndices > 0)
-				recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
-													   slot, estate, false,
-													   false, NULL, NIL,
-													   false);
+				recheckIndexes = ExecInsertIndexTuples(resultRelInfo, estate,
+													   0, slot, NIL,
+													   NULL);
 		}
 	}
 
@@ -1330,7 +1360,12 @@ ExecInsert(ModifyTableContext *context,
 	 * tuple to a new partition, put this row into the transition NEW TABLE,
 	 * if there is one. We need to do this separately for DELETE and INSERT
 	 * because they happen on different tables.
+	 *
+	 * Pass the original unconverted tuple in 'tcs_original_insert_tuple', if
+	 * any, to allow the ExecAR* functions to save some work.
 	 */
+	if (mtstate->mt_transition_capture)
+		mtstate->mt_transition_capture->tcs_original_insert_tuple = tcs_original_insert_tuple;
 	ar_insert_trig_tcs = mtstate->mt_transition_capture;
 	if (mtstate->operation == CMD_UPDATE && mtstate->mt_transition_capture
 		&& mtstate->mt_transition_capture->tcs_update_new_table)
@@ -1354,6 +1389,8 @@ ExecInsert(ModifyTableContext *context,
 	/* AFTER ROW INSERT Triggers */
 	ExecARInsertTriggers(estate, resultRelInfo, slot, recheckIndexes,
 						 ar_insert_trig_tcs);
+	if (mtstate->mt_transition_capture)
+		mtstate->mt_transition_capture->tcs_original_insert_tuple = NULL;
 
 	list_free(recheckIndexes);
 
@@ -1411,7 +1448,7 @@ ExecInsert(ModifyTableContext *context,
 			}
 		}
 
-		result = ExecProcessReturning(context, resultRelInfo, CMD_INSERT,
+		result = ExecProcessReturning(context, resultRelInfo, false,
 									  oldSlot, slot, planSlot);
 
 		/*
@@ -1467,6 +1504,15 @@ ExecBatchInsert(ModifyTableState *mtstate,
 																  slots,
 																  planSlots,
 																  &numInserted);
+
+	/*
+	 * XXX An FDW may report more rows than we gave it, which would lead to
+	 * buffer overruns in the loop below.  We clamp the count so that
+	 * statements that happen to work today keep working, at the cost of
+	 * misreporting the number of rows.  This is a stopgap; a proper fix means
+	 * reworking the batch insert API.
+	 */
+	numInserted = Min(numInserted, numSlots);
 
 	for (i = 0; i < numInserted; i++)
 	{
@@ -1575,14 +1621,18 @@ ExecDeleteAct(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 			  ItemPointer tupleid, bool changingPart)
 {
 	EState	   *estate = context->estate;
+	uint32		options = 0;
+
+	if (changingPart)
+		options |= TABLE_DELETE_CHANGING_PARTITION;
 
 	return table_tuple_delete(resultRelInfo->ri_RelationDesc, tupleid,
 							  estate->es_output_cid,
+							  options,
 							  estate->es_snapshot,
 							  estate->es_crosscheck_snapshot,
 							  true /* wait for commit */ ,
-							  &context->tmfd,
-							  changingPart);
+							  &context->tmfd);
 }
 
 /*
@@ -2009,7 +2059,7 @@ ldelete_result:
 			return NULL;
 		}
 
-		rslot = ExecProcessReturning(context, resultRelInfo, CMD_DELETE,
+		rslot = ExecProcessReturning(context, resultRelInfo, true,
 									 slot, NULL, context->planSlot);
 
 		/*
@@ -2188,13 +2238,6 @@ ExecCrossPartitionUpdate(ModifyTableContext *context,
 	context->cpUpdateReturningSlot =
 		ExecInsert(context, mtstate->rootResultRelInfo, slot, canSetTag,
 				   inserted_tuple, insert_destrel);
-
-	/*
-	 * Reset the transition state that may possibly have been written by
-	 * INSERT.
-	 */
-	if (mtstate->mt_transition_capture)
-		mtstate->mt_transition_capture->tcs_original_insert_tuple = NULL;
 
 	/* We're done moving. */
 	return true;
@@ -2464,6 +2507,7 @@ lreplace:
 	 */
 	result = table_tuple_update(resultRelationDesc, tupleid, slot,
 								estate->es_output_cid,
+								0,
 								estate->es_snapshot,
 								estate->es_crosscheck_snapshot,
 								true /* wait for commit */ ,
@@ -2489,11 +2533,15 @@ ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 
 	/* insert index entries for tuple if necessary */
 	if (resultRelInfo->ri_NumIndices > 0 && (updateCxt->updateIndexes != TU_None))
-		recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
-											   slot, context->estate,
-											   true, false,
-											   NULL, NIL,
-											   (updateCxt->updateIndexes == TU_Summarizing));
+	{
+		uint32		flags = EIIT_IS_UPDATE;
+
+		if (updateCxt->updateIndexes == TU_Summarizing)
+			flags |= EIIT_ONLY_SUMMARIZING;
+		recheckIndexes = ExecInsertIndexTuples(resultRelInfo, context->estate,
+											   flags, slot, NIL,
+											   NULL);
+	}
 
 	/* AFTER ROW UPDATE Triggers */
 	ExecARUpdateTriggers(context->estate, resultRelInfo,
@@ -2883,7 +2931,7 @@ redo_act:
 
 	/* Process RETURNING if present */
 	if (resultRelInfo->ri_projectReturning)
-		return ExecProcessReturning(context, resultRelInfo, CMD_UPDATE,
+		return ExecProcessReturning(context, resultRelInfo, false,
 									oldSlot, slot, context->planSlot);
 
 	return NULL;
@@ -2959,49 +3007,30 @@ ExecOnConflictDelete(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 }
 
 /*
- * ExecOnConflictUpdate --- execute UPDATE of INSERT ON CONFLICT DO UPDATE
+ * ExecOnConflictLockRow --- lock the row for ON CONFLICT DO SELECT/UPDATE
  *
- * Try to lock tuple for update as part of speculative insertion.  If
- * a qual originating from ON CONFLICT DO UPDATE is satisfied, update
- * (but still lock row, even though it may not satisfy estate's
- * snapshot).
+ * Try to lock tuple for update as part of speculative insertion for ON
+ * CONFLICT DO UPDATE or ON CONFLICT DO SELECT FOR UPDATE/SHARE.
  *
- * Returns true if we're done (with or without an update), or false if
- * the caller must retry the INSERT from scratch.
+ * Returns true if the row is successfully locked, or false if the caller must
+ * retry the INSERT from scratch.
  */
 static bool
-ExecOnConflictUpdate(ModifyTableContext *context,
-					 ResultRelInfo *resultRelInfo,
-					 ItemPointer conflictTid,
-					 TupleTableSlot *excludedSlot,
-					 bool canSetTag,
-					 TupleTableSlot **returning)
+ExecOnConflictLockRow(ModifyTableContext *context,
+					  TupleTableSlot *existing,
+					  ItemPointer conflictTid,
+					  Relation relation,
+					  LockTupleMode lockmode,
+					  bool isUpdate)
 {
-	ModifyTableState *mtstate = context->mtstate;
-	ExprContext *econtext = mtstate->ps.ps_ExprContext;
-	Relation	relation = resultRelInfo->ri_RelationDesc;
-	ExprState  *onConflictSetWhere = resultRelInfo->ri_onConflict->oc_WhereClause;
-	TupleTableSlot *existing = resultRelInfo->ri_onConflict->oc_Existing;
 	TM_FailureData tmfd;
-	LockTupleMode lockmode;
 	TM_Result	test;
 	Datum		xminDatum;
 	TransactionId xmin;
 	bool		isnull;
 
 	/*
-	 * Parse analysis should have blocked ON CONFLICT for all system
-	 * relations, which includes these.  There's no fundamental obstacle to
-	 * supporting this; we'd just need to handle LOCKTAG_TUPLE like the other
-	 * ExecUpdate() caller.
-	 */
-	Assert(!resultRelInfo->ri_needLockTagTuple);
-
-	/* Determine lock mode to use */
-	lockmode = ExecUpdateLockMode(context->estate, resultRelInfo);
-
-	/*
-	 * Lock tuple for update.  Don't follow updates when tuple cannot be
+	 * Lock tuple with lockmode.  Don't follow updates when tuple cannot be
 	 * locked without doing so.  A row locking conflict here means our
 	 * previous conclusion that the tuple is conclusively committed is not
 	 * true anymore.
@@ -3046,7 +3075,7 @@ ExecOnConflictUpdate(ModifyTableContext *context,
 						(errcode(ERRCODE_CARDINALITY_VIOLATION),
 				/* translator: %s is a SQL command name */
 						 errmsg("%s command cannot affect row a second time",
-								"ON CONFLICT DO UPDATE"),
+								isUpdate ? "ON CONFLICT DO UPDATE" : "ON CONFLICT DO SELECT"),
 						 errhint("Ensure that no rows proposed for insertion within the same command have duplicate constrained values.")));
 
 			/* This shouldn't happen */
@@ -3094,6 +3123,50 @@ ExecOnConflictUpdate(ModifyTableContext *context,
 	}
 
 	/* Success, the tuple is locked. */
+	return true;
+}
+
+/*
+ * ExecOnConflictUpdate --- execute UPDATE of INSERT ON CONFLICT DO UPDATE
+ *
+ * Try to lock tuple for update as part of speculative insertion.  If
+ * a qual originating from ON CONFLICT DO UPDATE is satisfied, update
+ * (but still lock row, even though it may not satisfy estate's
+ * snapshot).
+ *
+ * Returns true if we're done (with or without an update), or false if
+ * the caller must retry the INSERT from scratch.
+ */
+static bool
+ExecOnConflictUpdate(ModifyTableContext *context,
+					 ResultRelInfo *resultRelInfo,
+					 ItemPointer conflictTid,
+					 TupleTableSlot *excludedSlot,
+					 bool canSetTag,
+					 TupleTableSlot **returning)
+{
+	ModifyTableState *mtstate = context->mtstate;
+	ExprContext *econtext = mtstate->ps.ps_ExprContext;
+	Relation	relation = resultRelInfo->ri_RelationDesc;
+	ExprState  *onConflictSetWhere = resultRelInfo->ri_onConflict->oc_WhereClause;
+	TupleTableSlot *existing = resultRelInfo->ri_onConflict->oc_Existing;
+	LockTupleMode lockmode;
+
+	/*
+	 * Parse analysis should have blocked ON CONFLICT for all system
+	 * relations, which includes these.  There's no fundamental obstacle to
+	 * supporting this; we'd just need to handle LOCKTAG_TUPLE like the other
+	 * ExecUpdate() caller.
+	 */
+	Assert(!resultRelInfo->ri_needLockTagTuple);
+
+	/* Determine lock mode to use */
+	lockmode = ExecUpdateLockMode(context->estate, resultRelInfo);
+
+	/* Lock tuple for update */
+	if (!ExecOnConflictLockRow(context, existing, conflictTid,
+							   resultRelInfo->ri_RelationDesc, lockmode, true))
+		return false;
 
 	/*
 	 * Verify that the tuple is visible to our MVCC snapshot if the current
@@ -3109,6 +3182,45 @@ ExecOnConflictUpdate(ModifyTableContext *context,
 	 * versions.
 	 */
 	ExecCheckTupleVisible(context->estate, relation, existing);
+
+	if (resultRelInfo->ri_WithCheckOptions != NIL)
+	{
+		/*
+		 * Check target's existing tuple against the security quals that
+		 * determine whether the user is allowed to see and update it.  This
+		 * must happen before the ON CONFLICT WHERE clause is evaluated below,
+		 * since that clause is supplied by the user and could otherwise be
+		 * used to read a row that the user has no right to see.
+		 *
+		 * The rewriter creates UPDATE RLS checks/WCOs for UPDATE security
+		 * quals, and stores them as WCOs of "kind" WCO_RLS_CONFLICT_CHECK.
+		 * Since SELECT permission on the target table is always required for
+		 * INSERT ... ON CONFLICT DO UPDATE, the rewriter also adds SELECT RLS
+		 * checks/WCOs for SELECT security quals, using WCOs of the same kind,
+		 * and this check enforces them too.
+		 *
+		 * The rewriter also creates WCOs of "kind" WCO_VIEW_CONFLICT_CHECK
+		 * from the quals of any auto-updatable view the target relation was
+		 * reached through, so that the existing tuple must be visible through
+		 * each such view.  The checks run from the inside out: RLS first,
+		 * then each view's quals, innermost first (the rewriter lists them in
+		 * that order), and then finally the ON CONFLICT WHERE clause.  That
+		 * way a view's quals never see a row that the base relation or an
+		 * inner view hides, and the WHERE clause won't either.
+		 *
+		 * The rewriter will also have associated UPDATE-applicable straight
+		 * RLS checks/WCOs for the benefit of the ExecUpdate() call that
+		 * follows.  INSERTs and UPDATEs naturally have mutually exclusive WCO
+		 * kinds, so there is no danger of spurious over-enforcement in the
+		 * INSERT or UPDATE path.
+		 */
+		ExecWithCheckOptions(WCO_RLS_CONFLICT_CHECK, resultRelInfo,
+							 existing,
+							 mtstate->ps.state);
+		ExecWithCheckOptions(WCO_VIEW_CONFLICT_CHECK, resultRelInfo,
+							 existing,
+							 mtstate->ps.state);
+	}
 
 	/*
 	 * Make tuple and any needed join variables available to ExecQual and
@@ -3126,28 +3238,6 @@ ExecOnConflictUpdate(ModifyTableContext *context,
 		ExecClearTuple(existing);	/* see return below */
 		InstrCountFiltered1(&mtstate->ps, 1);
 		return true;			/* done with the tuple */
-	}
-
-	if (resultRelInfo->ri_WithCheckOptions != NIL)
-	{
-		/*
-		 * Check target's existing tuple against UPDATE-applicable USING
-		 * security barrier quals (if any), enforced here as RLS checks/WCOs.
-		 *
-		 * The rewriter creates UPDATE RLS checks/WCOs for UPDATE security
-		 * quals, and stores them as WCOs of "kind" WCO_RLS_CONFLICT_CHECK,
-		 * but that's almost the extent of its special handling for ON
-		 * CONFLICT DO UPDATE.
-		 *
-		 * The rewriter will also have associated UPDATE applicable straight
-		 * RLS checks/WCOs for the benefit of the ExecUpdate() call that
-		 * follows.  INSERTs and UPDATEs naturally have mutually exclusive WCO
-		 * kinds, so there is no danger of spurious over-enforcement in the
-		 * INSERT or UPDATE path.
-		 */
-		ExecWithCheckOptions(WCO_RLS_CONFLICT_CHECK, resultRelInfo,
-							 existing,
-							 mtstate->ps.state);
 	}
 
 	/* Project the new tuple version */
@@ -3179,6 +3269,151 @@ ExecOnConflictUpdate(ModifyTableContext *context,
 		resultRelInfo->ri_projectReturning->pi_state.flags & EEO_FLAG_HAS_OLD)
 		ExecMaterializeSlot(*returning);
 
+	ExecClearTuple(existing);
+
+	return true;
+}
+
+/*
+ * ExecOnConflictSelect --- execute SELECT of INSERT ON CONFLICT DO SELECT
+ *
+ * If SELECT FOR UPDATE/SHARE is specified, try to lock tuple as part of
+ * speculative insertion.  If a qual originating from ON CONFLICT DO SELECT is
+ * satisfied, select (but still lock row, even though it may not satisfy
+ * estate's snapshot).
+ *
+ * Returns true if we're done (with or without a select), or false if the
+ * caller must retry the INSERT from scratch.
+ */
+static bool
+ExecOnConflictSelect(ModifyTableContext *context,
+					 ResultRelInfo *resultRelInfo,
+					 ItemPointer conflictTid,
+					 TupleTableSlot *excludedSlot,
+					 bool canSetTag,
+					 TupleTableSlot **returning)
+{
+	ModifyTableState *mtstate = context->mtstate;
+	ExprContext *econtext = mtstate->ps.ps_ExprContext;
+	Relation	relation = resultRelInfo->ri_RelationDesc;
+	ExprState  *onConflictSelectWhere = resultRelInfo->ri_onConflict->oc_WhereClause;
+	TupleTableSlot *existing = resultRelInfo->ri_onConflict->oc_Existing;
+	LockClauseStrength lockStrength = resultRelInfo->ri_onConflict->oc_LockStrength;
+
+	/*
+	 * Parse analysis should have blocked ON CONFLICT for all system
+	 * relations, which includes these.  There's no fundamental obstacle to
+	 * supporting this; we'd just need to handle LOCKTAG_TUPLE appropriately.
+	 */
+	Assert(!resultRelInfo->ri_needLockTagTuple);
+
+	/* Fetch/lock existing tuple, according to the requested lock strength */
+	if (lockStrength == LCS_NONE)
+	{
+		if (!table_tuple_fetch_row_version(relation,
+										   conflictTid,
+										   SnapshotAny,
+										   existing))
+			elog(ERROR, "failed to fetch conflicting tuple for ON CONFLICT");
+	}
+	else
+	{
+		LockTupleMode lockmode;
+
+		switch (lockStrength)
+		{
+			case LCS_FORKEYSHARE:
+				lockmode = LockTupleKeyShare;
+				break;
+			case LCS_FORSHARE:
+				lockmode = LockTupleShare;
+				break;
+			case LCS_FORNOKEYUPDATE:
+				lockmode = LockTupleNoKeyExclusive;
+				break;
+			case LCS_FORUPDATE:
+				lockmode = LockTupleExclusive;
+				break;
+			default:
+				elog(ERROR, "Unexpected lock strength %d", (int) lockStrength);
+		}
+
+		if (!ExecOnConflictLockRow(context, existing, conflictTid,
+								   resultRelInfo->ri_RelationDesc, lockmode, false))
+			return false;
+	}
+
+	/*
+	 * Verify that the tuple is visible to our MVCC snapshot if the current
+	 * isolation level mandates that.  See comments in ExecOnConflictUpdate().
+	 */
+	ExecCheckTupleVisible(context->estate, relation, existing);
+
+	if (resultRelInfo->ri_WithCheckOptions != NIL)
+	{
+		/*
+		 * Check target's existing tuple against the security quals that
+		 * determine whether the user is allowed to see it.  This must happen
+		 * before the ON CONFLICT WHERE clause is evaluated below; see
+		 * comments in ExecOnConflictUpdate().
+		 *
+		 * The rewriter creates WCOs from the USING quals of SELECT policies,
+		 * and stores them as WCOs of "kind" WCO_RLS_CONFLICT_CHECK.  If FOR
+		 * UPDATE/SHARE was specified, UPDATE permissions are required on the
+		 * target table, and the rewriter also adds WCOs built from the USING
+		 * quals of UPDATE policies, using WCOs of the same kind, and this
+		 * check enforces them too.
+		 *
+		 * The WCOs of "kind" WCO_VIEW_CONFLICT_CHECK, from the quals of any
+		 * auto-updatable view the target relation was reached through, come
+		 * after those, innermost view first, for the reasons given in
+		 * ExecOnConflictUpdate().
+		 */
+		ExecWithCheckOptions(WCO_RLS_CONFLICT_CHECK, resultRelInfo,
+							 existing,
+							 mtstate->ps.state);
+		ExecWithCheckOptions(WCO_VIEW_CONFLICT_CHECK, resultRelInfo,
+							 existing,
+							 mtstate->ps.state);
+	}
+
+	/*
+	 * Make tuple and any needed join variables available to ExecQual.  The
+	 * EXCLUDED tuple is installed in ecxt_innertuple, while the target's
+	 * existing tuple is installed in the scantuple.  EXCLUDED has been made
+	 * to reference INNER_VAR in setrefs.c, but there is no other redirection.
+	 */
+	econtext->ecxt_scantuple = existing;
+	econtext->ecxt_innertuple = excludedSlot;
+	econtext->ecxt_outertuple = NULL;
+
+	if (!ExecQual(onConflictSelectWhere, econtext))
+	{
+		ExecClearTuple(existing);	/* see return below */
+		InstrCountFiltered1(&mtstate->ps, 1);
+		return true;			/* done with the tuple */
+	}
+
+	/* RETURNING is required for DO SELECT */
+	Assert(resultRelInfo->ri_projectReturning);
+
+	*returning = ExecProcessReturning(context, resultRelInfo, false,
+									  existing, existing, context->planSlot);
+
+	if (canSetTag)
+		context->estate->es_processed++;
+
+	/*
+	 * Before releasing the existing tuple, make sure that the returning slot
+	 * has a local copy of any pass-by-reference values.
+	 */
+	ExecMaterializeSlot(*returning);
+
+	/*
+	 * Clear out existing tuple, as there might not be another conflict among
+	 * the next input rows. Don't want to hold resources till the end of the
+	 * query.
+	 */
 	ExecClearTuple(existing);
 
 	return true;
@@ -3300,10 +3535,11 @@ ExecMerge(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
  * Otherwise, we execute the qualifying action and return its RETURNING
  * result, if any, or NULL.
  *
- * On entry, "*matched" is assumed to be true.  If a concurrent update or
- * delete is detected that causes the join quals to no longer pass, we set it
- * to false, indicating that the caller should process any NOT MATCHED [BY
- * TARGET] actions.
+ * On entry, "*matched" is assumed to be true.  If the join quals originally
+ * passed (MATCHED case) and a concurrent update or delete is detected that
+ * causes the join quals to no longer pass, we set "*matched" to false,
+ * indicating that the caller should process any NOT MATCHED [BY TARGET]
+ * actions.
  *
  * After a concurrent update, we restart from the first action to look for a
  * new qualifying action to execute. If the join quals originally passed, and
@@ -3600,10 +3836,16 @@ lmerge_matched:
 							 errmsg("could not serialize access due to concurrent delete")));
 
 				/*
-				 * If the tuple was already deleted, set matched to false to
-				 * let caller handle it under NOT MATCHED [BY TARGET] clauses.
+				 * The target tuple was concurrently deleted by some other
+				 * transaction.  If this was a MATCHED action, the source row
+				 * still exists, so set *matched to false, to let the caller
+				 * handle it using any NOT MATCHED [BY TARGET] actions.
+				 * Otherwise, for a NOT MATCHED BY SOURCE action, neither the
+				 * source row nor the target row now exists, so there is no
+				 * futher action to execute.
 				 */
-				*matched = false;
+				if (relaction->mas_action->matchKind == MERGE_WHEN_MATCHED)
+					*matched = false;
 				goto out;
 
 			case TM_Updated:
@@ -3756,10 +3998,18 @@ lmerge_matched:
 						case TM_Deleted:
 
 							/*
-							 * tuple already deleted; tell caller to run NOT
-							 * MATCHED [BY TARGET] actions
+							 * The target tuple was concurrently deleted by
+							 * some other transaction.  If this was a MATCHED
+							 * action, the source row still exists, so set
+							 * *matched to false, to let the caller handle it
+							 * using any NOT MATCHED [BY TARGET] actions.
+							 * Otherwise, for a NOT MATCHED BY SOURCE action,
+							 * neither the source row nor the target row now
+							 * exists, so there is no futher action to
+							 * execute.
 							 */
-							*matched = false;
+							if (was_matched)
+								*matched = false;
 							goto out;
 
 						case TM_SelfModified:
@@ -3814,7 +4064,7 @@ lmerge_matched:
 				case CMD_UPDATE:
 					rslot = ExecProcessReturning(context,
 												 resultRelInfo,
-												 CMD_UPDATE,
+												 false,
 												 resultRelInfo->ri_oldTupleSlot,
 												 newslot,
 												 context->planSlot);
@@ -3823,7 +4073,7 @@ lmerge_matched:
 				case CMD_DELETE:
 					rslot = ExecProcessReturning(context,
 												 resultRelInfo,
-												 CMD_DELETE,
+												 true,
 												 resultRelInfo->ri_oldTupleSlot,
 												 NULL,
 												 context->planSlot);
@@ -4116,7 +4366,11 @@ ExecInitMerge(ModifyTableState *mtstate, EState *estate)
 	 * Note that the planner does not build a withCheckOptionList or
 	 * returningList for the root relation, but as in ExecInitPartitionInfo,
 	 * we can use the first resultRelInfo entry as a reference to calculate
-	 * the attno's for the root table.
+	 * the attno's for the root table.  Since the resultRelInfo entry is an
+	 * inheritance child, not a partition, it may have columns that are not
+	 * present in the root relation.  We can safely ignore such columns when
+	 * building the attribute map, since they cannot be referenced by a query
+	 * that targets the root relation.
 	 */
 	if (rootRelInfo != mtstate->resultRelInfo &&
 		rootRelInfo->ri_RelationDesc->rd_rel->relkind != RELKIND_PARTITIONED_TABLE &&
@@ -4150,7 +4404,8 @@ ExecInitMerge(ModifyTableState *mtstate, EState *estate)
 				part_attmap =
 					build_attrmap_by_name(RelationGetDescr(rootRelation),
 										  RelationGetDescr(firstResultRel),
-										  false);
+										  true);	/* ignore extra child
+													 * columns */
 
 				wcoList = (List *)
 					map_variable_attnos((Node *) wcoList,
@@ -4194,7 +4449,8 @@ ExecInitMerge(ModifyTableState *mtstate, EState *estate)
 					part_attmap =
 						build_attrmap_by_name(RelationGetDescr(rootRelation),
 											  RelationGetDescr(firstResultRel),
-											  false);
+											  true);	/* ignore extra child
+														 * columns */
 
 				returningList = (List *)
 					map_variable_attnos((Node *) returningList,
@@ -4358,7 +4614,8 @@ ExecPrepareTupleRouting(ModifyTableState *mtstate,
 						PartitionTupleRouting *proute,
 						ResultRelInfo *targetRelInfo,
 						TupleTableSlot *slot,
-						ResultRelInfo **partRelInfo)
+						ResultRelInfo **partRelInfo,
+						TupleTableSlot **tcs_original_insert_tuple)
 {
 	ResultRelInfo *partrel;
 	TupleConversionMap *map;
@@ -4386,7 +4643,7 @@ ExecPrepareTupleRouting(ModifyTableState *mtstate,
 		has_before_insert_row_trig = (partrel->ri_TrigDesc &&
 									  partrel->ri_TrigDesc->trig_insert_before_row);
 
-		mtstate->mt_transition_capture->tcs_original_insert_tuple =
+		*tcs_original_insert_tuple =
 			!has_before_insert_row_trig ? slot : NULL;
 	}
 
@@ -4594,7 +4851,8 @@ ExecModifyTable(PlanState *pstate)
 			Assert((resultRelInfo->ri_projectReturning->pi_state.flags & EEO_FLAG_HAS_OLD) == 0 &&
 				   (resultRelInfo->ri_projectReturning->pi_state.flags & EEO_FLAG_HAS_NEW) == 0);
 
-			slot = ExecProcessReturning(&context, resultRelInfo, operation,
+			slot = ExecProcessReturning(&context, resultRelInfo,
+										operation == CMD_DELETE,
 										NULL, NULL, context.planSlot);
 
 			return slot;
@@ -5020,8 +5278,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	mtstate->mt_done = false;
 
 	mtstate->mt_nrels = nrels;
-	mtstate->resultRelInfo = (ResultRelInfo *)
-		palloc(nrels * sizeof(ResultRelInfo));
+	mtstate->resultRelInfo = palloc_array(ResultRelInfo, nrels);
 
 	mtstate->mt_merge_pending_not_matched = NULL;
 	mtstate->mt_merge_inserted = 0;
@@ -5030,6 +5287,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	mtstate->mt_updateColnosLists = updateColnosLists;
 	mtstate->mt_mergeActionLists = mergeActionLists;
 	mtstate->mt_mergeJoinConditions = mergeJoinConditions;
+	mtstate->mt_fdwPrivLists = fdwPrivLists;
 
 	/*----------
 	 * Resolve the target relation. This is the same as:
@@ -5314,24 +5572,23 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	}
 
 	/*
-	 * If needed, Initialize target list, projection and qual for ON CONFLICT
-	 * DO UPDATE.
+	 * For ON CONFLICT DO SELECT/UPDATE, initialize the ON CONFLICT action
+	 * state.
 	 */
-	if (node->onConflictAction == ONCONFLICT_UPDATE)
+	if (node->onConflictAction == ONCONFLICT_UPDATE ||
+		node->onConflictAction == ONCONFLICT_SELECT)
 	{
-		OnConflictSetState *onconfl = makeNode(OnConflictSetState);
-		ExprContext *econtext;
-		TupleDesc	relationDesc;
+		OnConflictActionState *onconfl = makeNode(OnConflictActionState);
 
 		/* already exists if created by RETURNING processing above */
 		if (mtstate->ps.ps_ExprContext == NULL)
 			ExecAssignExprContext(estate, &mtstate->ps);
 
-		econtext = mtstate->ps.ps_ExprContext;
-		relationDesc = resultRelInfo->ri_RelationDesc->rd_att;
-
-		/* create state for DO UPDATE SET operation */
+		/* action state for DO SELECT/UPDATE */
 		resultRelInfo->ri_onConflict = onconfl;
+
+		/* lock strength for DO SELECT [FOR UPDATE/SHARE] */
+		onconfl->oc_LockStrength = node->onConflictLockStrength;
 
 		/* initialize slot for the existing tuple */
 		onconfl->oc_Existing =
@@ -5339,24 +5596,36 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 							  &mtstate->ps.state->es_tupleTable);
 
 		/*
-		 * Create the tuple slot for the UPDATE SET projection. We want a slot
-		 * of the table's type here, because the slot will be used to insert
-		 * into the table, and for RETURNING processing - which may access
-		 * system attributes.
+		 * For ON CONFLICT DO UPDATE, initialize target list and projection.
 		 */
-		onconfl->oc_ProjSlot =
-			table_slot_create(resultRelInfo->ri_RelationDesc,
-							  &mtstate->ps.state->es_tupleTable);
+		if (node->onConflictAction == ONCONFLICT_UPDATE)
+		{
+			ExprContext *econtext;
+			TupleDesc	relationDesc;
 
-		/* build UPDATE SET projection state */
-		onconfl->oc_ProjInfo =
-			ExecBuildUpdateProjection(node->onConflictSet,
-									  true,
-									  node->onConflictCols,
-									  relationDesc,
-									  econtext,
-									  onconfl->oc_ProjSlot,
-									  &mtstate->ps);
+			econtext = mtstate->ps.ps_ExprContext;
+			relationDesc = resultRelInfo->ri_RelationDesc->rd_att;
+
+			/*
+			 * Create the tuple slot for the UPDATE SET projection. We want a
+			 * slot of the table's type here, because the slot will be used to
+			 * insert into the table, and for RETURNING processing - which may
+			 * access system attributes.
+			 */
+			onconfl->oc_ProjSlot =
+				table_slot_create(resultRelInfo->ri_RelationDesc,
+								  &mtstate->ps.state->es_tupleTable);
+
+			/* build UPDATE SET projection state */
+			onconfl->oc_ProjInfo =
+				ExecBuildUpdateProjection(node->onConflictSet,
+										  true,
+										  node->onConflictCols,
+										  relationDesc,
+										  econtext,
+										  onconfl->oc_ProjSlot,
+										  &mtstate->ps);
+		}
 
 		/* initialize state to evaluate the WHERE clause, if any */
 		if (node->onConflictWhere)

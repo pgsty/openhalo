@@ -1,6 +1,6 @@
 # Security Policy
 
-OpenHalo is an independent PostgreSQL 18 fork with the `aux_mysql` protocol
+OpenHalo is an independent PostgreSQL fork with the `aux_mysql` protocol
 and SQL compatibility extension. This policy covers vulnerabilities in the
 fork-specific kernel hooks, `aux_mysql`, release artifacts, and documentation.
 
@@ -36,6 +36,7 @@ report it to OpenHalo and we will route it appropriately.
 
 ## Supported Releases
 
-Security fixes are tracked on `master` and ship in the latest stable OpenHalo
+Security fixes are tracked on the release branch and ship in the latest stable OpenHalo
 18 release. Upgrade to the latest release to receive them; older release lines
 are supported only when an advisory says otherwise.
+The PostgreSQL 19 port is a development branch, not a published stable release.

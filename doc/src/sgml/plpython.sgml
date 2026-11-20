@@ -620,9 +620,16 @@ SELECT * FROM multiout_simple_setof(3);
   <title>Sharing Data</title>
   <para>
    The global dictionary <varname>SD</varname> is available to store
-   private data between repeated calls to the same function.
+   private data between repeated calls to the same function
+   within a session.  Each PL/Python function has its own instance
+   of <varname>SD</varname>, except that for trigger functions, there is
+   one instance of <varname>SD</varname> per function per triggered-on
+   relation.
+  </para>
+
+  <para>
    The global dictionary <varname>GD</varname> is public data,
-   that is available to all Python functions within a session;  use with
+   that is available to all PL/Python functions within a session;  use with
    care.<indexterm><primary>global data</primary>
    <secondary>in PL/Python</secondary></indexterm>
   </para>
@@ -661,6 +668,14 @@ $$ LANGUAGE plpython3u;
    <primary>trigger</primary>
    <secondary>in PL/Python</secondary>
   </indexterm>
+
+  <para>
+   <application>PL/Python</application> can be used to define trigger
+   functions.
+   <productname>PostgreSQL</productname> requires that a function that is to
+   be called as a trigger must be declared as a function with no arguments and
+   a return type of <literal>trigger</literal>.
+  </para>
 
   <para>
    When a function is used as a trigger, the dictionary
@@ -767,6 +782,74 @@ $$ LANGUAGE plpython3u;
    <literal>"MODIFY"</literal> to indicate you've modified the new row.
    Otherwise the return value is ignored.
   </para>
+ </sect1>
+
+ <sect1 id="plpython-event-trigger">
+  <title>Event Trigger Functions</title>
+
+  <indexterm zone="plpython-event-trigger">
+   <primary>event trigger</primary>
+   <secondary>in PL/Python</secondary>
+  </indexterm>
+
+  <para>
+   <application>PL/Python</application> can be used to define event triggers
+   (see also <xref linkend="event-triggers"/>).
+   <productname>PostgreSQL</productname> requires that a function that is to
+   be called as an event trigger must be declared as a function with no
+   arguments and a return type of <literal>event_trigger</literal>.
+  </para>
+
+  <para>
+   When a function is used as an event trigger, the dictionary
+   <literal>TD</literal> contains trigger-related values:
+
+   <variablelist>
+    <varlistentry>
+     <term><varname>TD["event"]</varname></term>
+     <listitem>
+      <para>
+       The event the trigger was fired for, as a string, for example
+       <literal>ddl_command_start</literal>.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><varname>TD["tag"]</varname></term>
+     <listitem>
+      <para>
+       The command tag for which the trigger was fired, as a string, for
+       example <literal>DROP TABLE</literal>.
+      </para>
+     </listitem>
+    </varlistentry>
+   </variablelist>
+  </para>
+
+  <para>
+   <xref linkend="plpython-event-trigger-example"/> shows an example of an
+   event trigger function in <application>PL/Python</application>.
+  </para>
+
+  <example id="plpython-event-trigger-example">
+   <title>A <application>PL/Python</application> Event Trigger Function</title>
+
+   <para>
+    This example trigger simply raises a <literal>NOTICE</literal> message
+    each time a supported command is executed.
+   </para>
+
+<programlisting>
+CREATE OR REPLACE FUNCTION pysnitch() RETURNS event_trigger
+LANGUAGE plpython3u
+AS $$
+  plpy.notice("TD[event] => " + TD["event"] + " ; TD[tag] => " + TD["tag"]);
+$$;
+
+CREATE EVENT TRIGGER pysnitch ON ddl_command_start EXECUTE FUNCTION pysnitch();
+</programlisting>
+  </example>
  </sect1>
 
  <sect1 id="plpython-database">
@@ -989,7 +1072,7 @@ $$ LANGUAGE plpython3u;
 <programlisting>
 CREATE FUNCTION count_odd_iterator() RETURNS integer AS $$
 odd = 0
-for row in plpy.cursor("select num from largetable"):
+for row in plpy.cursor("SELECT num FROM largetable"):
     if row['num'] % 2:
          odd += 1
 return odd
@@ -997,7 +1080,7 @@ $$ LANGUAGE plpython3u;
 
 CREATE FUNCTION count_odd_fetch(batch_size integer) RETURNS integer AS $$
 odd = 0
-cursor = plpy.cursor("select num from largetable")
+cursor = plpy.cursor("SELECT num FROM largetable")
 while True:
     rows = cursor.fetch(batch_size)
     if not rows:
@@ -1010,7 +1093,7 @@ $$ LANGUAGE plpython3u;
 
 CREATE FUNCTION count_odd_prepared() RETURNS integer AS $$
 odd = 0
-plan = plpy.prepare("select num from largetable where num % $1 &lt;&gt; 0", ["integer"])
+plan = plpy.prepare("SELECT num FROM largetable WHERE num % $1 &lt;&gt; 0", ["integer"])
 rows = list(plpy.cursor(plan, [2]))  # or: = list(plan.cursor([2]))
 
 return len(rows)

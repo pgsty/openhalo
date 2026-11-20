@@ -3,7 +3,7 @@
  * toast_compression.c
  *	  Functions for toast compression.
  *
- * Copyright (c) 2021-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2021-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -20,28 +20,29 @@
 #include "access/detoast.h"
 #include "access/toast_compression.h"
 #include "common/pg_lzcompress.h"
+#include "utils/memutils.h"
 #include "varatt.h"
 
 /* GUC */
-int			default_toast_compression = TOAST_PGLZ_COMPRESSION;
+int			default_toast_compression = DEFAULT_TOAST_COMPRESSION;
 
-#define NO_LZ4_SUPPORT() \
+#define NO_COMPRESSION_SUPPORT(method) \
 	ereport(ERROR, \
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), \
-			 errmsg("compression method lz4 not supported"), \
-			 errdetail("This functionality requires the server to be built with lz4 support.")))
+			 errmsg("compression method %s not supported", method), \
+			 errdetail("This functionality requires the server to be built with %s support.", method)))
 
 /*
  * Compress a varlena using PGLZ.
  *
  * Returns the compressed varlena, or NULL if compression fails.
  */
-struct varlena *
-pglz_compress_datum(const struct varlena *value)
+varlena *
+pglz_compress_datum(const varlena *value)
 {
 	int32		valsize,
 				len;
-	struct varlena *tmp = NULL;
+	varlena    *tmp = NULL;
 
 	valsize = VARSIZE_ANY_EXHDR(value);
 
@@ -56,9 +57,13 @@ pglz_compress_datum(const struct varlena *value)
 	/*
 	 * Figure out the maximum possible size of the pglz output, add the bytes
 	 * that will be needed for varlena overhead, and allocate that amount.
+	 *
+	 * VARSIZE_ANY_EXHDR's refusal to return values higher than 1GB are what
+	 * protect this addition from wraparound; the PGLZ strategy doesn't
+	 * provide a useful backstop.
 	 */
-	tmp = (struct varlena *) palloc(PGLZ_MAX_OUTPUT(valsize) +
-									VARHDRSZ_COMPRESSED);
+	tmp = (varlena *) palloc(PGLZ_MAX_OUTPUT(valsize) +
+							 VARHDRSZ_COMPRESSED);
 
 	len = pglz_compress(VARDATA_ANY(value),
 						valsize,
@@ -78,17 +83,20 @@ pglz_compress_datum(const struct varlena *value)
 /*
  * Decompress a varlena that was compressed using PGLZ.
  */
-struct varlena *
-pglz_decompress_datum(const struct varlena *value)
+varlena *
+pglz_decompress_datum(const varlena *value)
 {
-	struct varlena *result;
+	varlena    *result;
 	int32		rawsize;
 
-	/* allocate memory for the uncompressed data */
-	result = (struct varlena *) palloc(VARDATA_COMPRESSED_GET_EXTSIZE(value) + VARHDRSZ);
+	/*
+	 * Allocate memory for the uncompressed data.  VARLENA_EXTSIZE_MASK
+	 * protects this against overflow.
+	 */
+	result = (varlena *) palloc(VARDATA_COMPRESSED_GET_EXTSIZE(value) + VARHDRSZ);
 
 	/* decompress the data */
-	rawsize = pglz_decompress((char *) value + VARHDRSZ_COMPRESSED,
+	rawsize = pglz_decompress((const char *) value + VARHDRSZ_COMPRESSED,
 							  VARSIZE(value) - VARHDRSZ_COMPRESSED,
 							  VARDATA(result),
 							  VARDATA_COMPRESSED_GET_EXTSIZE(value), true);
@@ -105,18 +113,23 @@ pglz_decompress_datum(const struct varlena *value)
 /*
  * Decompress part of a varlena that was compressed using PGLZ.
  */
-struct varlena *
-pglz_decompress_datum_slice(const struct varlena *value,
+varlena *
+pglz_decompress_datum_slice(const varlena *value,
 							int32 slicelength)
 {
-	struct varlena *result;
+	varlena    *result;
 	int32		rawsize;
 
-	/* allocate memory for the uncompressed data */
-	result = (struct varlena *) palloc(slicelength + VARHDRSZ);
+	/*
+	 * Allocate memory for the uncompressed data.  Caller must have checked
+	 * the requested size, but verify.
+	 */
+	if (!AllocSizeIsValid(slicelength))
+		elog(ERROR, "value is too big");
+	result = (varlena *) palloc(slicelength + VARHDRSZ);
 
 	/* decompress the data */
-	rawsize = pglz_decompress((char *) value + VARHDRSZ_COMPRESSED,
+	rawsize = pglz_decompress((const char *) value + VARHDRSZ_COMPRESSED,
 							  VARSIZE(value) - VARHDRSZ_COMPRESSED,
 							  VARDATA(result),
 							  slicelength, false);
@@ -135,26 +148,33 @@ pglz_decompress_datum_slice(const struct varlena *value,
  *
  * Returns the compressed varlena, or NULL if compression fails.
  */
-struct varlena *
-lz4_compress_datum(const struct varlena *value)
+varlena *
+lz4_compress_datum(const varlena *value)
 {
 #ifndef USE_LZ4
-	NO_LZ4_SUPPORT();
+	NO_COMPRESSION_SUPPORT("lz4");
 	return NULL;				/* keep compiler quiet */
 #else
 	int32		valsize;
 	int32		len;
 	int32		max_size;
-	struct varlena *tmp = NULL;
+	varlena    *tmp = NULL;
 
 	valsize = VARSIZE_ANY_EXHDR(value);
 
 	/*
 	 * Figure out the maximum possible size of the LZ4 output, add the bytes
 	 * that will be needed for varlena overhead, and allocate that amount.
+	 *
+	 * The current (2026) definition of LZ4_compressBound cannot yield a value
+	 * that can wrap-around the VARHDRSZ_COMPRESSED addition in 32-bit
+	 * machines, but we have no way to prevent future LZ4 development (or a
+	 * malicious LZ4 library) from changing that, so verify.
 	 */
 	max_size = LZ4_compressBound(valsize);
-	tmp = (struct varlena *) palloc(max_size + VARHDRSZ_COMPRESSED);
+	if (!AllocSizeIsValid(max_size))
+		elog(ERROR, "toast object size is too big");
+	tmp = (varlena *) palloc(max_size + VARHDRSZ_COMPRESSED);
 
 	len = LZ4_compress_default(VARDATA_ANY(value),
 							   (char *) tmp + VARHDRSZ_COMPRESSED,
@@ -178,21 +198,25 @@ lz4_compress_datum(const struct varlena *value)
 /*
  * Decompress a varlena that was compressed using LZ4.
  */
-struct varlena *
-lz4_decompress_datum(const struct varlena *value)
+varlena *
+lz4_decompress_datum(const varlena *value)
 {
 #ifndef USE_LZ4
-	NO_LZ4_SUPPORT();
+	NO_COMPRESSION_SUPPORT("lz4");
 	return NULL;				/* keep compiler quiet */
 #else
 	int32		rawsize;
-	struct varlena *result;
+	varlena    *result;
 
-	/* allocate memory for the uncompressed data */
-	result = (struct varlena *) palloc(VARDATA_COMPRESSED_GET_EXTSIZE(value) + VARHDRSZ);
+	/*
+	 * Allocate memory for the uncompressed data.  VARLENA_EXTSIZE_MASK
+	 * protects this against overflow.
+	 */
+	Assert(AllocSizeIsValid(VARDATA_COMPRESSED_GET_EXTSIZE(value)));
+	result = (varlena *) palloc(VARDATA_COMPRESSED_GET_EXTSIZE(value) + VARHDRSZ);
 
 	/* decompress the data */
-	rawsize = LZ4_decompress_safe((char *) value + VARHDRSZ_COMPRESSED,
+	rawsize = LZ4_decompress_safe((const char *) value + VARHDRSZ_COMPRESSED,
 								  VARDATA(result),
 								  VARSIZE(value) - VARHDRSZ_COMPRESSED,
 								  VARDATA_COMPRESSED_GET_EXTSIZE(value));
@@ -211,25 +235,30 @@ lz4_decompress_datum(const struct varlena *value)
 /*
  * Decompress part of a varlena that was compressed using LZ4.
  */
-struct varlena *
-lz4_decompress_datum_slice(const struct varlena *value, int32 slicelength)
+varlena *
+lz4_decompress_datum_slice(const varlena *value, int32 slicelength)
 {
 #ifndef USE_LZ4
-	NO_LZ4_SUPPORT();
+	NO_COMPRESSION_SUPPORT("lz4");
 	return NULL;				/* keep compiler quiet */
 #else
 	int32		rawsize;
-	struct varlena *result;
+	varlena    *result;
 
 	/* slice decompression not supported prior to 1.8.3 */
 	if (LZ4_versionNumber() < 10803)
 		return lz4_decompress_datum(value);
 
-	/* allocate memory for the uncompressed data */
-	result = (struct varlena *) palloc(slicelength + VARHDRSZ);
+	/*
+	 * Allocate memory for the uncompressed data.  Caller must have checked
+	 * the requested size, but verify.
+	 */
+	if (!AllocSizeIsValid(slicelength))
+		elog(ERROR, "toast object size is too big");
+	result = (varlena *) palloc(slicelength + VARHDRSZ);
 
 	/* decompress the data */
-	rawsize = LZ4_decompress_safe_partial((char *) value + VARHDRSZ_COMPRESSED,
+	rawsize = LZ4_decompress_safe_partial((const char *) value + VARHDRSZ_COMPRESSED,
 										  VARDATA(result),
 										  VARSIZE(value) - VARHDRSZ_COMPRESSED,
 										  slicelength,
@@ -251,7 +280,7 @@ lz4_decompress_datum_slice(const struct varlena *value, int32 slicelength)
  * Returns TOAST_INVALID_COMPRESSION_ID if the varlena is not compressed.
  */
 ToastCompressionId
-toast_get_compression_id(struct varlena *attr)
+toast_get_compression_id(varlena *attr)
 {
 	ToastCompressionId cmid = TOAST_INVALID_COMPRESSION_ID;
 
@@ -262,7 +291,7 @@ toast_get_compression_id(struct varlena *attr)
 	 */
 	if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{
-		struct varatt_external toast_pointer;
+		varatt_external toast_pointer;
 
 		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
 
@@ -289,7 +318,7 @@ CompressionNameToMethod(const char *compression)
 	else if (strcmp(compression, "lz4") == 0)
 	{
 #ifndef USE_LZ4
-		NO_LZ4_SUPPORT();
+		NO_COMPRESSION_SUPPORT("lz4");
 #endif
 		return TOAST_LZ4_COMPRESSION;
 	}

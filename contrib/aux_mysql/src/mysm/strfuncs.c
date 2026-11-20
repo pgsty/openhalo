@@ -572,7 +572,7 @@ static bool
 mys_varbit_to_uint64(const VarBit *vb, uint64 max_val, uint64 *out)
 {
 	int			nbits = VARBITLEN(vb);
-	const bits8 *src = VARBITS(vb);
+	const uint8 *src = VARBITS(vb);
 	uint64		acc = 0;
 
 	for (int i = 0; i < nbits; i++)
@@ -655,7 +655,7 @@ mys_int64_to_varbit(int64 val)
 	int32		rlen;
 	int32		bitsleft;
 	VarBit	   *ret;
-	bits8	   *r;
+	uint8	   *r;
 
 	if (val < 0)
 		nbits = 64;
@@ -673,11 +673,11 @@ mys_int64_to_varbit(int64 val)
 
 	while (bitsleft >= 8)
 	{
-		*r++ = (bits8) ((uval >> (bitsleft - 8)) & BITMASK);
+		*r++ = (uint8) ((uval >> (bitsleft - 8)) & BITMASK);
 		bitsleft -= 8;
 	}
 	if (bitsleft > 0)
-		*r = (bits8) ((uval << (8 - bitsleft)) & BITMASK);
+		*r = (uint8) ((uval << (8 - bitsleft)) & BITMASK);
 
 	return ret;
 }
@@ -845,9 +845,9 @@ mys_bit_to_text(PG_FUNCTION_ARGS)
 	int			bitLen;
 	int			nbytes;
 	int			shift;
-	const bits8 *src;
+	const uint8 *src;
 	text	   *result;
-	bits8	   *dst;
+	uint8	   *dst;
 
 	if (PG_ARGISNULL(0))
 		PG_RETURN_NULL();
@@ -858,7 +858,7 @@ mys_bit_to_text(PG_FUNCTION_ARGS)
 	shift = nbytes * BITS_PER_BYTE - bitLen;
 	src = VARBITS(s);
 	result = (text *) palloc0(VARHDRSZ + nbytes);
-	dst = (bits8 *) VARDATA(result);
+	dst = (uint8 *) VARDATA(result);
 
 	SET_VARSIZE(result, VARHDRSZ + nbytes);
 	if (bitLen != 0)
@@ -867,12 +867,12 @@ mys_bit_to_text(PG_FUNCTION_ARGS)
 			memcpy(dst, src, nbytes);
 		else
 		{
-			bits8		carry = 0;
+			uint8		carry = 0;
 
 			for (int i = 0; i < nbytes; i++)
 			{
 				dst[i] = carry | (src[i] >> shift);
-				carry = (bits8) (src[i] << (BITS_PER_BYTE - shift));
+				carry = (uint8) (src[i] << (BITS_PER_BYTE - shift));
 			}
 		}
 
@@ -897,21 +897,21 @@ cast_bittext_to_bytea(PG_FUNCTION_ARGS)
 	VarBit	   *s = PG_GETARG_VARBIT_P(0);
 	int			nbytes = VARBITBYTES(s);
 	int			shift = nbytes * BITS_PER_BYTE - VARBITLEN(s);
-	const bits8 *src = VARBITS(s);
+	const uint8 *src = VARBITS(s);
 	bytea	   *result = palloc(VARHDRSZ + nbytes);
-	bits8	   *dst = (bits8 *) VARDATA(result);
+	uint8	   *dst = (uint8 *) VARDATA(result);
 
 	SET_VARSIZE(result, VARHDRSZ + nbytes);
 	if (shift == 0)
 		memcpy(dst, src, nbytes);
 	else
 	{
-		bits8		carry = 0;
+		uint8		carry = 0;
 
 		for (int i = 0; i < nbytes; i++)
 		{
 			dst[i] = carry | (src[i] >> shift);
-			carry = (bits8) (src[i] << (BITS_PER_BYTE - shift));
+			carry = (uint8) (src[i] << (BITS_PER_BYTE - shift));
 		}
 	}
 

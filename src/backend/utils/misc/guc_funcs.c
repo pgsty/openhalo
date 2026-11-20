@@ -5,7 +5,7 @@
  * SQL commands and SQL-accessible functions related to GUC variables.
  *
  *
- * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  * Written by Peter Eisentraut <peter_e@gmx.net>.
  *
  * IDENTIFICATION
@@ -22,6 +22,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_parameter_acl.h"
+#include "catalog/pg_type_d.h"
 #include "funcapi.h"
 #include "guc_internal.h"
 #include "miscadmin.h"
@@ -30,6 +31,7 @@
 #include "utils/builtins.h"
 #include "utils/guc_tables.h"
 #include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
 
 static char *flatten_set_variable_args(const char *name, List *args);
 static void ShowGUCConfigOption(const char *name, DestReceiver *dest);
@@ -139,7 +141,7 @@ ExecSetVariableStmt(VariableSetStmt *stmt, bool isTopLevel)
 		case VAR_SET_DEFAULT:
 			if (stmt->is_local)
 				WarnNoTransactionBlock(isTopLevel, "SET LOCAL");
-			/* fall through */
+			pg_fallthrough;
 		case VAR_RESET:
 			(void) set_config_option(stmt->name,
 									 NULL,
@@ -210,12 +212,29 @@ flatten_set_variable_args(const char *name, List *args)
 	else
 		flags = 0;
 
-	/* Complain if list input and non-list variable */
-	if ((flags & GUC_LIST_INPUT) == 0 &&
-		list_length(args) != 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("SET %s takes only one argument", name)));
+	/*
+	 * Handle special cases for list input.
+	 */
+	if (flags & GUC_LIST_INPUT)
+	{
+		/* NULL represents an empty list. */
+		if (list_length(args) == 1)
+		{
+			Node	   *arg = (Node *) linitial(args);
+
+			if (IsA(arg, A_Const) &&
+				((A_Const *) arg)->isnull)
+				return pstrdup("");
+		}
+	}
+	else
+	{
+		/* Complain if list input and non-list variable. */
+		if (list_length(args) != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("SET %s takes only one argument", name)));
+	}
 
 	initStringInfo(&buf);
 
@@ -246,6 +265,12 @@ flatten_set_variable_args(const char *name, List *args)
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(arg));
 		con = (A_Const *) arg;
 
+		/* Complain if NULL is used with a non-list variable. */
+		if (con->isnull)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("NULL is an invalid value for %s", name)));
+
 		switch (nodeTag(&con->val))
 		{
 			case T_Integer:
@@ -268,6 +293,9 @@ flatten_set_variable_args(const char *name, List *args)
 					int32		typmod;
 					Datum		interval;
 					char	   *intervalout;
+
+					/* gram.y ensures this is only reachable for TIME ZONE */
+					Assert(!(flags & GUC_LIST_QUOTE));
 
 					typenameTypeIdAndMod(NULL, typeName, &typoid, &typmod);
 					Assert(typoid == INTERVALOID);
@@ -418,6 +446,7 @@ GetPGVariableResultDesc(const char *name)
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, varname,
 						   TEXTOID, -1, 0);
 	}
+	TupleDescFinalize(tupdesc);
 	return tupdesc;
 }
 
@@ -439,6 +468,7 @@ ShowGUCConfigOption(const char *name, DestReceiver *dest)
 	tupdesc = CreateTemplateTupleDesc(1);
 	TupleDescInitBuiltinEntry(tupdesc, (AttrNumber) 1, varname,
 							  TEXTOID, -1, 0);
+	TupleDescFinalize(tupdesc);
 
 	/* prepare for projection of tuples */
 	tstate = begin_tup_output_tupdesc(dest, tupdesc, &TTSOpsVirtual);
@@ -473,6 +503,7 @@ ShowAllGUCConfig(DestReceiver *dest)
 							  TEXTOID, -1, 0);
 	TupleDescInitBuiltinEntry(tupdesc, (AttrNumber) 3, "description",
 							  TEXTOID, -1, 0);
+	TupleDescFinalize(tupdesc);
 
 	/* prepare for projection of tuples */
 	tstate = begin_tup_output_tupdesc(dest, tupdesc, &TTSOpsVirtual);
@@ -578,7 +609,7 @@ pg_settings_get_flags(PG_FUNCTION_ARGS)
  * Return whether or not the GUC variable is visible to the current user.
  */
 bool
-ConfigOptionIsVisible(struct config_generic *conf)
+ConfigOptionIsVisible(const struct config_generic *conf)
 {
 	if ((conf->flags & GUC_SUPERUSER_ONLY) &&
 		!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_SETTINGS))
@@ -591,7 +622,7 @@ ConfigOptionIsVisible(struct config_generic *conf)
  * Extract fields to show in pg_settings for given variable.
  */
 static void
-GetConfigOptionValues(struct config_generic *conf, const char **values)
+GetConfigOptionValues(const struct config_generic *conf, const char **values)
 {
 	char		buffer[256];
 
@@ -629,7 +660,7 @@ GetConfigOptionValues(struct config_generic *conf, const char **values)
 	{
 		case PGC_BOOL:
 			{
-				struct config_bool *lconf = (struct config_bool *) conf;
+				const struct config_bool *lconf = &conf->_bool;
 
 				/* min_val */
 				values[9] = NULL;
@@ -650,7 +681,7 @@ GetConfigOptionValues(struct config_generic *conf, const char **values)
 
 		case PGC_INT:
 			{
-				struct config_int *lconf = (struct config_int *) conf;
+				const struct config_int *lconf = &conf->_int;
 
 				/* min_val */
 				snprintf(buffer, sizeof(buffer), "%d", lconf->min);
@@ -675,7 +706,7 @@ GetConfigOptionValues(struct config_generic *conf, const char **values)
 
 		case PGC_REAL:
 			{
-				struct config_real *lconf = (struct config_real *) conf;
+				const struct config_real *lconf = &conf->_real;
 
 				/* min_val */
 				snprintf(buffer, sizeof(buffer), "%g", lconf->min);
@@ -700,7 +731,7 @@ GetConfigOptionValues(struct config_generic *conf, const char **values)
 
 		case PGC_STRING:
 			{
-				struct config_string *lconf = (struct config_string *) conf;
+				const struct config_string *lconf = &conf->_string;
 
 				/* min_val */
 				values[9] = NULL;
@@ -727,7 +758,7 @@ GetConfigOptionValues(struct config_generic *conf, const char **values)
 
 		case PGC_ENUM:
 			{
-				struct config_enum *lconf = (struct config_enum *) conf;
+				const struct config_enum *lconf = &conf->_enum;
 
 				/* min_val */
 				values[9] = NULL;
@@ -741,15 +772,15 @@ GetConfigOptionValues(struct config_generic *conf, const char **values)
 				 * NOTE! enumvals with double quotes in them are not
 				 * supported!
 				 */
-				values[11] = config_enum_get_options((struct config_enum *) conf,
+				values[11] = config_enum_get_options(lconf,
 													 "{\"", "\"}", "\",\"");
 
 				/* boot_val */
-				values[12] = pstrdup(config_enum_lookup_by_value(lconf,
+				values[12] = pstrdup(config_enum_lookup_by_value(conf,
 																 lconf->boot_val));
 
 				/* reset_val */
-				values[13] = pstrdup(config_enum_lookup_by_value(lconf,
+				values[13] = pstrdup(config_enum_lookup_by_value(conf,
 																 lconf->reset_val));
 			}
 			break;
@@ -848,122 +879,52 @@ show_config_by_name_missing_ok(PG_FUNCTION_ARGS)
 Datum
 show_all_settings(PG_FUNCTION_ARGS)
 {
-	FuncCallContext *funcctx;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	struct config_generic **guc_vars;
 	int			num_vars;
-	TupleDesc	tupdesc;
-	int			call_cntr;
-	int			max_calls;
 	AttInMetadata *attinmeta;
-	MemoryContext oldcontext;
 
-	/* stuff done only on the first call of the function */
-	if (SRF_IS_FIRSTCALL())
+	/*
+	 * get_guc_variables() returns an array of pointers to the live GUC
+	 * entries, including placeholder entries.  Loading a module while the
+	 * scan is in progress can replace and free the placeholder entries of
+	 * that module's prefix, so a value-per-call SRF holding this array across
+	 * calls would read freed memory. So we use the materialize mode to build
+	 * the whole result in one call.
+	 */
+	InitMaterializedSRF(fcinfo, 0);
+
+	/* metadata needed to produce tuples from raw C strings */
+	attinmeta = TupleDescGetAttInMetadata(rsinfo->setDesc);
+
+	/* collect the variables, in sorted order */
+	guc_vars = get_guc_variables(&num_vars);
+
+	/*
+	 * The memory used to build each row is not freed until this SRF's context
+	 * is torn down. That is bounded by the number of GUCs, so resetting a
+	 * context per row is not worth the complication.
+	 */
+	for (int i = 0; i < num_vars; i++)
 	{
-		/* create a function context for cross-call persistence */
-		funcctx = SRF_FIRSTCALL_INIT();
-
-		/*
-		 * switch to memory context appropriate for multiple function calls
-		 */
-		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-
-		/*
-		 * need a tuple descriptor representing NUM_PG_SETTINGS_ATTS columns
-		 * of the appropriate types
-		 */
-		tupdesc = CreateTemplateTupleDesc(NUM_PG_SETTINGS_ATTS);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "name",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "setting",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "unit",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "category",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "short_desc",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 6, "extra_desc",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 7, "context",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 8, "vartype",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 9, "source",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 10, "min_val",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 11, "max_val",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 12, "enumvals",
-						   TEXTARRAYOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 13, "boot_val",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 14, "reset_val",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 15, "sourcefile",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 16, "sourceline",
-						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 17, "pending_restart",
-						   BOOLOID, -1, 0);
-
-		/*
-		 * Generate attribute metadata needed later to produce tuples from raw
-		 * C strings
-		 */
-		attinmeta = TupleDescGetAttInMetadata(tupdesc);
-		funcctx->attinmeta = attinmeta;
-
-		/* collect the variables, in sorted order */
-		guc_vars = get_guc_variables(&num_vars);
-
-		/* use user_fctx to remember the array location */
-		funcctx->user_fctx = guc_vars;
-
-		/* total number of tuples to be returned */
-		funcctx->max_calls = num_vars;
-
-		MemoryContextSwitchTo(oldcontext);
-	}
-
-	/* stuff done on every call of the function */
-	funcctx = SRF_PERCALL_SETUP();
-
-	guc_vars = (struct config_generic **) funcctx->user_fctx;
-	call_cntr = funcctx->call_cntr;
-	max_calls = funcctx->max_calls;
-	attinmeta = funcctx->attinmeta;
-
-	while (call_cntr < max_calls)	/* do when there is more left to send */
-	{
-		struct config_generic *conf = guc_vars[call_cntr];
+		struct config_generic *conf = guc_vars[i];
 		char	   *values[NUM_PG_SETTINGS_ATTS];
 		HeapTuple	tuple;
-		Datum		result;
 
 		/* skip if marked NO_SHOW_ALL or if not visible to current user */
 		if ((conf->flags & GUC_NO_SHOW_ALL) ||
 			!ConfigOptionIsVisible(conf))
-		{
-			call_cntr = ++funcctx->call_cntr;
 			continue;
-		}
 
 		/* extract values for the current variable */
 		GetConfigOptionValues(conf, (const char **) values);
 
-		/* build a tuple */
+		/* build a tuple and store it */
 		tuple = BuildTupleFromCStrings(attinmeta, values);
-
-		/* make the tuple into a datum */
-		result = HeapTupleGetDatum(tuple);
-
-		SRF_RETURN_NEXT(funcctx, result);
+		tuplestore_puttuple(rsinfo->setResult, tuple);
 	}
 
-	/* do when there is no more left */
-	SRF_RETURN_DONE(funcctx);
+	return (Datum) 0;
 }
 
 /*
@@ -986,7 +947,6 @@ show_all_file_settings(PG_FUNCTION_ARGS)
 #define NUM_PG_FILE_SETTINGS_ATTS 7
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	ConfigVariable *conf;
-	int			seqno;
 
 	/* Scan the config files using current context as workspace */
 	conf = ProcessConfigFileInternal(PGC_SIGHUP, false, DEBUG3);
@@ -995,7 +955,7 @@ show_all_file_settings(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 
 	/* Process the results and create a tuplestore */
-	for (seqno = 1; conf != NULL; conf = conf->next, seqno++)
+	for (int seqno = 1; conf != NULL; conf = conf->next, seqno++)
 	{
 		Datum		values[NUM_PG_FILE_SETTINGS_ATTS];
 		bool		nulls[NUM_PG_FILE_SETTINGS_ATTS];

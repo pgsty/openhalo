@@ -60,6 +60,11 @@ SET ROLE regress_priv_user3;
 GRANT regress_priv_user1 TO regress_priv_user4;
 SELECT grantor::regrole FROM pg_auth_members WHERE roleid = 'regress_priv_user1'::regrole and member = 'regress_priv_user4'::regrole;
 RESET ROLE;
+REVOKE INHERIT OPTION FOR regress_priv_user2 FROM regress_priv_user3;
+SET ROLE regress_priv_user3;
+GRANT regress_priv_user1 TO regress_priv_user5; -- fail
+ALTER GROUP regress_priv_user1 ADD USER regress_priv_user5; -- fail
+RESET ROLE;
 REVOKE regress_priv_user2 FROM regress_priv_user3;
 REVOKE regress_priv_user1 FROM regress_priv_user2 CASCADE;
 
@@ -568,6 +573,24 @@ INSERT INTO atest5(two) VALUES (6) ON CONFLICT (two) DO UPDATE set three = EXCLU
 INSERT INTO atest5(two) VALUES (6) ON CONFLICT (two) DO UPDATE set three = EXCLUDED.three;
 INSERT INTO atest5(two) VALUES (6) ON CONFLICT (two) DO UPDATE set one = 8; -- fails (due to UPDATE)
 INSERT INTO atest5(three) VALUES (4) ON CONFLICT (two) DO UPDATE set three = 10; -- fails (due to INSERT)
+-- Check that column level privileges are enforced for ON CONFLICT ... WHERE
+-- Ok. we may select one
+INSERT INTO atest5(two) VALUES (2) ON CONFLICT (two) DO SELECT WHERE atest5.one = 1 RETURNING atest5.two;
+-- Error. No select rights on three
+INSERT INTO atest5(two) VALUES (2) ON CONFLICT (two) DO SELECT WHERE atest5.three = 1 RETURNING atest5.two;
+
+-- Check that ON CONFLICT ... SELECT FOR UPDATE/SHARE requires an updatable column
+SET SESSION AUTHORIZATION regress_priv_user1;
+REVOKE UPDATE (three) ON atest5 FROM regress_priv_user4;
+SET SESSION AUTHORIZATION regress_priv_user4;
+
+INSERT INTO atest5(two) VALUES (2) ON CONFLICT (two) DO SELECT FOR UPDATE RETURNING atest5.two; -- fails
+
+SET SESSION AUTHORIZATION regress_priv_user1;
+GRANT UPDATE (three) ON atest5 TO regress_priv_user4;
+SET SESSION AUTHORIZATION regress_priv_user4;
+
+INSERT INTO atest5(two) VALUES (2) ON CONFLICT (two) DO SELECT FOR UPDATE RETURNING atest5.two; -- ok
 
 -- Check that the columns in the inference require select privileges
 INSERT INTO atest5(four) VALUES (4); -- fail
@@ -914,6 +937,21 @@ SET SESSION AUTHORIZATION regress_priv_user4;
 SELECT '{1}'::int4[]::int8[]; --other user, fail
 ROLLBACK;
 
+-- verify privilege checks on cast functions used by to_json()/to_jsonb()
+CREATE TYPE priv_testenum1 AS ENUM ('a');
+CREATE FUNCTION priv_testenum1_to_json(priv_testenum1) RETURNS json
+  LANGUAGE sql IMMUTABLE AS $$ SELECT to_json($1::text) $$;
+CREATE CAST (priv_testenum1 AS json) WITH FUNCTION priv_testenum1_to_json(priv_testenum1);
+REVOKE ALL ON FUNCTION priv_testenum1_to_json(priv_testenum1) FROM PUBLIC;
+SELECT to_json('a'::priv_testenum1); -- superuser, succeed
+SET SESSION AUTHORIZATION regress_priv_user4;
+SELECT to_json('a'::priv_testenum1); -- other user, fail
+SELECT to_jsonb('a'::priv_testenum1); -- other user, fail
+RESET SESSION AUTHORIZATION;
+DROP CAST (priv_testenum1 AS json);
+DROP FUNCTION priv_testenum1_to_json(priv_testenum1);
+DROP TYPE priv_testenum1;
+
 -- privileges on types
 
 -- switch to superuser
@@ -924,6 +962,9 @@ REVOKE USAGE ON TYPE priv_testtype1 FROM PUBLIC;
 GRANT USAGE ON TYPE priv_testtype1 TO regress_priv_user2;
 GRANT USAGE ON TYPE _priv_testtype1 TO regress_priv_user2; -- fail
 GRANT USAGE ON DOMAIN priv_testtype1 TO regress_priv_user2; -- fail
+
+CREATE FUNCTION cons_priv_testtype1(a int, b text) RETURNS priv_testtype1 LANGUAGE SQL
+  AS $$ SELECT row(a, b) $$ IMMUTABLE;
 
 CREATE DOMAIN priv_testdomain1 AS int;
 REVOKE USAGE on DOMAIN priv_testdomain1 FROM PUBLIC;
@@ -982,6 +1023,10 @@ REVOKE ALL ON TYPE priv_testtype1 FROM PUBLIC;
 CREATE TABLE test12 (c int DEFAULT 0 CHECK (c > 0 AND '(0,1)'::priv_testtype1 IS NOT NULL));
 CREATE TABLE test13 (c int DEFAULT ('(0,1)'::priv_testtype1).a);
 
+CREATE TABLE test_tbl_with_idx (c int, d text);
+CREATE INDEX ON test_tbl_with_idx ((cons_priv_testtype1(c, d)));
+DROP TABLE test_tbl_with_idx;
+
 SET SESSION AUTHORIZATION regress_priv_user2;
 
 -- commands that should succeed
@@ -1032,6 +1077,10 @@ REVOKE ALL ON TYPE priv_testtype1 FROM PUBLIC;
 CREATE TABLE test12 (c int DEFAULT 0 CHECK (c > 0 AND '(0,1)'::priv_testtype1 IS NOT NULL));
 CREATE TABLE test13 (c int DEFAULT ('(0,1)'::priv_testtype1).a);
 
+CREATE TABLE test_tbl_with_idx (c int, d text);
+CREATE INDEX ON test_tbl_with_idx ((cons_priv_testtype1(c, d)));
+DROP TABLE test_tbl_with_idx;
+
 -- new stored expressions require USAGE on types, rebuilds do not
 \c -
 REVOKE USAGE ON TYPE priv_testtype1 FROM regress_priv_user2;
@@ -1067,6 +1116,7 @@ DROP TABLE test17b;
 DROP TABLE test12;
 DROP TABLE test13;
 
+DROP FUNCTION cons_priv_testtype1; -- ok
 DROP TYPE priv_testtype1; -- ok
 DROP DOMAIN priv_testdomain1; -- ok
 
@@ -1298,6 +1348,24 @@ REFRESH MATERIALIZED VIEW sro_mv;
 REFRESH MATERIALIZED VIEW sro_mv;
 BEGIN; SET CONSTRAINTS ALL IMMEDIATE; REFRESH MATERIALIZED VIEW sro_mv; COMMIT;
 
+SET SESSION AUTHORIZATION regress_sro_user;
+-- REFRESH may not leave a type behind in the caller's pg_temp, either
+CREATE OR REPLACE FUNCTION mv_action() RETURNS bool LANGUAGE sql AS
+	'CREATE DOMAIN pg_temp.sro_domain AS pg_catalog.int4; SELECT true';
+REFRESH MATERIALIZED VIEW sro_mv; -- fail
+CREATE OR REPLACE FUNCTION mv_action() RETURNS bool LANGUAGE sql AS
+	'CREATE TYPE pg_temp.sro_enum AS ENUM (''x''); SELECT true';
+REFRESH MATERIALIZED VIEW sro_mv; -- fail
+CREATE OR REPLACE FUNCTION mv_action() RETURNS bool LANGUAGE sql AS
+	'CREATE TYPE pg_temp.sro_range AS RANGE (SUBTYPE = pg_catalog.int4); SELECT true';
+REFRESH MATERIALIZED VIEW sro_mv; -- fail
+-- including a multirange named apart from its range
+CREATE OR REPLACE FUNCTION mv_action() RETURNS bool LANGUAGE sql AS
+	'CREATE TYPE public.sro_range AS RANGE (SUBTYPE = pg_catalog.int4,
+	  MULTIRANGE_TYPE_NAME = pg_temp.sro_multirange); SELECT true';
+\c -
+REFRESH MATERIALIZED VIEW sro_mv; -- fail
+
 -- REFRESH MATERIALIZED VIEW CONCURRENTLY use of eval_const_expressions()
 SET SESSION AUTHORIZATION regress_sro_user;
 CREATE FUNCTION unwanted_grant_nofail(int) RETURNS int
@@ -1416,6 +1484,27 @@ SELECT loread(lo_open(1005, x'40000'::int), 32);
 
 SELECT lo_truncate(lo_open(1005, x'20000'::int), 10);	-- to be denied
 SELECT lo_truncate(lo_open(2001, x'20000'::int), 10);
+
+\c -
+-- confirm role with privileges of pg_read_all_data can read large objects
+SET SESSION AUTHORIZATION regress_priv_user6;
+
+SELECT loread(lo_open(1002, x'40000'::int), 32);
+SELECT lo_get(1002);
+SELECT lowrite(lo_open(1002, x'20000'::int), 'abcd');	-- to be denied
+SELECT lo_put(1002, 1, 'abcd');							-- to be denied
+SELECT lo_truncate(lo_open(1002, x'20000'::int), 0);	-- to be denied
+SELECT lo_unlink(1002);									-- to be denied
+
+\c -
+-- confirm role with privileges of pg_write_all_data can write large objects
+GRANT SELECT ON LARGE OBJECT 1002 TO regress_priv_user7;
+SET SESSION AUTHORIZATION regress_priv_user7;
+
+SELECT lowrite(lo_open(1002, x'20000'::int), 'abcd');
+SELECT lo_put(1002, 1, 'abcd');
+SELECT lo_truncate(lo_open(1002, x'20000'::int), 0);
+SELECT lo_unlink(1002);									-- to be denied
 
 -- has_largeobject_privilege function
 
@@ -1652,7 +1741,7 @@ ALTER DEFAULT PRIVILEGES GRANT SELECT ON LARGE OBJECTS TO regress_priv_user2;
 
 SELECT lo_create(1008);
 SELECT has_largeobject_privilege('regress_priv_user2', 1008, 'SELECT'); -- yes
-SELECT has_largeobject_privilege('regress_priv_user6', 1008, 'SELECT'); -- no
+SELECT has_largeobject_privilege('regress_priv_user3', 1008, 'SELECT'); -- no
 SELECT has_largeobject_privilege('regress_priv_user2', 1008, 'UPDATE'); -- no
 
 ALTER DEFAULT PRIVILEGES GRANT ALL ON LARGE OBJECTS TO regress_priv_user2;
@@ -2005,7 +2094,8 @@ DROP TABLE lock_table;
 DROP USER regress_locktable_user;
 
 -- test to check privileges of system views pg_shmem_allocations,
--- pg_shmem_allocations_numa and pg_backend_memory_contexts.
+-- pg_shmem_allocations_numa, pg_dsm_registry_allocations, and
+-- pg_backend_memory_contexts.
 
 -- switch to superuser
 \c -
@@ -2016,6 +2106,7 @@ SELECT has_table_privilege('regress_readallstats','pg_aios','SELECT'); -- no
 SELECT has_table_privilege('regress_readallstats','pg_backend_memory_contexts','SELECT'); -- no
 SELECT has_table_privilege('regress_readallstats','pg_shmem_allocations','SELECT'); -- no
 SELECT has_table_privilege('regress_readallstats','pg_shmem_allocations_numa','SELECT'); -- no
+SELECT has_table_privilege('regress_readallstats','pg_dsm_registry_allocations','SELECT'); -- no
 
 GRANT pg_read_all_stats TO regress_readallstats;
 
@@ -2023,6 +2114,7 @@ SELECT has_table_privilege('regress_readallstats','pg_aios','SELECT'); -- yes
 SELECT has_table_privilege('regress_readallstats','pg_backend_memory_contexts','SELECT'); -- yes
 SELECT has_table_privilege('regress_readallstats','pg_shmem_allocations','SELECT'); -- yes
 SELECT has_table_privilege('regress_readallstats','pg_shmem_allocations_numa','SELECT'); -- yes
+SELECT has_table_privilege('regress_readallstats','pg_dsm_registry_allocations','SELECT'); -- yes
 
 -- run query to ensure that functions within views can be executed
 SET ROLE regress_readallstats;
@@ -2162,3 +2254,37 @@ SELECT * FROM information_schema.table_privileges t
 
 DROP TABLE grantor_test1, grantor_test2, grantor_test3;
 DROP ROLE regress_grantor1, regress_grantor2, regress_grantor3;
+
+-- GRANTED BY
+CREATE ROLE regress_grantor1;
+CREATE ROLE regress_grantor2 ROLE regress_grantor1;
+CREATE ROLE regress_grantor3 ROLE regress_grantor1;
+CREATE ROLE regress_grantor4 ROLE regress_grantor1;
+CREATE ROLE regress_grantor5;
+CREATE TABLE grantor_test ();
+GRANT SELECT ON grantor_test TO regress_grantor2 WITH GRANT OPTION;
+GRANT UPDATE ON grantor_test TO regress_grantor3 WITH GRANT OPTION;
+GRANT SELECT, UPDATE ON grantor_test TO regress_grantor4 WITH GRANT OPTION;
+SET ROLE regress_grantor1;
+
+GRANT SELECT, UPDATE ON grantor_test TO regress_grantor5;
+
+SELECT * FROM information_schema.table_privileges t
+    WHERE grantor LIKE 'regress_grantor%' ORDER BY ROW(t.*);
+
+REVOKE SELECT, UPDATE ON grantor_test FROM regress_grantor5;
+GRANT SELECT, UPDATE ON grantor_test TO regress_grantor5 GRANTED BY regress_grantor2;
+GRANT SELECT, UPDATE ON grantor_test TO regress_grantor5 GRANTED BY regress_grantor3;
+
+SELECT * FROM information_schema.table_privileges t
+    WHERE grantor LIKE 'regress_grantor%' ORDER BY ROW(t.*);
+
+REVOKE SELECT, UPDATE ON grantor_test FROM regress_grantor5 GRANTED BY regress_grantor2;
+REVOKE SELECT, UPDATE ON grantor_test FROM regress_grantor5 GRANTED BY regress_grantor3;
+
+SELECT * FROM information_schema.table_privileges t
+    WHERE grantor LIKE 'regress_grantor%' ORDER BY ROW(t.*);
+
+RESET ROLE;
+DROP TABLE grantor_test;
+DROP ROLE regress_grantor1, regress_grantor2, regress_grantor3, regress_grantor4, regress_grantor5;

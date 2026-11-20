@@ -1,53 +1,53 @@
-# OpenHalo 18
+# OpenHalo 19
 
 [![PGSTY: pgsty.com](https://img.shields.io/badge/PGSTY-pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://pgsty.com/)
 [![Pigsty: pigsty.io](https://img.shields.io/badge/Pigsty-pigsty.io-slategray?style=flat)](https://pigsty.io/)
-[![Version: v18.6.1](https://img.shields.io/badge/Version-v18.6.1-slategray?style=flat)](https://github.com/pgsty/openHalo/releases)
-[![Extension: aux_mysql 1.9](https://img.shields.io/badge/aux__mysql-1.9-slategray?style=flat)](contrib/aux_mysql/README.md)
+[![Version: 19.0-dev](https://img.shields.io/badge/Version-19.0--dev-slategray?style=flat)](https://github.com/pgsty/openHalo/releases)
+[![Extension: aux_mysql 2.0](https://img.shields.io/badge/aux__mysql-2.0-slategray?style=flat)](contrib/aux_mysql/README.md)
 [![License: PostgreSQL / GPL-3.0](https://img.shields.io/badge/License-PostgreSQL%20%2F%20GPL--3.0-slategray?style=flat&logo=gnu&logoColor=white)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/openHalo?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/openHalo&Date)
-[![PostgreSQL: 18.6](https://img.shields.io/badge/PostgreSQL-18.6-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](README.postgresql.md)
+[![PostgreSQL: 19.0](https://img.shields.io/badge/PostgreSQL-19.0-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](README.postgresql.md)
 [![MySQL: 5.7 / 8.0](https://img.shields.io/badge/MySQL-5.7%20%2F%208.0-%234479A1?style=flat&logo=mysql&logoColor=white&labelColor=4479A1)](contrib/aux_mysql/README.md)
 
-**OpenHalo 18** (current release: **`v18.6.1`**) is a PostgreSQL 18.6 kernel and `aux_mysql` (`1.9`) extension that speaks the MySQL wire protocol and SQL dialect natively—allowing MySQL clients, drivers, and applications on port `3306` and PostgreSQL clients on port `5432` to query the same data concurrently.
+**OpenHalo 19** (development branch, based on **PostgreSQL 19.0**) is a PostgreSQL 19.0 kernel and `aux_mysql` (`2.0`) extension that speaks the MySQL wire protocol and SQL dialect natively—allowing MySQL clients, drivers, and applications on port `3306` and PostgreSQL clients on port `5432` to query the same data concurrently.
 
 [PGSTY](https://pgsty.com) | [Pigsty](https://pigsty.io) | [`aux_mysql` Docs](contrib/aux_mysql/README.md) | [Migration Guide](contrib/aux_mysql/MIGRATION.md) | [Testing Guide](contrib/aux_mysql/TESTING.md) | [Upstream Port Log](contrib/aux_mysql/UPSTREAM.md) | [Changelog](CHANGELOG.md) | [Releases](https://github.com/pgsty/openHalo/releases) | [Issues](https://github.com/pgsty/openHalo/issues) | [Upstream](https://github.com/HaloTech-Co-Ltd/openHalo)
 
 ---
 
 > [!IMPORTANT]
-> **About This Fork**: [`pgsty/openHalo`](https://github.com/pgsty/openHalo) (**OpenHalo 18**) is an independent fork maintained by **[PGSTY](https://pgsty.com)**, derived from [`HaloTech-Co-Ltd/openHalo`](https://github.com/HaloTech-Co-Ltd/openHalo) (`1.0` on PostgreSQL 14.18).
-> Rather than maintaining a monolithic fork across ~320 PostgreSQL 14 kernel files, OpenHalo 18 rebases onto **PostgreSQL 18.6** with a compact set of protocol, execution, sequence, foreign-key, and collation hooks, and moves the entire MySQL wire protocol, parser, DDL/DML rewriter, and runtime semantics into the preloaded [`aux_mysql`](contrib/aux_mysql/README.md) (`1.9`) extension.
+> **About This Fork**: [`pgsty/openHalo`](https://github.com/pgsty/openHalo) (**OpenHalo 19**) is an independent fork maintained by **[PGSTY](https://pgsty.com)**, derived from [`HaloTech-Co-Ltd/openHalo`](https://github.com/HaloTech-Co-Ltd/openHalo) (`1.0` on PostgreSQL 14.18).
+> Rather than maintaining a monolithic fork across ~320 PostgreSQL 14 kernel files, OpenHalo 19 rebases onto **PostgreSQL 19.0** with a compact set of protocol, execution, sequence, foreign-key, and collation hooks, and moves the entire MySQL wire protocol, parser, DDL/DML rewriter, and runtime semantics into the preloaded [`aux_mysql`](contrib/aux_mysql/README.md) (`2.0`) extension.
 
 ---
 
 ## Architecture
 
-OpenHalo 18 separates generic kernel extension points from MySQL-specific protocol and SQL compatibility:
+OpenHalo 19 separates generic kernel extension points from MySQL-specific protocol and SQL compatibility:
 
 ```text
-PostgreSQL 18.6 + protocol/execution hooks + atomic sequence advancement
+PostgreSQL 19.0 + protocol/execution hooks + atomic sequence advancement
   postmaster: listens on 5432 (PostgreSQL) & 3306 (MySQL) -> regular backends
               (shared max_connections, pg_stat_activity, pg_hba.conf, query cancel)
   backend:    handshake -> authenticate -> read command -> parse -> analyze/plan/execute -> results / OK / ERR
        |
-aux_mysql 1.9 (contrib/aux_mysql)
+aux_mysql 2.0 (contrib/aux_mysql)
   MySQL wire protocol, caching_sha2_password (TLS / RSA), COM_STMT_* binary protocol,
   MySQL grammar (mys_gram.y), raw parse tree rewriting, ProcessUtility hook for MySQL DDL,
   autocommit / implicit commit / statement-level rollback, MySQL types, operators & functions
 ```
 
-Catalog layouts remain PostgreSQL 18 compatible, while protocol, parse, and plan node structures include OpenHalo 18 hook fields. Always build the kernel and `aux_mysql` together, and rebuild and validate third-party C extensions against these headers (see [Migration & Support Boundaries](contrib/aux_mysql/MIGRATION.md)).
+Catalog layouts remain PostgreSQL 19 compatible, while protocol, parse, and plan node structures include OpenHalo 19 hook fields. Always build the kernel and `aux_mysql` together, and rebuild and validate third-party C extensions against these headers (see [Migration & Support Boundaries](contrib/aux_mysql/MIGRATION.md)).
 
 ---
 
-## OpenHalo 18 vs openHalo 1.0
+## OpenHalo 19 vs openHalo 1.0
 
-| Dimension | openHalo 1.0 (branch `pg14`, tag `v1.0-pg14`) | OpenHalo 18 (`pgsty/openHalo`) |
+| Dimension | openHalo 1.0 (branch `pg14`, tag `v1.0-pg14`) | OpenHalo 19 (`pgsty/openHalo`) |
 | :--- | :--- | :--- |
-| **PostgreSQL Base** | PostgreSQL 14.18 (~320 kernel files modified) | **PostgreSQL 18.6** + targeted protocol/execution hooks & sequence API |
-| **MySQL Layer** | Compiled into the kernel (forked analyzer & executor) | **`aux_mysql` (`1.9`) extension**, preloaded by default |
-| **Extension ABI** | Diverges from PG (`DestReceiver`, `pg_proc`, ACL bits) | PG18 catalogs preserved; protocol/parse/plan structs extended (rebuild extensions) |
+| **PostgreSQL Base** | PostgreSQL 14.18 (~320 kernel files modified) | **PostgreSQL 19.0** + targeted protocol/execution hooks & sequence API |
+| **MySQL Layer** | Compiled into the kernel (forked analyzer & executor) | **`aux_mysql` (`2.0`) extension**, preloaded by default |
+| **Extension ABI** | Diverges from PG (`DestReceiver`, `pg_proc`, ACL bits) | PG19 catalogs preserved; protocol/parse/plan structs extended (rebuild extensions) |
 | **Authentication** | `mysql_native_password` | **`caching_sha2_password`** (MySQL 8 default) over TLS or RSA against PG passwords; `mysql_clear_password` on request |
 | **Initialization** | Manual `CREATE EXTENSION aux_mysql` | Installed synchronously on the first superuser MySQL connection (`mysql.auto_create_extension = on`) |
 | **Configuration** | `mysql.*` GUCs hardcoded in core | Same `mysql.*` GUC names defined by `aux_mysql` (`database_compat_mode` removed) |
@@ -181,19 +181,16 @@ All parameters are defined by `aux_mysql` under the `mysql.*` prefix:
 
 ## Upgrading & Migration
 
-- **Updating from `v18.6` (`aux_mysql` `1.5` → `1.9`)**: Install the `v18.6.1` kernel and extension files together, restart PostgreSQL, and run this over a PostgreSQL connection to `mysql.database`:
-  ```sql
-  ALTER EXTENSION aux_mysql UPDATE TO '1.9';
-  ```
-  The update keeps existing objects as they are; follow the [object migration audit](contrib/aux_mysql/MIGRATION.md#updating-an-existing-openhalo-18-installation) for old binary columns, prefix keys, generated columns and unchecked foreign keys.
-- **Migrating from openHalo 1.0 (PG 14)**: OpenHalo 18 uses PostgreSQL 18 catalogs and is **not** binary-upgrade (`pg_upgrade`) compatible with openHalo 14 data directories. Migrate via logical dump and restore after running the read-only preflight tools (`contrib/aux_mysql/tools/check_pg14_config.py` and `check_pg14_schema.sql`). See the full [Migration Guide](contrib/aux_mysql/MIGRATION.md).
+- **PostgreSQL 18 → 19** is a major upgrade: build and install the kernel and extension together into a separate prefix, initialize a new cluster, and rehearse the migration on a copy. The on-disk catalogs, WAL and C extension ABI changed. Follow the [PG19 port and validation notes](contrib/aux_mysql/PG19.md) and [migration guide](contrib/aux_mysql/MIGRATION.md).
+- This branch carries **`aux_mysql 2.0`** and its consolidated installation SQL. It does not ship an extension upgrade script from `1.x` to `2.0`. The historical `ALTER EXTENSION ... UPDATE TO '1.9'` path belongs to the PG18 releases.
+- **openHalo 1.0 (PG14)** still requires reviewed logical migration; its catalogs cannot be upgraded with `pg_upgrade`.
 
 ---
 
 ## Source Layout
 
-- **PostgreSQL 18.6 Kernel Hooks**: `src/backend/postmaster/protocol_extension.c`, `src/include/postmaster/protocol_extension.h`, plus targeted parser, executor, sequence, trigger, locale, and `pg_upgrade` guards (see [`README.postgresql.md`](README.postgresql.md) and [`COPYRIGHT`](COPYRIGHT)).
-- **`contrib/aux_mysql/`**: The MySQL wire protocol, grammar, rewrite engine, runtime library, regression suites (`tests/`), and PG14→PG18 code generators (`tools/`).
+- **PostgreSQL 19.0 Kernel Hooks**: `src/backend/postmaster/protocol_extension.c`, `src/include/postmaster/protocol_extension.h`, plus targeted parser, executor, sequence, trigger, locale, and `pg_upgrade` guards (see [`README.postgresql.md`](README.postgresql.md) and [`COPYRIGHT`](COPYRIGHT)).
+- **`contrib/aux_mysql/`**: The MySQL wire protocol, grammar, rewrite engine, runtime library, regression suites (`tests/`), and keyword-generation tools (`tools/`).
 - **Build & Config Defaults**: `src/backend/utils/misc/postgresql.conf.sample`, `GNUmakefile.in`, and `contrib/Makefile`.
 
 ---
@@ -201,41 +198,38 @@ All parameters are defined by `aux_mysql` under the `mysql.*` prefix:
 ## Testing
 
 ```bash
-# 1. Verify byte-for-byte reproducibility of generated grammar and SQL scripts (reads the local pg14 branch)
-python3 contrib/aux_mysql/tests/check_generated.py
-
-# 2. PostgreSQL core regression suite (with aux_mysql preloaded)
+# 1. PostgreSQL core regression suite (with aux_mysql preloaded)
 make check
 
-# 3. Provision a disposable test instance and run the MySQL smoke, driver & A/B suites
+# 2. Provision a disposable test instance and run the MySQL smoke, driver & A/B suites
 contrib/aux_mysql/tests/kernel_instance.sh <prefix> <pgdata> <pgport> <mysqlport>
 PGBIN=<prefix>/bin PGPORT=<pgport> MYSQL_PORT=<mysqlport> contrib/aux_mysql/tests/run.sh
 
-# 4. sysbench OLTP benchmark over the MySQL protocol
+# 3. sysbench OLTP benchmark over the MySQL protocol
 MYSQL_PORT=<mysqlport> contrib/aux_mysql/tests/sysbench.sh
 ```
 
-See [`contrib/aux_mysql/TESTING.md`](contrib/aux_mysql/TESTING.md) for the complete `1.9` integration, upgrade, roundtrip, and ecosystem test suites.
+See [`contrib/aux_mysql/TESTING.md`](contrib/aux_mysql/TESTING.md) for the complete `2.0` integration, upgrade, roundtrip, and ecosystem test suites.
 
 ---
 
 ## Documentation
 
-- **[`contrib/aux_mysql/README.md`](contrib/aux_mysql/README.md)**: Complete `aux_mysql` 1.9 architecture, authentication, prepared statements, SQL dialect, type/index semantics, and operational notes.
-- **[`contrib/aux_mysql/MIGRATION.md`](contrib/aux_mysql/MIGRATION.md)**: OpenHalo 14 → 18 logical migration workflow, preflight scripts, and post-upgrade repair procedures.
+- **[`contrib/aux_mysql/README.md`](contrib/aux_mysql/README.md)**: Complete `aux_mysql` 2.0 architecture, authentication, prepared statements, SQL dialect, type/index semantics, and operational notes.
+- **[`contrib/aux_mysql/MIGRATION.md`](contrib/aux_mysql/MIGRATION.md)**: Major-version migration boundaries and historical PG18 repair procedures.
 - **[`contrib/aux_mysql/TESTING.md`](contrib/aux_mysql/TESTING.md)**: Verification suites and isolated test instance instructions.
 - **[`contrib/aux_mysql/UPSTREAM.md`](contrib/aux_mysql/UPSTREAM.md)**: Upstream `HaloTech-Co-Ltd/openHalo` synchronization and porting record.
-- **[`CHANGELOG.md`](CHANGELOG.md)**: OpenHalo 18 release notes.
+- **[`CHANGELOG.md`](CHANGELOG.md)**: OpenHalo 19 release notes.
 - **[`CONTRIBUTING.md`](CONTRIBUTING.md)**: Development setup, tests and pull requests.
-- **[`README.postgresql.md`](README.postgresql.md)**: Upstream PostgreSQL 18 documentation and resources.
+- **[`README.postgresql.md`](README.postgresql.md)**: Upstream PostgreSQL 19 documentation and resources.
 
 ---
 
 ## License
 
-OpenHalo 18 inherits the licenses of its upstream projects:
+OpenHalo 19 inherits the licenses of its upstream projects:
 
-- **PostgreSQL 18.6 Kernel & Protocol Extension Hooks**: Licensed under the **[PostgreSQL License](COPYRIGHT)**.
+- **PostgreSQL 19.0 Kernel & Protocol Extension Hooks**: Licensed under the **[PostgreSQL License](COPYRIGHT)**.
 - **`contrib/aux_mysql` Extension**: Derived from `openHalo` and licensed under the **[GNU General Public License v3.0 (GPLv3)](LICENSE)** (see [`contrib/aux_mysql/COPYRIGHT`](contrib/aux_mysql/COPYRIGHT) and [`3party-legal-notices`](3party-legal-notices)). Combined builds that include `aux_mysql` are distributed under the **GPLv3**.
 
 ### Copyright & Attribution

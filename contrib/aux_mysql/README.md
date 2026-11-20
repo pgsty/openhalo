@@ -1,11 +1,11 @@
 # aux_mysql
 
-openHalo's MySQL Supplementary Extension (version 1.9, same name and settings as in openHalo 1.0) on
-PostgreSQL 18. In openHalo 1.0 the MySQL protocol, parser and semantics were compiled into the kernel and
+openHalo's MySQL Supplementary Extension (version 2.0, same name and settings as in openHalo 1.0) on
+PostgreSQL 19. In openHalo 1.0 the MySQL protocol, parser and semantics were compiled into the kernel and
 aux_mysql held the SQL layer; here the extension implements MySQL behavior with the matching
 OpenHalo kernel's protocol, executor, foreign-key and collation hooks. The node and callback
 layouts must match: build the kernel and extension together. Other kernels require adaptation
-and separate validation. Load it through `shared_preload_libraries` (the OpenHalo 18 default).
+and separate validation. Load it through `shared_preload_libraries` (the OpenHalo 19 default).
 
 ## Parameters
 
@@ -280,7 +280,7 @@ Every run keeps separate logs. Exit 0 means all required groups passed; exit 1 m
 exit 2 means missing dependencies (incomplete). Set `JAR` to the Connector/J jar and `LOG_DIR`
 to a new output directory. `sysbench.sh` separately counts completed and error-free scenarios;
 ignored database errors produce a nonzero exit. `ab_regress.py` additionally requires psycopg2.
-The 1.9 integration suites and isolated-instance requirements are listed in [TESTING.md](TESTING.md).
+The 2.0 integration suites and isolated-instance requirements are listed in [TESTING.md](TESTING.md).
 
 ## License
 

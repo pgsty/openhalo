@@ -37,6 +37,7 @@
 #include "commands/defrem.h"
 #include "common/hashfn.h"
 #include "funcapi.h"
+#include "utils/tuplestore.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -248,13 +249,13 @@ pad_compare(const char *a, int alen, const char *b, int blen, int unit)
  * the first differing weight decides, so stop there.  Equal ASCII bytes have
  * equal weights.  PAD SPACE: the shorter operand continues with spaces. */
 static int
-general_strncoll(const char *a, ssize_t alen, const char *b, ssize_t blen,
+general_strncoll(const char *a, size_t alen, const char *b, size_t blen,
 				pg_locale_t locale)
 {
 	const unsigned char *p = (const unsigned char *) a;
 	const unsigned char *q = (const unsigned char *) b;
-	const unsigned char *pend = p + (alen < 0 ? strlen(a) : alen);
-	const unsigned char *qend = q + (blen < 0 ? strlen(b) : blen);
+	const unsigned char *pend = p + alen;
+	const unsigned char *qend = q + blen;
 	const unsigned char *tail, *tend;
 	int sign;
 
@@ -293,11 +294,11 @@ general_strncoll(const char *a, ssize_t alen, const char *b, ssize_t blen,
  * The rest is filled with the space weight, exactly as PAD SPACE compares a
  * shorter operand.  Not pg_strnxfrm(), whose trimmed hash key has no order. */
 static size_t
-general_strnxfrm_prefix(char *dest, size_t size, const char *src, ssize_t len,
+general_strnxfrm_prefix(char *dest, size_t size, const char *src, size_t len,
 						pg_locale_t locale)
 {
 	const unsigned char *p = (const unsigned char *) src;
-	const unsigned char *end = p + (len < 0 ? strlen(src) : len);
+	const unsigned char *end = p + len;
 	unsigned char *out = (unsigned char *) dest;
 	size_t n = 0;
 
@@ -323,10 +324,10 @@ general_strnxfrm_prefix(char *dest, size_t size, const char *src, ssize_t len,
 
 /* pg_strnxfrm's result is binary and length-delimited (embedded NUL is OK). */
 static size_t
-general_strnxfrm(char *dest, size_t size, const char *src, ssize_t len,
+general_strnxfrm(char *dest, size_t size, const char *src, size_t len,
 				pg_locale_t locale)
 {
-	bytea *key = general_key(src, len < 0 ? strlen(src) : len, 0, true);
+	bytea *key = general_key(src, len, 0, true);
 	size_t n = VARSIZE_ANY_EXHDR(key);
 	if (size > n)
 	{
@@ -339,8 +340,32 @@ general_strnxfrm(char *dest, size_t size, const char *src, ssize_t len,
 
 /* strxfrm_is_safe only enables abbreviated keys (varstr_sortsupport), which
  * use the prefix method; pg_strnxfrm() stays the equality key for hashing. */
+static int
+general_strcoll(const char *a, const char *b, pg_locale_t locale)
+{
+	return general_strncoll(a, strlen(a), b, strlen(b), locale);
+}
+
+static size_t
+general_strxfrm(char *dest, size_t size, const char *src, pg_locale_t locale)
+{
+	return general_strnxfrm(dest, size, src, strlen(src), locale);
+}
+
+static size_t
+general_strxfrm_prefix(char *dest, size_t size, const char *src, pg_locale_t locale)
+{
+	return general_strnxfrm_prefix(dest, size, src, strlen(src), locale);
+}
+
 static const struct collate_methods general_methods = {
-	general_strncoll, general_strnxfrm, general_strnxfrm_prefix, true
+	.strncoll = general_strncoll,
+	.strcoll = general_strcoll,
+	.strnxfrm = general_strnxfrm,
+	.strxfrm = general_strxfrm,
+	.strnxfrm_prefix = general_strnxfrm_prefix,
+	.strxfrm_prefix = general_strxfrm_prefix,
+	.strxfrm_is_safe = true
 };
 
 static int
@@ -400,19 +425,16 @@ mys_simple_weight_next(MysSimpleCollation kind, const char *data, int byte_len,
 }
 
 static int
-binary_strncoll(const char *a, ssize_t alen, const char *b, ssize_t blen,
+binary_strncoll(const char *a, size_t alen, const char *b, size_t blen,
 			   pg_locale_t locale)
 {
-	if (alen < 0) alen = strlen(a);
-	if (blen < 0) blen = strlen(b);
 	return pad_compare(a, alen, b, blen, 1);
 }
 
 static size_t
-binary_strnxfrm(char *dest, size_t size, const char *src, ssize_t len,
+binary_strnxfrm(char *dest, size_t size, const char *src, size_t len,
 				pg_locale_t locale)
 {
-	if (len < 0) len = strlen(src);
 	while (len > 0 && src[len - 1] == ' ') len--;
 	if (size > (size_t) len)
 	{
@@ -424,18 +446,42 @@ binary_strnxfrm(char *dest, size_t size, const char *src, ssize_t len,
 
 /* Abbreviated keys: the bytes, padded with spaces as pad_compare() does. */
 static size_t
-binary_strnxfrm_prefix(char *dest, size_t size, const char *src, ssize_t len,
+binary_strnxfrm_prefix(char *dest, size_t size, const char *src, size_t len,
 					   pg_locale_t locale)
 {
-	size_t n = Min(size, (size_t) (len < 0 ? strlen(src) : len));
+	size_t n = Min(size, (size_t) len);
 
 	memcpy(dest, src, n);
 	memset(dest + n, ' ', size - n);
 	return size;
 }
 
+static int
+binary_strcoll(const char *a, const char *b, pg_locale_t locale)
+{
+	return binary_strncoll(a, strlen(a), b, strlen(b), locale);
+}
+
+static size_t
+binary_strxfrm(char *dest, size_t size, const char *src, pg_locale_t locale)
+{
+	return binary_strnxfrm(dest, size, src, strlen(src), locale);
+}
+
+static size_t
+binary_strxfrm_prefix(char *dest, size_t size, const char *src, pg_locale_t locale)
+{
+	return binary_strnxfrm_prefix(dest, size, src, strlen(src), locale);
+}
+
 static const struct collate_methods binary_methods = {
-	binary_strncoll, binary_strnxfrm, binary_strnxfrm_prefix, true
+	.strncoll = binary_strncoll,
+	.strcoll = binary_strcoll,
+	.strnxfrm = binary_strnxfrm,
+	.strxfrm = binary_strxfrm,
+	.strnxfrm_prefix = binary_strnxfrm_prefix,
+	.strxfrm_prefix = binary_strxfrm_prefix,
+	.strxfrm_is_safe = true
 };
 
 #ifdef PG_LOCALE_CREATE_HOOK
@@ -823,7 +869,7 @@ exact_candidate(IndexScanDesc scan)
 		state->estate = CreateExecutorState();
 		state->info = BuildIndexInfo(scan->indexRelation);
 		state->slot = table_slot_create(scan->heapRelation, NULL);
-		state->fetch = table_index_fetch_begin(scan->heapRelation);
+		state->fetch = table_index_fetch_begin(scan->heapRelation, 0);
 	}
 	table_index_fetch_reset(state->fetch);
 	while (table_index_fetch_tuple(state->fetch, &tid, scan->xs_snapshot,
@@ -1091,7 +1137,11 @@ PG_FUNCTION_INFO_V1(mys_prefix_handler);
 Datum
 mys_prefix_handler(PG_FUNCTION_ARGS)
 {
-	IndexAmRoutine *am = (IndexAmRoutine *) DatumGetPointer(DirectFunctionCall1(bthandler, (Datum) 0));
+	/* PG19 handlers return static routines, and btree's is read-only. */
+	static IndexAmRoutine amroutine;
+	IndexAmRoutine *am = &amroutine;
+
+	*am = *(const IndexAmRoutine *) DatumGetPointer(bthandler(fcinfo));
 #ifndef PG_LOCALE_CREATE_HOOK
 	install_collation();
 #endif
@@ -1250,7 +1300,7 @@ mys_index_key_parts19(PG_FUNCTION_ARGS)
 }
 
 static void
-prefix_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
+prefix_analyze(ParseState *pstate, Query *query, const JumbleState *jstate)
 {
 	if (previous_analyze) previous_analyze(pstate, query, jstate);
 #ifndef PG_LOCALE_CREATE_HOOK

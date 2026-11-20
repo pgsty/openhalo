@@ -3,7 +3,7 @@
  * pl_exec.c		- Executor for the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -267,6 +267,7 @@ typedef struct count_param_references_context
 static void coerce_function_result_tuple(PLpgSQL_execstate *estate,
 										 TupleDesc tupdesc);
 static void plpgsql_exec_error_callback(void *arg);
+static void plpgsql_execsql_error_callback(void *arg);
 static void copy_plpgsql_datums(PLpgSQL_execstate *estate,
 								PLpgSQL_function *func);
 static void plpgsql_fulfill_promise(PLpgSQL_execstate *estate,
@@ -427,6 +428,8 @@ static bool compatible_tupdescs(TupleDesc src_tupdesc, TupleDesc dst_tupdesc);
 static HeapTuple make_tuple_from_row(PLpgSQL_execstate *estate,
 									 PLpgSQL_row *row,
 									 TupleDesc tupdesc);
+static void check_record_tupdescs_match(ExpandedRecordHeader *srcerh,
+										ExpandedRecordHeader *dsterh);
 static TupleDesc deconstruct_composite_datum(Datum value,
 											 HeapTupleData *tmptup);
 static void exec_move_row_from_datum(PLpgSQL_execstate *estate,
@@ -880,8 +883,7 @@ coerce_function_result_tuple(PLpgSQL_execstate *estate, TupleDesc tupdesc)
 			resultsize = EOH_get_flat_size(&erh->hdr);
 			tuphdr = (HeapTupleHeader) SPI_palloc(resultsize);
 			EOH_flatten_into(&erh->hdr, tuphdr, resultsize);
-			HeapTupleHeaderSetTypeId(tuphdr, tupdesc->tdtypeid);
-			HeapTupleHeaderSetTypMod(tuphdr, tupdesc->tdtypmod);
+			heap_datum_update_type(tuphdr, tupdesc);
 			estate->retval = PointerGetDatum(tuphdr);
 		}
 		else
@@ -1198,6 +1200,13 @@ plpgsql_exec_event_trigger(PLpgSQL_function *func, EventTriggerData *trigdata)
 	estate.err_text = gettext_noop("during initialization of execution state");
 	copy_plpgsql_datums(&estate, func);
 
+	estate.err_text = gettext_noop("during function entry");
+
+	/*
+	 * Set the magic variable FOUND to false
+	 */
+	exec_set_found(&estate, false);
+
 	/*
 	 * Let the instrumentation plugin peek at this function
 	 */
@@ -1301,6 +1310,37 @@ plpgsql_exec_error_callback(void *arg)
 				   estate->func->fn_signature);
 }
 
+/*
+ * error context callback used for "SELECT simple-expr INTO var"
+ *
+ * This should match the behavior of spi.c's _SPI_error_callback(),
+ * so that the construct still reports errors the same as it did
+ * before we optimized it with the simple-expression code path.
+ */
+static void
+plpgsql_execsql_error_callback(void *arg)
+{
+	PLpgSQL_expr *expr = (PLpgSQL_expr *) arg;
+	const char *query = expr->query;
+	int			syntaxerrposition;
+
+	/*
+	 * If there is a syntax error position, convert to internal syntax error;
+	 * otherwise treat the query as an item of context stack
+	 */
+	syntaxerrposition = geterrposition();
+	if (syntaxerrposition > 0)
+	{
+		errposition(0);
+		internalerrposition(syntaxerrposition);
+		internalerrquery(query);
+	}
+	else
+	{
+		errcontext("SQL statement \"%s\"", query);
+	}
+}
+
 
 /* ----------
  * Support function for initializing local execution variables
@@ -1318,8 +1358,7 @@ copy_plpgsql_datums(PLpgSQL_execstate *estate,
 	int			i;
 
 	/* Allocate local datum-pointer array */
-	estate->datums = (PLpgSQL_datum **)
-		palloc(sizeof(PLpgSQL_datum *) * ndatums);
+	estate->datums = palloc_array(PLpgSQL_datum *, ndatums);
 
 	/*
 	 * To reduce palloc overhead, we make a single palloc request for all the
@@ -1497,7 +1536,7 @@ plpgsql_fulfill_promise(PLpgSQL_execstate *estate,
 				int			lbs[1];
 				int			i;
 
-				elems = palloc(sizeof(Datum) * nelems);
+				elems = palloc_array(Datum, nelems);
 				for (i = 0; i < nelems; i++)
 					elems[i] = CStringGetTextDatum(estate->trigdata->tg_trigger->tgargs[i]);
 				dims[0] = nelems;
@@ -2340,11 +2379,11 @@ make_callstmt_target(PLpgSQL_execstate *estate, PLpgSQL_expr *expr)
 	 */
 	MemoryContextSwitchTo(estate->func->fn_cxt);
 
-	row = (PLpgSQL_row *) palloc0(sizeof(PLpgSQL_row));
+	row = palloc0_object(PLpgSQL_row);
 	row->dtype = PLPGSQL_DTYPE_ROW;
 	row->refname = "(unnamed row)";
 	row->lineno = -1;
-	row->varnos = (int *) palloc(numargs * sizeof(int));
+	row->varnos = palloc_array(int, numargs);
 
 	MemoryContextSwitchTo(get_eval_mcontext(estate));
 
@@ -3231,7 +3270,7 @@ exec_stmt_return(PLpgSQL_execstate *estate, PLpgSQL_stmt_return *stmt)
 				/* fulfill promise if needed, then handle like regular var */
 				plpgsql_fulfill_promise(estate, (PLpgSQL_var *) retvar);
 
-				/* FALL THRU */
+				pg_fallthrough;
 
 			case PLPGSQL_DTYPE_VAR:
 				{
@@ -3363,14 +3402,14 @@ exec_stmt_return_next(PLpgSQL_execstate *estate,
 				/* fulfill promise if needed, then handle like regular var */
 				plpgsql_fulfill_promise(estate, (PLpgSQL_var *) retvar);
 
-				/* FALL THRU */
+				pg_fallthrough;
 
 			case PLPGSQL_DTYPE_VAR:
 				{
 					PLpgSQL_var *var = (PLpgSQL_var *) retvar;
 					Datum		retval = var->value;
 					bool		isNull = var->isnull;
-					Form_pg_attribute attr = TupleDescAttr(tupdesc, 0);
+					Form_pg_attribute attr;
 
 					if (natts != 1)
 						ereport(ERROR,
@@ -3383,6 +3422,7 @@ exec_stmt_return_next(PLpgSQL_execstate *estate,
 														var->datatype->typlen);
 
 					/* coerce type if needed */
+					attr = TupleDescAttr(tupdesc, 0);
 					retval = exec_cast_value(estate,
 											 retval,
 											 &isNull,
@@ -3417,6 +3457,13 @@ exec_stmt_return_next(PLpgSQL_execstate *estate,
 					tuple = expanded_record_get_tuple(rec->erh);
 					if (tupmap)
 						tuple = execute_attr_map_tuple(tuple, tupmap);
+					else
+					{
+						/*
+						 * Expanded records should always have valid contents,
+						 * so we don't need a version check here.
+						 */
+					}
 					tuplestore_puttuple(estate->tuple_store, tuple);
 					MemoryContextSwitchTo(oldcontext);
 				}
@@ -3480,6 +3527,14 @@ exec_stmt_return_next(PLpgSQL_execstate *estate,
 													gettext_noop("returned record type does not match expected record type"));
 				if (tupmap)
 					tuple = execute_attr_map_tuple(tuple, tupmap);
+				else
+				{
+					/*
+					 * No need to check the version here, due to
+					 * deconstruct_composite_datum() already having checked.
+					 */
+				}
+
 				tuplestore_puttuple(estate->tuple_store, tuple);
 				ReleaseTupleDesc(retvaldesc);
 				MemoryContextSwitchTo(oldcontext);
@@ -3501,7 +3556,7 @@ exec_stmt_return_next(PLpgSQL_execstate *estate,
 		}
 		else
 		{
-			Form_pg_attribute attr = TupleDescAttr(tupdesc, 0);
+			Form_pg_attribute attr;
 
 			/* Simple scalar result */
 			if (natts != 1)
@@ -3510,6 +3565,7 @@ exec_stmt_return_next(PLpgSQL_execstate *estate,
 						 errmsg("wrong result type supplied in RETURN NEXT")));
 
 			/* coerce type if needed */
+			attr = TupleDescAttr(tupdesc, 0);
 			retval = exec_cast_value(estate,
 									 retval,
 									 &isNull,
@@ -4252,6 +4308,81 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 			}
 		}
 		stmt->mod_stmt_set = true;
+	}
+
+	/*
+	 * Some users write "SELECT expr INTO var" instead of "var := expr".  If
+	 * the expression is simple and the INTO target is a single variable, we
+	 * can bypass SPI and call ExecEvalExpr() directly.  (exec_eval_expr would
+	 * actually work for non-simple expressions too, but such an expression
+	 * might return more or less than one row, complicating matters greatly.
+	 * The potential performance win is small if it's non-simple, and any
+	 * errors we might issue would likely look different, so avoid using this
+	 * code path for non-simple cases.)
+	 */
+	if (expr->expr_simple_expr && stmt->into)
+	{
+		PLpgSQL_datum *target = estate->datums[stmt->target->dno];
+
+		if (target->dtype == PLPGSQL_DTYPE_ROW)
+		{
+			PLpgSQL_row *row = (PLpgSQL_row *) target;
+
+			if (row->nfields == 1)
+			{
+				/* OK, there is a single target variable */
+				ErrorContextCallback plerrcontext;
+				Datum		value;
+				bool		isnull;
+				Oid			valtype;
+				int32		valtypmod;
+				bool		simple;
+
+				/*
+				 * Setup error traceback support for ereport().  This is so
+				 * that error reports for the expression will look similar
+				 * whether or not we take this code path.
+				 */
+				plerrcontext.callback = plpgsql_execsql_error_callback;
+				plerrcontext.arg = expr;
+				plerrcontext.previous = error_context_stack;
+				error_context_stack = &plerrcontext;
+
+				/*
+				 * Evaluate the already-planned expression.  This fails if the
+				 * expression is busy, or if replanning occurs and we find it
+				 * is no longer simple.  In such cases, fall through to the
+				 * SPI code below.
+				 */
+				simple = exec_eval_simple_expr(estate, expr,
+											   &value, &isnull,
+											   &valtype, &valtypmod);
+
+				/*
+				 * Pop the error context stack: the code below would not use
+				 * SPI's error handling during the assignment step.
+				 */
+				error_context_stack = plerrcontext.previous;
+
+				if (simple)
+				{
+					/* Success; assign the result to the INTO target */
+					exec_assign_value(estate, estate->datums[row->varnos[0]],
+									  value, isnull, valtype, valtypmod);
+					exec_eval_cleanup(estate);
+
+					/*
+					 * We must duplicate the other effects of the code below,
+					 * as well.  We know that exactly one row was returned, so
+					 * it doesn't matter whether the INTO was STRICT or not.
+					 */
+					exec_set_found(estate, true);
+					estate->eval_processed = 1;
+
+					return PLPGSQL_RC_OK;
+				}
+			}
+		}
 	}
 
 	/*
@@ -5240,13 +5371,6 @@ exec_assign_value(PLpgSQL_execstate *estate,
 					recfield->rectupledescid = erh->er_tupdesc_id;
 				}
 
-				/* We don't support assignments to system columns. */
-				if (recfield->finfo.fnumber <= 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("cannot assign to system column \"%s\"",
-									recfield->fieldname)));
-
 				/* Cast the new value to the right type, if needed. */
 				value = exec_cast_value(estate,
 										value,
@@ -5256,7 +5380,41 @@ exec_assign_value(PLpgSQL_execstate *estate,
 										recfield->finfo.ftypeid,
 										recfield->finfo.ftypmod);
 
-				/* And assign it. */
+				/*
+				 * Edge case: the cast step can run user-defined code, which
+				 * could call the current plpgsql function recursively, and
+				 * potentially change the recfield datum underneath us.  If we
+				 * see the tupdesc ID change, repeat the lookup, and allow it
+				 * so long as the field datatype didn't change.
+				 */
+				if (unlikely(recfield->rectupledescid != erh->er_tupdesc_id))
+				{
+					ExpandedRecordFieldInfo save_finfo = recfield->finfo;
+
+					if (!expanded_record_lookup_field(erh,
+													  recfield->fieldname,
+													  &recfield->finfo))
+						ereport(ERROR,
+								(errcode(ERRCODE_UNDEFINED_COLUMN),
+								 errmsg("record \"%s\" has no field \"%s\"",
+										rec->refname, recfield->fieldname)));
+					recfield->rectupledescid = erh->er_tupdesc_id;
+					if (save_finfo.ftypeid != recfield->finfo.ftypeid ||
+						save_finfo.ftypmod != recfield->finfo.ftypmod)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("record \"%s\" field \"%s\" changed type during assignment",
+										rec->refname, recfield->fieldname)));
+				}
+
+				/* We don't support assignments to system columns. */
+				if (recfield->finfo.fnumber <= 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot assign to system column \"%s\"",
+									recfield->fieldname)));
+
+				/* All OK, assign it. */
 				expanded_record_set_field(erh, recfield->finfo.fnumber,
 										  value, isNull, !estate->atomic);
 				break;
@@ -5300,7 +5458,7 @@ exec_eval_datum(PLpgSQL_execstate *estate,
 			/* fulfill promise if needed, then handle like regular var */
 			plpgsql_fulfill_promise(estate, (PLpgSQL_var *) datum);
 
-			/* FALL THRU */
+			pg_fallthrough;
 
 		case PLPGSQL_DTYPE_VAR:
 			{
@@ -7546,6 +7704,7 @@ static TupleDesc
 deconstruct_composite_datum(Datum value, HeapTupleData *tmptup)
 {
 	HeapTupleHeader td;
+	TupleDesc	tupdesc;
 	Oid			tupType;
 	int32		tupTypmod;
 
@@ -7561,7 +7720,52 @@ deconstruct_composite_datum(Datum value, HeapTupleData *tmptup)
 	/* Extract rowtype info and find a tupdesc */
 	tupType = HeapTupleHeaderGetTypeId(td);
 	tupTypmod = HeapTupleHeaderGetTypMod(td);
-	return lookup_rowtype_tupdesc(tupType, tupTypmod);
+	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+
+	/*
+	 * The tuple might have a different version than the tupledesc. We could
+	 * check this in all callers instead, but duplicating the check doesn't
+	 * make a whole lot of sense.
+	 *
+	 * XXX: It'd be much better if we had a core API that wrapped all this,
+	 * there are many copies of this around our tree and extensions.
+	 */
+	if (HeapTupleHeaderIsVersionedDatum(td))
+		heap_datum_check(td, tupdesc);
+
+	return tupdesc;
+}
+
+/*
+ * Verify that the tuple held by srcerh may be copied directly into dsterh.
+ *
+ * It's possible that the tupledescs for the source and target have been built
+ * at different times. If so, check if they're incompatible - in that case we
+ * have no choice but to error out.
+ *
+ * XXX: It'd be nicer to do this in the ERH layer, but that'd require a few
+ * more changes and would make it harder to emit a somewhat understandable
+ * error message.
+ */
+static void
+check_record_tupdescs_match(ExpandedRecordHeader *srcerh, ExpandedRecordHeader *dsterh)
+{
+	Assert(srcerh->er_typeid == dsterh->er_typeid);
+
+	/* very common fastpath */
+	if (srcerh->er_tupdesc_id == dsterh->er_tupdesc_id)
+		return;
+
+	/*
+	 * Note that we intentionally don't use equalTupleDescs() here, since that
+	 * flags even harmless differences between the descriptors.
+	 */
+	if (!compatible_tupdescs(expanded_record_get_tupdesc(srcerh),
+							 expanded_record_get_tupdesc(dsterh)))
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("assigned value is incompatible with the variable's type"),
+				errdetail("A variable can retain the type definition established when it was first used."));
 }
 
 /*
@@ -7642,6 +7846,16 @@ exec_move_row_from_datum(PLpgSQL_execstate *estate,
 				 (erh->er_typmod == rec->erh->er_typmod &&
 				  erh->er_typmod >= 0)))
 			{
+				/*
+				 * Check if the tuple descriptors are compatible. It may seem
+				 * tempting to just not enter the surrounding "if" if the
+				 * er_tupdesc_id doesn't match, but the fieldwise-assignment
+				 * path differs behaviorally, due to not copying the ctid
+				 * along. As the er_tupdesc_id can increment due to
+				 * invalidation processing, that would lead to unpredictable
+				 * behavior.
+				 */
+				check_record_tupdescs_match(erh, rec->erh);
 				expanded_record_set_tuple(rec->erh, erh->fvalue,
 										  true, !estate->atomic);
 				return;
@@ -7665,6 +7879,8 @@ exec_move_row_from_datum(PLpgSQL_execstate *estate,
 				(rec->rectypeid == RECORDOID ||
 				 rec->rectypeid == erh->er_typeid))
 			{
+				/* check comment above previous call */
+				check_record_tupdescs_match(erh, newerh);
 				expanded_record_set_tuple(newerh, erh->fvalue,
 										  true, !estate->atomic);
 				assign_record_var(estate, rec, newerh);
@@ -8604,6 +8820,15 @@ exec_set_found(PLpgSQL_execstate *estate, bool state)
 	PLpgSQL_var *var;
 
 	var = (PLpgSQL_var *) (estate->datums[estate->found_varno]);
+
+	/*
+	 * Use pg_assume() to avoid a spurious warning with some compilers, by
+	 * telling the compiler that the VARATT_IS_EXTERNAL_NON_EXPANDED() branch
+	 * in assign_simple_var() will never be reached when called from here, due
+	 * to "found" being a boolean (i.e. a byvalue type), not a varlena.
+	 */
+	pg_assume(var->datatype->typlen != -1);
+
 	assign_simple_var(estate, var, BoolGetDatum(state), false, false);
 }
 
@@ -8804,7 +9029,7 @@ assign_simple_var(PLpgSQL_execstate *estate, PLpgSQL_var *var,
 		 * pain, but there's little choice.
 		 */
 		oldcxt = MemoryContextSwitchTo(get_eval_mcontext(estate));
-		detoasted = PointerGetDatum(detoast_external_attr((struct varlena *) DatumGetPointer(newvalue)));
+		detoasted = PointerGetDatum(detoast_external_attr((varlena *) DatumGetPointer(newvalue)));
 		MemoryContextSwitchTo(oldcxt);
 		/* Now's a good time to not leak the input value if it's freeable */
 		if (freeable)

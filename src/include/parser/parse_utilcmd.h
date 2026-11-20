@@ -4,7 +4,7 @@
  *		parse analysis for utility commands
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, PGSTY PTE. LTD.
  * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
@@ -18,7 +18,7 @@
 
 #include "parser/parse_node.h"
 
-struct AttrMap;					/* avoid including attmap.h here */
+typedef struct AttrMap AttrMap; /* avoid including attmap.h here */
 
 
 /* Extensions may restore an index AM from constraint metadata before
@@ -38,7 +38,8 @@ extern CreateStatsStmt *transformStatsStmt(Oid relid, CreateStatsStmt *stmt,
 										   const char *queryString);
 extern void transformRuleStmt(RuleStmt *stmt, const char *queryString,
 							  List **actions, Node **whereClause);
-extern List *transformCreateSchemaStmtElements(List *schemaElts,
+extern List *transformCreateSchemaStmtElements(ParseState *pstate,
+											   List *schemaElts,
 											   const char *schemaName);
 extern PartitionBoundSpec *transformPartitionBound(ParseState *pstate, Relation parent,
 												   PartitionBoundSpec *spec);
@@ -46,7 +47,7 @@ extern List *expandTableLikeClause(RangeVar *heapRel,
 								   TableLikeClause *table_like_clause);
 extern IndexStmt *generateClonedIndexStmt(RangeVar *heapRel,
 										  Relation source_idx,
-										  const struct AttrMap *attmap,
+										  const AttrMap *attmap,
 										  Oid *constraintOid);
 
 #endif							/* PARSE_UTILCMD_H */
