@@ -14,6 +14,7 @@ OBJS = \
 	src/mys_auth.o \
 	src/mys_stmt.o \
 	src/mys_txn.o \
+	src/mys_current_read.o \
 	src/mys_semantics.o \
 	src/mysql_parser.o \
 	src/mys_compat.o \

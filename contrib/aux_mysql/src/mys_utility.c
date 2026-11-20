@@ -70,6 +70,7 @@
 #include "mys_fk.h"
 #include "mys_parsenodes.h"
 #include "mys_generated_policy.h"
+#include "mys_current_read.h"
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
@@ -2509,10 +2510,17 @@ static PlannedStmt *
 mys_planner(Query *query, const char *queryString, int cursorOptions,
 			ParamListInfo params, ExplainState *es)
 {
+	PlannedStmt *stmt;
+	bool		has_row_security = query->hasRowSecurity;
+
 	mys_assign_bool_as_int(query);
 	if (prev_planner)
-		return prev_planner(query, queryString, cursorOptions, params, es);
-	return standard_planner(query, queryString, cursorOptions, params, es);
+		stmt = prev_planner(query, queryString, cursorOptions, params, es);
+	else
+		stmt = standard_planner(query, queryString, cursorOptions, params, es);
+	if (mys_is_mysql_session())
+		mys_current_read_plan(stmt, has_row_security);
+	return stmt;
 }
 
 /*
@@ -2975,6 +2983,7 @@ void
 mysql_utility_init(void)
 {
 	mys_fk_init();
+	mys_current_read_init();
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = mys_ProcessUtility;
 	prev_ExecutorStart = ExecutorStart_hook;

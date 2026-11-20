@@ -90,6 +90,7 @@ PG19-specific and recovery checks:
 ```sh
 python3 tests/pg19_kernel.py
 python3 tests/release_review.py
+python3 tests/point_write_concurrency.py
 python3 tests/pg19_upgrade.py --old-prefix /path/to/openhalo18-aux2 \
   --new-prefix /path/to/openhalo19 --work-dir /tmp/openhalo-major-upgrade
 python3 tests/release_roundtrip.py
@@ -111,6 +112,22 @@ input/output spanning MySQL's 16 MiB frame boundary; and eight concurrent native
 PG/MySQL writers with committed and rolled-back updates. It requires a superuser
 PG connection and a TLS/SCRAM fixture, creates unique roles/schema, and removes
 them on exit. RSA checks explicitly disable client TLS auto-upgrade.
+
+`point_write_concurrency.py` observes lock waits to force DELETE/INSERT races;
+checks UPDATE values and predicates, composite/text keys, binary parameters,
+native writers, triggers, cached plans and index invalidation; and verifies
+whole-transaction rollback and SQLSTATE 40001 after deadlocks. It also checks
+that idle transaction timeouts do not disconnect an already-rolled-back victim.
+Cancellation/lock-timeout cases must retain earlier writes. Use `--reference`
+with `MYSQL_HOST`/`MYSQL_PORT` for the portable cases against MySQL 5.7;
+OpenHalo-only cases require a superuser PG connection. Both modes use a unique
+schema and remove it on exit.
+
+`sysbench.sh` retries only 1213/1205. Errors 1062/1020 fail the workload immediately.
+Its exit status still requires zero ignored errors, including genuine deadlocks;
+report the completed workloads and retry counts separately. `MYSQL_HOST` selects
+the target for reference comparisons. See [the concurrency report](CONCURRENCY-19.0.0.md)
+for the fix and subsequent stress runs.
 
 For full upstream coverage, configure with `--enable-tap-tests
 --enable-injection-points` and the libraries for the selected optional modules,

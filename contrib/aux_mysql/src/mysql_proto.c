@@ -630,6 +630,8 @@ mys_sqlstate(int sqlerrcode)
 {
 	switch (sqlerrcode)
 	{
+		case ERRCODE_T_R_DEADLOCK_DETECTED:
+			return "40001";
 		case ERRCODE_MYS_USER_LOCK_WRONG_NAME:
 			return "42000";
 		case ERRCODE_MYS_USER_LOCK_DEADLOCK:
@@ -656,6 +658,7 @@ mys_sqlstate(int sqlerrcode)
 void
 mys_send_error(int sqlerrcode, const char *msg)
 {
+	mys_txn_note_error(sqlerrcode);
 	mys_send_err(mys_errno(sqlerrcode), mys_sqlstate(sqlerrcode), msg);
 }
 
@@ -1428,9 +1431,6 @@ mys_sync_selected_database(void)
 static void
 mys_send_ready_for_query(CommandDest dest)
 {
-	/* after an error inside a transaction: statement-level rollback */
-	mys_txn_recover();
-
 	if (!handshake_done)
 	{
 		/* An installation error must close the connection, never send OK. */
@@ -2010,6 +2010,7 @@ mys_send_message(ErrorData *edata)
 		return;
 	}
 
+	mys_txn_note_error(edata->sqlerrcode);
 	msg = edata->message ? edata->message : "missing error text";
 	/* a key (a unique violation, ...): its MySQL name, not the PostgreSQL one */
 	if (edata->constraint_name)
@@ -2642,6 +2643,7 @@ const ProtocolExtensionConfig mysql_protocol_config = {
 	.foreign_key_insert = mys_pending_fk_check_insert,
 	.sequence_write = mys_sequence_write,
 	.on_conflict_row = mys_record_upsert_row,
+	.prepare_for_query = mys_txn_recover,
 };
 
 bool

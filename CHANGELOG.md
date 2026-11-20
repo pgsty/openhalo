@@ -17,6 +17,14 @@ version is `19.0.0`, reported by `SHOW openhalo.version` and MySQL
 
 ## 19.0.0 (unreleased)
 
+- Fix concurrent MySQL unique-key UPDATE/DELETE skipping a row deleted and
+  reinserted by another transaction, which made sysbench's following INSERT
+  fail with 1062. Resolve the current row under a tuple lock before evaluating
+  predicates and writes; preserve native PG and transaction-snapshot semantics.
+- Roll back the whole transaction after deadlocks/serialization failures and
+  report 1213 / 40001. Recover before setting idle state/timeouts so a rolled-back
+  connection is not treated as idle in a transaction. Add deterministic races
+  and remove 1062/1020 from sysbench's retry list.
 - Add a single product version definition and read-only `openhalo.version` /
   MySQL `version_comment` identifiers, separate from the kernel and SQL versions.
 - Accept keyword `version` in scoped/unscoped MySQL SET statements and reject
@@ -38,7 +46,9 @@ version is `19.0.0`, reported by `SHOW openhalo.version` and MySQL
   migration boundaries. This is development work, not a published release.
 - See the [19.0.0 review report](contrib/aux_mysql/REVIEW-19.0.0.md) for the new
   cross-platform, sanitizer, PGXS, replication and compatibility test round,
-  including the sysbench concurrency limitation.
+  including the original sysbench failure. The
+  [concurrency investigation](contrib/aux_mysql/CONCURRENCY-19.0.0.md) records its
+  subsequent fixes and validation.
 
 ## v18.6.1
 

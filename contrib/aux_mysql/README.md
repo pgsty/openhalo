@@ -56,11 +56,21 @@ is still controlled by `mysql.halo_mysql_version`.
   (as in MySQL, a statement touching a table, COMMIT / ROLLBACK or DDL spends it).
   Access modes take effect (read-only writes report 1792). Isolation follows what MySQL applications rely
   on: READ UNCOMMITTED, READ COMMITTED and read-write REPEATABLE READ run as PostgreSQL READ COMMITTED
-  (latest committed rows, no serialization failures, as InnoDB's writes see), read-only REPEATABLE READ
+  (statement snapshots; unique-key current writes are described below), read-only REPEATABLE READ
   and `START TRANSACTION WITH CONSISTENT SNAPSHOT` get a real snapshot, SERIALIZABLE is PostgreSQL's,
   and serialization failures report 1213 (SQLSTATE 40001) so drivers retry them as deadlocks.
+  Deadlocks and serialization failures roll back the entire transaction; ordinary statement
+  failures, cancellation and lock timeouts retain the statement-level rollback behavior.
   `SET GLOBAL read_only` / `super_read_only` stop writes per statement (1290) for ordinary users / for
   everyone, including persistent sequence writes; temporary tables stay writable.
+- **Concurrent point writes**: single-table UPDATE/DELETE by a complete, immediate B-tree unique key
+  on ordinary heap tables, with a direct SeqScan/IndexScan plan, lock the current row before evaluating
+  predicates and new values. A concurrent DELETE/INSERT of
+  the same key is resolved by repeating the key lookup after waiting. Composite and text keys and
+  prepared parameters are supported. Native PG connections and transaction-snapshot isolation keep
+  PostgreSQL semantics. RLS, joins, ranges, partial/expression indexes and absent-key gap locking are
+  outside this path. Real duplicate keys still report 1062; multi-key deadlocks require transaction
+  retries. See the [concurrency investigation](CONCURRENCY-19.0.0.md).
 - **Semantics**: `/` returns DECIMAL, `DIV`, division by zero gives NULL plus a warning (error 1365 in strict
   mode), case-insensitive string columns by default (`*_ci`; `*_bin` and a non-`_ci` table `COLLATE=` stay
   case-sensitive), lenient conversions when `sql_mode` is not strict, `ON UPDATE CURRENT_TIMESTAMP`,

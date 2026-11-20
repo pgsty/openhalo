@@ -212,6 +212,7 @@ extern List *mys_txn_apply(List *stmts, List **infos);
 extern void mys_txn_stmt_done(MysStmtInfo *info);
 extern bool mys_txn_skip_control(MysStmtInfo *info);
 extern void mys_txn_recover(void);
+extern void mys_txn_note_error(int sqlerrcode);
 extern List *mys_txn_deferred_error(ErrorData *edata);
 extern bool mys_txn_is_deferred_error(Node *stmt);
 extern void mys_txn_raise_deferred_error(void);

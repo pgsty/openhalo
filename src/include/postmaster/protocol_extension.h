@@ -112,6 +112,9 @@ typedef struct ProtocolExtensionConfig
 	void		(*sequence_write) (struct RelationData *sequence);
 	void		(*on_conflict_row) (struct TupleTableSlot *oldslot,
 								struct TupleTableSlot *newslot, uint64 deleted);
+
+	/* Recover protocol transaction state before idle status/timeouts are set. */
+	void		(*prepare_for_query) (void);
 } ProtocolExtensionConfig;
 
 /*

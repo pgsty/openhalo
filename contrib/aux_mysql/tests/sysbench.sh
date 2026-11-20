@@ -8,17 +8,17 @@
 #   MYSQL_PORT=3306 THREADS=8 TIME=20 tests/sysbench.sh
 #
 # Needs schema "test" and user dbuser_mysql / Mysql.123 (kernel_instance.sh).
-# Ignored errors: 1213/1205 are in sysbench's default list; 1062 comes from
-# concurrent DELETE id=?; INSERT id=? on the same row, which PostgreSQL's
-# READ COMMITTED does not serialize the way InnoDB locking reads do; 1020 is
-# the matching "record has changed" case.
+# Only normal deadlocks/lock timeouts are retryable. A duplicate key (1062)
+# or record-changed error (1020) must fail immediately. The summary retains
+# a strict zero-retry gate, even though valid multi-key workloads can deadlock.
 set -eu
+HOST=${MYSQL_HOST:-127.0.0.1}
 PORT=${MYSQL_PORT:-3306}
 THREADS=${THREADS:-8}
 TIME=${TIME:-20}
 TABLES=${TABLES:-4}
 SIZE=${SIZE:-20000}
-COMMON="--db-driver=mysql --mysql-host=127.0.0.1 --mysql-port=$PORT --mysql-user=dbuser_mysql
+COMMON="--db-driver=mysql --mysql-host=$HOST --mysql-port=$PORT --mysql-user=dbuser_mysql
   --mysql-password=Mysql.123 --mysql-db=test --tables=$TABLES --table-size=$SIZE"
 fail=0
 completed=0
@@ -29,7 +29,7 @@ sysbench oltp_read_write $COMMON cleanup >/dev/null 2>&1 || true
 sysbench oltp_read_write $COMMON prepare >/dev/null
 for t in oltp_point_select oltp_read_only oltp_read_write oltp_write_only; do
   out=$(sysbench $t $COMMON --threads=$THREADS --time=$TIME --report-interval=0 \
-        --mysql-ignore-errors=1062,1213,1205,1020 run 2>&1) || { printf '%s\n' "$out" > "$LOG_DIR/$t.log"; echo "== $t: FAILED"; echo "$out" | tail -5; fail=1; continue; }
+        --mysql-ignore-errors=1213,1205 run 2>&1) || { printf '%s\n' "$out" > "$LOG_DIR/$t.log"; echo "== $t: FAILED"; echo "$out" | tail -5; fail=1; continue; }
   printf '%s\n' "$out" > "$LOG_DIR/$t.log"
   completed=$((completed+1))
   tps=$(echo "$out" | awk '/transactions:/ {gsub(/[(]/,"",$3); print $3}')

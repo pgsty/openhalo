@@ -53,6 +53,7 @@ bool		halo_mysql_statement_rollback = true;
 
 /* nest level of the hidden savepoint of the running statement, 0 if none */
 static int	stmt_savepoint_level = 0;
+static bool abort_transaction = false;
 
 /* value of a SET autocommit = <expr>, or -1 if it is not a constant */
 static int
@@ -433,16 +434,38 @@ mys_txn_stmt_done(MysStmtInfo *info)
 		stmt_savepoint_level = 0;
 }
 
+/* Only errors sent to the client count; a caught server-side error does not. */
+void
+mys_txn_note_error(int sqlerrcode)
+{
+	if (sqlerrcode == ERRCODE_T_R_DEADLOCK_DETECTED ||
+		sqlerrcode == ERRCODE_T_R_SERIALIZATION_FAILURE)
+		abort_transaction = true;
+}
+
 /*
- * ReadyForQuery after an error: if the failed statement ran under its
+ * Before idle status/timeouts after an error: if the failed statement ran under its
  * hidden savepoint, roll back to it so that the transaction goes on, as in
- * MySQL.  (PostgresMain has already aborted the subtransaction.)
+ * MySQL. Deadlocks/serialization failures (1213) must instead roll back the
+ * entire transaction, including writes before the hidden savepoint. Otherwise
+ * a client's retry BEGIN could implicitly commit those earlier writes.
+ * (PostgresMain has already aborted the current subtransaction.)
  */
 void
 mys_txn_recover(void)
 {
 	MemoryContext oldcxt;
 
+	if (abort_transaction)
+	{
+		abort_transaction = false;
+		stmt_savepoint_level = 0;
+		oldcxt = CurrentMemoryContext;
+		AbortOutOfAnyTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		mys_statement_done(true, false);
+		return;
+	}
 	if (stmt_savepoint_level == 0)
 		return;
 	if (IsAbortedTransactionBlockState() &&

@@ -86,15 +86,20 @@ behavior failures, not leak freedom. Builds and test databases are disposable.
 
 ## Concurrency result and remaining boundaries
 
-The eight-thread sysbench run completed all four workloads, 30 seconds each,
+The following records the pre-fix run. A subsequent
+[concurrency investigation](CONCURRENCY-19.0.0.md) reproduced the skipped-row
+race, implemented current unique-key writes and corrected deadlock recovery.
+The original failures remain recorded here rather than relabeled as passes.
+
+The initial eight-thread sysbench run completed all four workloads, 30 seconds each,
 with four 20,000-row tables and server-side prepared statements. Point reads and
 read-only transactions had zero ignored errors. Read/write and write-only runs
 reported **60 and 459** ignored errors respectively; the server log identifies
 duplicate primary-key conflicts during concurrent DELETE/INSERT on the same
 rows. The harness therefore returned failure for its strict zero-error gate
 (`completed=4/4`, `error_free=2/4`). A separate one-thread run passed **4/4** with
-zero errors. These results do not establish InnoDB-equivalent locking behavior;
-applications using this pattern must handle transaction retries. No performance
+zero errors. The follow-up fixes this existing-row point-write race; full
+InnoDB-equivalent locking is not implemented. No performance
 baseline is claimed while other builds and tests share the host.
 
 There is no aux_mysql **1.x → 2.0** update script. The major-upgrade rehearsal
@@ -119,7 +124,7 @@ platform-specific suites. These are separate from the regression-test counts
 above. No failing test or make error was reported in that final invocation.
 
 The reviewed changes are suitable for the development main branch within this
-documented scope. The sysbench zero-error gate did not pass, and this review
+documented scope. The initial sysbench zero-error gate did not pass, and this review
 does not qualify a direct aux_mysql 1.x upgrade or constitute a production
 release certification.
 

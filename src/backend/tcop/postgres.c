@@ -4679,6 +4679,10 @@ PostgresMain(const char *dbname, const char *username)
 		 */
 		if (send_ready_for_query)
 		{
+			/* A protocol may roll back a statement or the whole transaction. */
+			if (MyProtocolExtension && MyProtocolExtension->prepare_for_query)
+				MyProtocolExtension->prepare_for_query();
+
 			if (IsAbortedTransactionBlockState())
 			{
 				set_ps_display("idle in transaction (aborted)");
