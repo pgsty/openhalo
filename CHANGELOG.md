@@ -17,6 +17,14 @@ version is `19.0.0`, reported by `SHOW openhalo.version` and MySQL
 
 ## 19.0.0 (unreleased)
 
+- Check for deadlocks when MySQL tuple/transaction lock waits enter the queue,
+  avoiding repeated one-second detection delays in hotspot workloads. Preserve
+  timed fallback, ordinary waits, native PG behavior and lock-wait log thresholds;
+  add the administrator-controlled `mysql.early_deadlock_check` switch.
+- Apply current unique-key writes to BitmapHeapScan plans too. Sustained writes
+  could change the cost-based plan and reintroduce skipped deletes and 1062.
+  Add deterministic cycle, cancellation, ledger-based transfer and repeated
+  sysbench tests; see the [hotspot report](contrib/aux_mysql/HOTSPOT-19.0.0.md).
 - Fix concurrent MySQL unique-key UPDATE/DELETE skipping a row deleted and
   reinserted by another transaction, which made sysbench's following INSERT
   fail with 1062. Resolve the current row under a tuple lock before evaluating

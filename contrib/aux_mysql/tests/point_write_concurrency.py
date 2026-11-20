@@ -351,6 +351,19 @@ class Suite:
                   'UPDATE t SET v=v+1 WHERE id=1', 1, ((1, 11),),
                   setup=lambda c: query(c, "SELECT set_config('enable_indexscan','off',false),"
                                            "set_config('enable_bitmapscan','off',false)"))
+        # Repeated writes grow the heap enough to make bitmap plans attractive.
+        # Point-write semantics must survive that cost-driven plan change.
+        def bitmap(c):
+            query(c, "SELECT set_config('enable_indexscan','off',false),"
+                     "set_config('enable_seqscan','off',false)")
+            plan = query(c, 'EXPLAIN DELETE FROM t WHERE id=1')
+            assert any('MySQL Current Read' in row[0] for row in plan), plan
+        self.race('bitmap point delete/reinsert', replace, 'DELETE FROM t WHERE id=1',
+                  1, ((1, 20),), after='INSERT INTO t VALUES(1,20)', setup=bitmap)
+        self.race('bitmap point update rechecks predicate', replace,
+                  'UPDATE t SET v=v+1 WHERE id=1 AND v=10', 1, ((1, 11),), setup=bitmap)
+        self.race('bitmap point update rejects changed predicate', replace,
+                  'UPDATE t SET v=v+1 WHERE id=1 AND v=0', 0, ((1, 10),), setup=bitmap)
         # A true transaction snapshot must continue to reject a concurrent change.
         a, b = self.connect(), self.connect()
         try:

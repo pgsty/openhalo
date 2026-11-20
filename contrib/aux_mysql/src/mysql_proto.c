@@ -2644,6 +2644,7 @@ const ProtocolExtensionConfig mysql_protocol_config = {
 	.sequence_write = mys_sequence_write,
 	.on_conflict_row = mys_record_upsert_row,
 	.prepare_for_query = mys_txn_recover,
+	.early_deadlock_check = mys_early_deadlock_check,
 };
 
 bool

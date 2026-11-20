@@ -150,7 +150,8 @@ mys_current_read_plan(PlannedStmt *stmt, bool has_row_security)
 		return;
 	modify = (ModifyTable *) stmt->planTree;
 	if (list_length(modify->resultRelations) != 1 ||
-		!(IsA(outerPlan(modify), IndexScan) || IsA(outerPlan(modify), SeqScan)))
+		!(IsA(outerPlan(modify), IndexScan) || IsA(outerPlan(modify), SeqScan) ||
+		  IsA(outerPlan(modify), BitmapHeapScan)))
 		return;
 	scan = (Scan *) outerPlan(modify);
 	if (scan->scanrelid != linitial_int(modify->resultRelations))
@@ -158,6 +159,8 @@ mys_current_read_plan(PlannedStmt *stmt, bool has_row_security)
 	quals = list_copy(scan->plan.qual);
 	if (IsA(scan, IndexScan))
 		quals = list_concat(quals, list_copy(((IndexScan *) scan)->indexqualorig));
+	else if (IsA(scan, BitmapHeapScan))
+		quals = list_concat(quals, list_copy(((BitmapHeapScan *) scan)->bitmapqualorig));
 	rte = list_nth_node(RangeTblEntry, stmt->rtable, scan->scanrelid - 1);
 	if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_RELATION)
 		return;
@@ -196,6 +199,9 @@ mys_current_read_plan(PlannedStmt *stmt, bool has_row_security)
 			current->scan = *scan;
 			NodeSetTag(current, T_CustomScan);
 			current->scan.plan.qual = quals;
+			/* The unique-key lookup replaces the bitmap producer as well. */
+			outerPlan(current) = NULL;
+			innerPlan(current) = NULL;
 			current->custom_private = list_make1(makeInteger(indexid));
 			current->custom_exprs = keys;
 			current->custom_relids = bms_make_singleton(scan->scanrelid);

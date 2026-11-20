@@ -50,6 +50,7 @@ extern void mys_clear_selected_database_if_matches(const char *db);
 extern void mys_sync_selected_database(void);
 extern void halo_mysql_ensure_extension(void);
 extern void halo_mysql_lock_setup(void);
+extern bool mys_early_deadlock_check(const struct LOCKTAG *locktag);
 extern bool mys_foreign_key_checks(void);
 extern void mys_sync_foreign_key_checks(void);
 extern void mys_sync_session_state(void);

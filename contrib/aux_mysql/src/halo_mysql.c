@@ -50,6 +50,7 @@ int			halo_mysql_parser = MYS_PARSER_MYSQL;
 int			halo_mysql_protocol_id = 0;
 int			halo_mysql_auth_plugin = MYS_AUTH_CACHING_SHA2;
 static bool halo_mysql_auto_create_extension = true;
+static bool halo_mysql_early_deadlock_check = true;
 static char *openhalo_version = NULL;
 
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -162,6 +163,15 @@ current_insert_ignore(void)
 	return info != NULL && info->ignore;
 }
 
+/* Row contention needs prompt detection, without changing DDL/advisory waits. */
+bool
+mys_early_deadlock_check(const LOCKTAG *locktag)
+{
+	return halo_mysql_early_deadlock_check &&
+		(locktag->locktag_type == LOCKTAG_TUPLE ||
+		 locktag->locktag_type == LOCKTAG_TRANSACTION);
+}
+
 void
 _PG_init(void)
 {
@@ -270,6 +280,15 @@ _PG_init(void)
 							 &halo_mysql_statement_rollback,
 							 true,
 							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("mysql.early_deadlock_check",
+							 "Check for deadlocks before MySQL row/transaction lock waits.",
+							 "The normal deadlock_timeout remains a fallback and the "
+							 "threshold for lock-wait logging. Off restores timed checks only.",
+							 &halo_mysql_early_deadlock_check,
+							 true,
+							 PGC_SUSET, 0,
 							 NULL, NULL, NULL);
 
 	DefineCustomStringVariable("mysql.default_collation",

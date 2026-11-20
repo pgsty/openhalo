@@ -34,6 +34,7 @@ struct Port;
 struct ErrorData;
 struct TupleTableSlot;
 struct RelationData;
+struct LOCKTAG;
 
 /* Maximum number of protocol extensions that can be registered */
 #define MAX_PROTOCOL_EXTENSIONS 8
@@ -115,6 +116,9 @@ typedef struct ProtocolExtensionConfig
 
 	/* Recover protocol transaction state before idle status/timeouts are set. */
 	void		(*prepare_for_query) (void);
+
+	/* Request one deadlock check before sleeping on a heavyweight lock. */
+	bool		(*early_deadlock_check) (const struct LOCKTAG *locktag);
 } ProtocolExtensionConfig;
 
 /*

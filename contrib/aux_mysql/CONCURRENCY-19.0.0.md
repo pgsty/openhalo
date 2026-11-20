@@ -6,6 +6,10 @@ This follows the failing eight-thread sysbench run recorded in
 [REVIEW-19.0.0.md](REVIEW-19.0.0.md). The fixes and tests below concern the
 development main branch; no release or deployment is implied.
 
+The later [hotspot investigation](HOTSPOT-19.0.0.md) adds early deadlock detection
+and fixes the BitmapHeapScan gap exposed by sustained high-contention writes.
+The results below describe the earlier round and are retained as its baseline.
+
 ## Root cause: a deleted tuple is not a reinserted key
 
 The failure is reproducible with two transactions and one existing primary key:

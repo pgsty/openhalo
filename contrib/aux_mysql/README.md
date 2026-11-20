@@ -29,6 +29,7 @@ is still controlled by `mysql.halo_mysql_version`.
 | `mysql.auth_cache_size` | 1024 | caching_sha2_password fast-auth cache entries, 0 disables (restart) |
 | `mysql.rsa_private_key_file` | `mysql_rsa_private_key.pem` | RSA key for the public key exchange, generated in the data directory if missing (restart) |
 | `mysql.statement_rollback` | on | a failing statement inside a transaction rolls back only itself (hidden savepoints) |
+| `mysql.early_deadlock_check` | on | check immediately before MySQL tuple/transaction lock waits; superuser SET/reload; `deadlock_timeout` remains the fallback and log-wait threshold |
 | `mysql.default_collation` | `case_insensitive` | collation (schema `mysql`) of string columns without COLLATE; empty: database default |
 | `mysql.parser` | `mysql` | dialect of queries over the MySQL protocol: `mysql` or `postgres` |
 
@@ -64,13 +65,18 @@ is still controlled by `mysql.halo_mysql_version`.
   `SET GLOBAL read_only` / `super_read_only` stop writes per statement (1290) for ordinary users / for
   everyone, including persistent sequence writes; temporary tables stay writable.
 - **Concurrent point writes**: single-table UPDATE/DELETE by a complete, immediate B-tree unique key
-  on ordinary heap tables, with a direct SeqScan/IndexScan plan, lock the current row before evaluating
+  on ordinary heap tables, with a direct SeqScan/IndexScan/BitmapHeapScan plan, lock the current row before evaluating
   predicates and new values. A concurrent DELETE/INSERT of
   the same key is resolved by repeating the key lookup after waiting. Composite and text keys and
   prepared parameters are supported. Native PG connections and transaction-snapshot isolation keep
   PostgreSQL semantics. RLS, joins, ranges, partial/expression indexes and absent-key gap locking are
   outside this path. Real duplicate keys still report 1062; multi-key deadlocks require transaction
   retries. See the [concurrency investigation](CONCURRENCY-19.0.0.md).
+- **Hotspot deadlocks**: MySQL row and transaction lock waits check for cycles immediately after
+  entering the wait queue. The existing detector can reorder waiters or abort a deadlock victim;
+  ordinary contention continues waiting. Native PG, DDL and advisory waits keep their timed checks.
+  `mysql.early_deadlock_check = off` restores timed checks for MySQL too. The regular timeout remains
+  a fallback when a cycle forms later. See [hotspot validation](HOTSPOT-19.0.0.md).
 - **Semantics**: `/` returns DECIMAL, `DIV`, division by zero gives NULL plus a warning (error 1365 in strict
   mode), case-insensitive string columns by default (`*_ci`; `*_bin` and a non-`_ci` table `COLLATE=` stay
   case-sensitive), lenient conversions when `sql_mode` is not strict, `ON UPDATE CURRENT_TIMESTAMP`,

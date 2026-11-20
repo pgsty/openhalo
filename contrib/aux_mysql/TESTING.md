@@ -91,6 +91,7 @@ PG19-specific and recovery checks:
 python3 tests/pg19_kernel.py
 python3 tests/release_review.py
 python3 tests/point_write_concurrency.py
+python3 tests/hotspot_deadlocks.py
 python3 tests/pg19_upgrade.py --old-prefix /path/to/openhalo18-aux2 \
   --new-prefix /path/to/openhalo19 --work-dir /tmp/openhalo-major-upgrade
 python3 tests/release_roundtrip.py
@@ -128,6 +129,29 @@ Its exit status still requires zero ignored errors, including genuine deadlocks;
 report the completed workloads and retry counts separately. `MYSQL_HOST` selects
 the target for reference comparisons. See [the concurrency report](CONCURRENCY-19.0.0.md)
 for the fix and subsequent stress runs.
+
+`hotspot_deadlocks.py` checks eager detection in 2/3/16-session cycles, the timed
+fallback and disable switch, native/mixed sessions, ordinary waits, cancellation,
+lock timeouts and soft cycles resolved by queue reordering. Two 16-thread transfer
+runs compare every balance against a commit ledger, including retries without
+an explicit MySQL ROLLBACK. It requires administrative PG/MySQL connections;
+`MYSQL_ADMIN_USER`/`MYSQL_ADMIN_PASSWORD` default to `PGUSER`/`PGPASSWORD`.
+
+For repeated sysbench hotspot stress, use a disposable fixture and an output
+directory outside the source tree:
+
+```sh
+python3 tests/hotspot_stress.py --output /tmp/openhalo-hotspot-16 \
+  --threads 16 --size 100 --seconds 30 --repeat 3
+```
+
+The stress runner creates/removes a unique schema, varies the seed between
+repetitions, records mean/P99/maximum latency and retries, and verifies primary
+key cardinality/range/sum after every workload. Only 1213 is retryable; 1062,
+1205 and other errors fail. It stops failed sysbench workers promptly, records
+the failure and enforces a bounded drain time. This does not change
+`sysbench.sh`'s stricter zero-retry gate. `--protocol disable` exercises text
+queries; `--distribution uniform` changes the key distribution.
 
 For full upstream coverage, configure with `--enable-tap-tests
 --enable-injection-points` and the libraries for the selected optional modules,
