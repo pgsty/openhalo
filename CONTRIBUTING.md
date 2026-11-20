@@ -8,7 +8,7 @@ is the statement, what MySQL returns and what OpenHalo returns.
 
 | Branch | Content |
 | :--- | :--- |
-| `codex/pg19.0` | OpenHalo 19: PostgreSQL 19.0 with protocol and execution hooks, plus `contrib/aux_mysql` |
+| `main` | OpenHalo 19 development: PostgreSQL 19.0 with protocol and execution hooks, plus `contrib/aux_mysql` |
 | `pg14` | openHalo 1.0 on PostgreSQL 14 (tag `v1.0-pg14`); historical source of the imported MySQL grammar and SQL layer |
 
 Releases are tagged `v<PostgreSQL version>.<revision>` on the release branch; see [`CHANGELOG.md`](CHANGELOG.md).
