@@ -24,6 +24,7 @@
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "openhalo_version.h"
 #include "pgstat.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -49,6 +50,7 @@ int			halo_mysql_parser = MYS_PARSER_MYSQL;
 int			halo_mysql_protocol_id = 0;
 int			halo_mysql_auth_plugin = MYS_AUTH_CACHING_SHA2;
 static bool halo_mysql_auto_create_extension = true;
+static char *openhalo_version = NULL;
 
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -167,6 +169,15 @@ _PG_init(void)
 	if (!process_shared_preload_libraries_in_progress)
 		ereport(ERROR,
 				(errmsg("aux_mysql must be loaded via \"shared_preload_libraries\"")));
+
+	DefineCustomStringVariable("openhalo.version",
+							   "OpenHalo software version.",
+							   NULL,
+							   &openhalo_version,
+							   OPENHALO_VERSION,
+							   PGC_INTERNAL, GUC_NOT_IN_SAMPLE,
+							   NULL, NULL, NULL);
+	MarkGUCPrefixReserved("openhalo");
 
 	DefineCustomBoolVariable("mysql.listener_on",
 							 "Enable the MySQL protocol listener.",

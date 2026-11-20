@@ -1208,7 +1208,7 @@ ExecInsert(ModifyTableContext *context,
 						if (MyProtocolExtension && MyProtocolExtension->on_conflict_row)
 							MyProtocolExtension->on_conflict_row(slot, slot, 0);
 						return resultRelInfo->ri_projectReturning ?
-							ExecProcessReturning(context, resultRelInfo, CMD_INSERT,
+							ExecProcessReturning(context, resultRelInfo, false,
 											 slot, slot, planSlot) : NULL;
 					}
 					goto vlock; /* more than one unique key can delete more rows */

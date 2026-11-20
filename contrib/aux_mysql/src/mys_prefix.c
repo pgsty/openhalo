@@ -1,5 +1,5 @@
 /*-------------------------------------------------------------------------
- * Exact MySQL prefix indexes on PostgreSQL 18.
+ * Exact MySQL prefix indexes on PostgreSQL 19.
  *
  * The physical tree contains bounded, ordered candidate keys. Its entries
  * are NEVER uniqueness evidence. A dirty-snapshot scan fetches the original

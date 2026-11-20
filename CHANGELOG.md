@@ -3,18 +3,29 @@
 Release notes for OpenHalo ([`pgsty/openHalo`](https://github.com/pgsty/openHalo)).
 
 Versions are `<PostgreSQL version>.<OpenHalo revision>`. The kernel reports the
-upstream PostgreSQL version; this development branch reports `19.0` and
-`PG_VERSION_NUM=190000`. `aux_mysql` is versioned separately.
+upstream PostgreSQL version (`19.0`, `PG_VERSION_NUM=190000`). The software
+version is `19.0.0`, reported by `SHOW openhalo.version` and MySQL
+`@@version_comment`. `aux_mysql` is versioned separately as `2.0`.
 
 | Release | PostgreSQL | `aux_mysql` | Date |
 | :--- | :--- | :--- | :--- |
+| [19.0.0](#1900-unreleased) | 19.0 | 2.0 | Unreleased |
 | [`v18.6.1`](#v1861) | 18.6 | 1.9 | 2026-11-10 |
 | [`v18.6`](#v186) | 18.6 | 1.5 | 2026-11-07 |
 
 ---
 
-## 19.0 development
+## 19.0.0 (unreleased)
 
+- Add a single product version definition and read-only `openhalo.version` /
+  MySQL `version_comment` identifiers, separate from the kernel and SQL versions.
+- Accept keyword `version` in scoped/unscoped MySQL SET statements and reject
+  changes to version identifiers with error 1238 / HY000. Report error 1227 /
+  42000 for an ordinary user's SET GLOBAL privilege denial.
+- Correct the REPLACE no-op RETURNING path to use PG19's boolean `isDelete`
+  argument instead of a PostgreSQL 18 command enum.
+- Align the configuration sample with PG19's formatting checks; keep the
+  intentional aux_mysql preload and validate that exact active setting.
 - Rebase the kernel onto the verified PostgreSQL 19.0 release source, preserving
   the protocol, execution, sequence, foreign-key and collation extension points.
 - Adapt `aux_mysql 2.0` to PG19's planner, scanner, numeric, shared-memory, table
@@ -25,6 +36,9 @@ upstream PostgreSQL version; this development branch reports `19.0` and
   A 1.x → 2.0 extension upgrade path is not included in this branch.
 - See [`PG19.md`](contrib/aux_mysql/PG19.md) for source provenance, validation and
   migration boundaries. This is development work, not a published release.
+- See the [19.0.0 review report](contrib/aux_mysql/REVIEW-19.0.0.md) for the new
+  cross-platform, sanitizer, PGXS, replication and compatibility test round,
+  including the sysbench concurrency limitation.
 
 ## v18.6.1
 

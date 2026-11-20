@@ -2,7 +2,7 @@
  *
  * mys_rewrite.c
  *	  Raw parse tree rewriting between the MySQL grammar and the stock
- *	  PostgreSQL 18 analyzer.
+ *	  PostgreSQL 19 analyzer.
  *
  * openHalo implemented MySQL semantics inside a forked copy of the PG14
  * analyzer (mys_analyze.c, mys_parse_utilcmd.c, ...).  PG18 offers no

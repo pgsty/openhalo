@@ -59,6 +59,15 @@ while (my $line = <$contents>)
 	push @lines_with_tabs, $line_num
 	  if $line =~ /\t/;
 
+	# OpenHalo preloads its protocol extension in newly initialized clusters.
+	# Accept only this intentional active setting; keep checking all other
+	# parameters for the upstream sample-file format.
+	if ($line =~ /^shared_preload_libraries = 'aux_mysql'\s*(?:#.*)?$/)
+	{
+		push @gucs_in_file, 'shared_preload_libraries';
+		next;
+	}
+
 	# Check if this line matches a GUC parameter:
 	# - Each parameter is preceded by "#", but not "# " in the sample
 	# file.

@@ -368,6 +368,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 
 %type <node>    mysql_system_variable mysql_user_variable set_variable
 %type <list>    set_variables
+%type <str>     mysql_set_variable_name
 
 %type <node>	select_no_parens select_with_parens select_clause
 				simple_select values_clause insert_value_clause
@@ -1786,8 +1787,14 @@ set_variable:
                 { $$ = $1; }
         ;
 
+/* VERSION is a keyword, but also a valid system variable in SET. */
+mysql_set_variable_name:
+			IDENT                   { $$ = $1; }
+			| VERSION_P             { $$ = pstrdup("version"); }
+		;
+
 mysql_system_variable:
-            IDENT plassign_equals on_a_expr
+			mysql_set_variable_name plassign_equals on_a_expr
                 {
                     ResTarget *result;
                     List *funcName;
@@ -1828,7 +1835,7 @@ mysql_system_variable:
                     result->location = @1;
                     $$ = (Node *) result;
                 }
-            | LOCAL IDENT plassign_equals on_a_expr
+			| LOCAL mysql_set_variable_name plassign_equals on_a_expr
                 {
                     if (isSystemVariable($2))
                     {
@@ -1878,7 +1885,7 @@ mysql_system_variable:
                                  parser_errposition(@2)));
                     }
                 }
-            | SESSION IDENT plassign_equals on_a_expr
+			| SESSION mysql_set_variable_name plassign_equals on_a_expr
                 {
                     if (isSystemVariable($2))
                     {
@@ -1928,7 +1935,7 @@ mysql_system_variable:
                                  parser_errposition(@2)));
                     }
                 }
-            | GLOBAL IDENT plassign_equals on_a_expr
+			| GLOBAL mysql_set_variable_name plassign_equals on_a_expr
                 {
                     if (isSystemVariable($2))
                     {

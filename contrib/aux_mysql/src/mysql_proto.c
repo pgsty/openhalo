@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * mysql_proto.c
- *	  MySQL client/server protocol on top of the PostgreSQL 18 protocol
+ *	  MySQL client/server protocol on top of the PostgreSQL 19 protocol
  *	  extension hooks.
  *
  * Connection life cycle:
@@ -592,6 +592,8 @@ mys_errno(int sqlerrcode)
 			return 1205;		/* ER_LOCK_WAIT_TIMEOUT */
 		case ERRCODE_QUERY_CANCELED:
 			return 1317;		/* ER_QUERY_INTERRUPTED */
+		case ERRCODE_CANT_CHANGE_RUNTIME_PARAM:
+			return 1238;		/* ER_INCORRECT_GLOBAL_LOCAL_VAR (read only) */
 		case ERRCODE_FEATURE_NOT_SUPPORTED:
 			return 1235;		/* ER_NOT_SUPPORTED_YET */
 		case ERRCODE_GENERATED_ALWAYS:
@@ -640,6 +642,8 @@ mys_sqlstate(int sqlerrcode)
 			return "HY000";
 		case MYS_ERRCODE_TXN_CHARACTERISTICS:
 			return "25001";
+		case ERRCODE_CANT_CHANGE_RUNTIME_PARAM:
+			return "HY000";
 		default:
 			return PGUNSIXBIT(sqlerrcode) == 'M' ? "42000" : unpack_sql_state(sqlerrcode);
 	}

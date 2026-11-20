@@ -1,15 +1,20 @@
-# OpenHalo 19
+# OpenHalo 19.0.0
 
 [![PGSTY: pgsty.com](https://img.shields.io/badge/PGSTY-pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://pgsty.com/)
 [![Pigsty: pigsty.io](https://img.shields.io/badge/Pigsty-pigsty.io-slategray?style=flat)](https://pigsty.io/)
-[![Version: 19.0-dev](https://img.shields.io/badge/Version-19.0--dev-slategray?style=flat)](https://github.com/pgsty/openHalo/releases)
+[![Version: 19.0.0](https://img.shields.io/badge/Version-19.0.0-slategray?style=flat)](https://github.com/pgsty/openHalo/releases)
 [![Extension: aux_mysql 2.0](https://img.shields.io/badge/aux__mysql-2.0-slategray?style=flat)](contrib/aux_mysql/README.md)
 [![License: PostgreSQL / GPL-3.0](https://img.shields.io/badge/License-PostgreSQL%20%2F%20GPL--3.0-slategray?style=flat&logo=gnu&logoColor=white)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/openHalo?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/openHalo&Date)
 [![PostgreSQL: 19.0](https://img.shields.io/badge/PostgreSQL-19.0-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](README.postgresql.md)
 [![MySQL: 5.7 / 8.0](https://img.shields.io/badge/MySQL-5.7%20%2F%208.0-%234479A1?style=flat&logo=mysql&logoColor=white&labelColor=4479A1)](contrib/aux_mysql/README.md)
 
-**OpenHalo 19** (development branch, based on **PostgreSQL 19.0**) is a PostgreSQL 19.0 kernel and `aux_mysql` (`2.0`) extension that speaks the MySQL wire protocol and SQL dialect natively—allowing MySQL clients, drivers, and applications on port `3306` and PostgreSQL clients on port `5432` to query the same data concurrently.
+**OpenHalo 19.0.0** (unreleased, based on **PostgreSQL 19.0**) is a PostgreSQL 19.0 kernel and `aux_mysql` (`2.0`) extension that speaks the MySQL wire protocol and SQL dialect natively—allowing MySQL clients, drivers, and applications on port `3306` and PostgreSQL clients on port `5432` to query the same data concurrently.
+
+The software version is available through PostgreSQL `SHOW openhalo.version`
+and MySQL `SELECT @@version_comment`. PostgreSQL's `server_version` remains
+`19.0`, and the MySQL handshake/`@@version` retains its configured compatibility
+version. The source of the software version is [`openhalo_version.h`](src/include/openhalo_version.h).
 
 [PGSTY](https://pgsty.com) | [Pigsty](https://pigsty.io) | [`aux_mysql` Docs](contrib/aux_mysql/README.md) | [Migration Guide](contrib/aux_mysql/MIGRATION.md) | [Testing Guide](contrib/aux_mysql/TESTING.md) | [Upstream Port Log](contrib/aux_mysql/UPSTREAM.md) | [Changelog](CHANGELOG.md) | [Releases](https://github.com/pgsty/openHalo/releases) | [Issues](https://github.com/pgsty/openHalo/issues) | [Upstream](https://github.com/HaloTech-Co-Ltd/openHalo)
 
@@ -210,6 +215,8 @@ MYSQL_PORT=<mysqlport> contrib/aux_mysql/tests/sysbench.sh
 ```
 
 See [`contrib/aux_mysql/TESTING.md`](contrib/aux_mysql/TESTING.md) for the complete `2.0` integration, upgrade, roundtrip, and ecosystem test suites.
+The [19.0.0 review report](contrib/aux_mysql/REVIEW-19.0.0.md) records the tested
+platforms, fixes, full-suite evidence and concurrency/upgrade boundaries.
 
 ---
 

@@ -7,6 +7,13 @@ OpenHalo kernel's protocol, executor, foreign-key and collation hooks. The node 
 layouts must match: build the kernel and extension together. Other kernels require adaptation
 and separate validation. Load it through `shared_preload_libraries` (the OpenHalo 19 default).
 
+OpenHalo's software version is **19.0.0**. Native SQL reports it through
+`SHOW openhalo.version`; MySQL reports `OpenHalo 19.0.0 (PostgreSQL 19.0)` through
+`SELECT @@version_comment` and `SHOW VARIABLES LIKE 'version_comment'`.
+These identifiers are read-only. PostgreSQL's kernel version remains `19.0`,
+the extension SQL version remains `2.0`, and the MySQL compatibility version
+is still controlled by `mysql.halo_mysql_version`.
+
 ## Parameters
 
 | Parameter | Default | |

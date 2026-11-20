@@ -30,6 +30,7 @@
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "openhalo_version.h"
 #include "storage/ipc.h"
 #include "storage/lockdefs.h"
 #include "storage/lwlock.h"
@@ -195,6 +196,11 @@ lookup_global_system_var(const char *varName, SystemVar *out_copy)
 static bool
 getVersionVariable(const char *varName, char **varValue)
 {
+	if (pg_strcasecmp(varName, "version_comment") == 0)
+	{
+		*varValue = pstrdup("OpenHalo " OPENHALO_VERSION " (PostgreSQL " PG_VERSION ")");
+		return true;
+	}
 	if (pg_strcasecmp(varName, "gtid_mode") == 0)
 	{
 		*varValue = pstrdup("OFF");
@@ -603,7 +609,7 @@ setSystemVariableValueOne(const char *rawVarName, const char *rawVarValue,
 	/* SET GLOBAL requires SUPER / superuser privilege (MySQL 1227). */
 	if (!isSessionSystemVar && !superuser())
 		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				(errcode(MYS_ERRCODE_SPECIFIC_ACCESS_DENIED),
 				 errmsg("Access denied; you need (at least one of) the SUPER or SYSTEM_VARIABLES_ADMIN privilege(s) for this operation")));
 
 	if (strcmp(varName, "max_allowed_packet") == 0)
@@ -626,7 +632,8 @@ setSystemVariableValueOne(const char *rawVarName, const char *rawVarValue,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("MySQL GTID replication is unavailable; transactions have no MySQL GTID")));
 	}
-	if (strcmp(varName, "gtid_executed") == 0 || strcmp(varName, "gtid_purged") == 0)
+	if (strcmp(varName, "gtid_executed") == 0 || strcmp(varName, "gtid_purged") == 0 ||
+		strcmp(varName, "version") == 0 || strcmp(varName, "version_comment") == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
 				 errmsg("Variable '%s' is read only", varName)));

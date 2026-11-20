@@ -4,6 +4,7 @@ Use disposable instances with the matching kernel and extension. Build debug
 (`--enable-debug --enable-cassert`) and release binaries separately; enable
 `--enable-depend`, or clean all objects after changing node/protocol headers.
 Keep build directories, data directories and logs outside this repository.
+The [19.0.0 acceptance report](REVIEW-19.0.0.md) records the latest review round.
 
 `tests/run.sh` recreates its `test` schema. The transaction and AB suites also
 exercise global read-only flags: never point these suites at a shared production
@@ -88,6 +89,7 @@ PG19-specific and recovery checks:
 
 ```sh
 python3 tests/pg19_kernel.py
+python3 tests/release_review.py
 python3 tests/pg19_upgrade.py --old-prefix /path/to/openhalo18-aux2 \
   --new-prefix /path/to/openhalo19 --work-dir /tmp/openhalo-major-upgrade
 python3 tests/release_roundtrip.py
@@ -99,6 +101,31 @@ MySQL TLS, escaped literals and default-expression round trips. It needs `PGBIN`
 PG/MySQL connection settings, psycopg2 and PyMySQL, and a TLS-enabled fixture.
 `release_roundtrip.py` also needs Oracle MySQL 5.7 dump/restore clients; select them
 with `MYSQLDUMP` and `MYSQL_CLIENT`.
+
+`release_review.py` checks the 19.0.0 product identity independently of PG19 and
+aux_mysql 2.0; readonly version variables and SET GLOBAL privilege errors,
+including their wire SQLSTATEs; RSA/TLS authentication, password rotation,
+NOLOGIN and expiry; RLS on REPLACE/ODKU; cancellation and connection reuse;
+malformed handshakes/commands and oversized preauthentication packets; binary
+input/output spanning MySQL's 16 MiB frame boundary; and eight concurrent native
+PG/MySQL writers with committed and rolled-back updates. It requires a superuser
+PG connection and a TLS/SCRAM fixture, creates unique roles/schema, and removes
+them on exit. RSA checks explicitly disable client TLS auto-upgrade.
+
+For full upstream coverage, configure with `--enable-tap-tests
+--enable-injection-points` and the libraries for the selected optional modules,
+then run `make check-world` with `TEMP_CONFIG` disabling the MySQL listener.
+`PG_TEST_EXTRA='ssl libpq_encryption'` enables the additional TLS/encryption
+tests. ECPG's preprocessor TAP tests write generated C files beside their input;
+give those tests a writable copy outside the repository when using read-only
+source mounts. Do not run separate `make check` invocations concurrently in one
+build tree: each recreates `tmp_install`.
+For Docker, use container-native storage for test databases and an init process
+(`--init`) that reaps orphaned children. Shared host filesystems can behave
+differently for permissions and directory operations; unreaped postmaster
+processes interfere with deliberate SIGKILL/restart tests. For an affected leaf
+suite, `make check NO_TEMP_INSTALL=1` reuses the already prepared temporary
+installation; preserve the Makefile's exported test environment when rerunning.
 
 Historical 1.5 → 1.9 extension upgrade suites and PG14 import generators were
 removed by the 2.0 source cleanup. They belong to the PG18 release checkout.
