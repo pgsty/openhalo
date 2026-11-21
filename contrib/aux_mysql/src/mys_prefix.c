@@ -32,6 +32,8 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_collation.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_type_d.h"
 #include "executor/executor.h"
 #include "commands/defrem.h"
@@ -58,6 +60,7 @@
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 #include "utils/selfuncs.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -535,7 +538,25 @@ binary_strcoll(const char *a, const char *b, pg_locale_t locale)
 static size_t
 binary_strxfrm(char *dest, size_t size, const char *src, pg_locale_t locale)
 {
-	return binary_strnxfrm(dest, size, src, strlen(src), locale);
+	size_t		len = strlen(src);
+	size_t		pad_end;
+
+	(void) locale;
+	while (len > 0 && src[len - 1] == ' ')
+		len--;
+	pad_end = len + 12;
+	if (size > 0)
+	{
+		size_t		copy_len = Min(len, size - 1);
+		size_t		fill_to = Min(pad_end, size - 1);
+
+		if (copy_len > 0)
+			memcpy(dest, src, copy_len);
+		if (fill_to > copy_len)
+			memset(dest + copy_len, ' ', fill_to - copy_len);
+		dest[fill_to] = '\0';
+	}
+	return pad_end;
 }
 
 static size_t
@@ -678,11 +699,16 @@ string_part(Relation index, int col)
 static int
 prefix_charcliplen(const char *data, int len, int characters)
 {
-	int offset = 0;
+	int			enc = GetDatabaseEncoding();
+	int			offset = 0;
+
 	while (offset < len && characters-- > 0)
 	{
-		int width = data[offset] == 0 ? 1 : pg_mblen(data + offset);
-		if (width > len - offset) break;
+		int			width = data[offset] == 0 ? 1 :
+			pg_encoding_verifymbchar(enc, data + offset, len - offset);
+
+		if (width <= 0)
+			break;
 		offset += width;
 	}
 	return offset;
@@ -804,6 +830,7 @@ physical_operator(StrategyNumber strategy)
 static text *
 pattern_prefix(Datum value)
 {
+	int enc = GetDatabaseEncoding();
 	text *pattern = DatumGetTextPP(value);
 	const char *src = VARDATA_ANY(pattern), *end = src + VARSIZE_ANY_EXHDR(pattern);
 	text *result = palloc(VARHDRSZ + VARSIZE_ANY_EXHDR(pattern));
@@ -812,7 +839,8 @@ pattern_prefix(Datum value)
 	{
 		int n;
 		if (*src == '\\' && src + 1 < end) src++;
-		n = pg_mblen(src);
+		n = *src == '\0' ? 1 : pg_encoding_verifymbchar(enc, src, end - src);
+		if (n <= 0) n = 1;
 		memcpy(dst, src, n);
 		dst += n; src += n;
 	}
@@ -936,8 +964,12 @@ exact_candidate(IndexScanDesc scan)
 
 	if (!state->estate)
 	{
+		MemoryContext oldcxt;
+
 		state->estate = CreateExecutorState();
+		oldcxt = MemoryContextSwitchTo(state->estate->es_query_cxt);
 		state->info = BuildIndexInfo(scan->indexRelation);
+		MemoryContextSwitchTo(oldcxt);
 		state->slot = table_slot_create(scan->heapRelation, NULL);
 		state->fetch = table_index_fetch_begin(scan->heapRelation, 0);
 	}
@@ -945,9 +977,12 @@ exact_candidate(IndexScanDesc scan)
 	while (table_index_fetch_tuple(state->fetch, &tid, scan->xs_snapshot,
 								   state->slot, &again, &dead))
 	{
+		MemoryContext oldcxt;
+
 		match = true;
 		ctx = GetPerTupleExprContext(state->estate);
 		ResetExprContext(ctx);
+		oldcxt = MemoryContextSwitchTo(ctx->ecxt_per_tuple_memory);
 		ctx->ecxt_scantuple = state->slot;
 		FormIndexDatum(state->info, state->slot, state->estate, values, nulls);
 		for (int i = 0; i < state->nkeys && match; i++)
@@ -980,6 +1015,7 @@ exact_candidate(IndexScanDesc scan)
 				match = DatumGetBool(FunctionCall2Coll(&key->sk_func, key->sk_collation,
 													   values[col], key->sk_argument));
 		}
+		MemoryContextSwitchTo(oldcxt);
 		ExecClearTuple(state->slot);
 		if (match)
 			return true;
@@ -1017,6 +1053,7 @@ prefix_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
 		tbm_add_tuples(bitmap, &state->tree->xs_heaptid, 1, true);
 		count++;
 	}
+	state->tree->heapRelation = scan->heapRelation;
 	table_close(heap, AccessShareLock);
 	return count;
 }
@@ -1284,11 +1321,49 @@ mys_prefix_handler(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(am);
 }
 
+static inline uint32
+like_next_char(const unsigned char **p, const unsigned char *end, int enc,
+			   bool general)
+{
+	const unsigned char *s = *p;
+	int			w;
+	uint32		ch;
+
+	if (*s < 0x80)
+	{
+		(*p)++;
+		return general ? (uint32) general_ascii[*s] : (uint32) *s;
+	}
+	if (enc == PG_UTF8)
+	{
+		w = pg_encoding_verifymbchar(PG_UTF8, (const char *) s, end - s);
+		if (w > 0)
+		{
+			ch = utf8_to_unicode(s);
+			*p += w;
+			return general ? (uint32) general_weight(ch) : ch;
+		}
+		(*p)++;
+		return general ? 0xfffd : (uint32) (0xdc00 + *s);
+	}
+	w = pg_encoding_verifymbchar(enc, (const char *) s, end - s);
+	if (w <= 0 || w > 4)
+		w = 1;
+	ch = 0;
+	for (int i = 0; i < w; i++)
+		ch = (ch << 8) | s[i];
+	if (ch >= UINT32_MAX - 1)
+		ch = 0xfffd;
+	*p += w;
+	return general && w == 1 ? (uint32) pg_ascii_toupper(s[0]) : ch;
+}
+
 /* LIKE is not PAD SPACE. A simple general_ci weight corresponds to exactly
  * one character; '%' and '_' operate on characters, never encoded bytes. */
 static bool
 prefix_like(FunctionCallInfo fcinfo, bool trim_char)
 {
+	int enc = GetDatabaseEncoding();
 	text *value = PG_GETARG_TEXT_PP(0), *pattern = PG_GETARG_TEXT_PP(1);
 	const unsigned char *src = (const unsigned char *) VARDATA_ANY(value);
 	const unsigned char *pat = (const unsigned char *) VARDATA_ANY(pattern);
@@ -1298,25 +1373,37 @@ prefix_like(FunctionCallInfo fcinfo, bool trim_char)
 	int ns = 0, np = 0, si = 0, pi = 0, star = -1, retry = 0;
 	bool general = is_general(PG_GET_COLLATION());
 	bool matched;
+	const unsigned char *sp, *send, *pp, *pend;
+
 	if (trim_char) while (slen > 0 && src[slen - 1] == ' ') slen--;
-	for (int i = 0; i < slen; i += pg_utf_mblen(src + i))
+	sp = src;
+	send = src + slen;
+	while (sp < send)
+		s[ns++] = like_next_char(&sp, send, enc, general);
+
+	pp = pat;
+	pend = pat + plen;
+	while (pp < pend)
 	{
-		uint32 ch = utf8_to_unicode(src + i);
-		s[ns++] = general ? general_weight(ch) : ch;
-	}
-	for (int i = 0; i < plen;)
-	{
-		uint32 ch = utf8_to_unicode(pat + i);
-		bool escaped = false;
-		i += pg_utf_mblen(pat + i);
-		if (ch == '\\' && i < plen)
+		if (*pp == '\\')
 		{
-			ch = utf8_to_unicode(pat + i);
-			i += pg_utf_mblen(pat + i);
-			escaped = true;
+			pp++;
+			p[np++] = pp < pend ?
+				like_next_char(&pp, pend, enc, general) :
+				(general ? (uint32) general_ascii['\\'] : (uint32) '\\');
 		}
-		p[np++] = !escaped && ch == '%' ? UINT32_MAX :
-			!escaped && ch == '_' ? UINT32_MAX - 1 : general ? general_weight(ch) : ch;
+		else if (*pp == '%')
+		{
+			pp++;
+			p[np++] = UINT32_MAX;
+		}
+		else if (*pp == '_')
+		{
+			pp++;
+			p[np++] = UINT32_MAX - 1;
+		}
+		else
+			p[np++] = like_next_char(&pp, pend, enc, general);
 	}
 	while (si < ns)
 	{
@@ -1352,7 +1439,14 @@ rewrite_like(Node *node, void *context)
 		OpExpr *op = (OpExpr *) node;
 		if (list_length(op->args) == 2 && mysql_collation_kind(op->inputcollid))
 		{
-			char *name = get_opname(op->opno);
+			HeapTuple optup = SearchSysCache1(OPEROID, ObjectIdGetDatum(op->opno));
+			Oid opnsp = HeapTupleIsValid(optup) ?
+				((Form_pg_operator) GETSTRUCT(optup))->oprnamespace : InvalidOid;
+			char *name = NULL;
+			if (HeapTupleIsValid(optup))
+				ReleaseSysCache(optup);
+			if (opnsp == PG_CATALOG_NAMESPACE || opnsp == get_namespace_oid("mysql", true))
+				name = get_opname(op->opno);
 			if (name && (strcmp(name, "~~") == 0 || strcmp(name, "!~~") == 0))
 			{
 				Oid replacement = OpernameGetOprid(list_make2(makeString("mysql"),

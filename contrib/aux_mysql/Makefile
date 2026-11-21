@@ -81,7 +81,7 @@ src/parser/mys_gram.h: src/parser/mys_gram.c
 
 src/parser/mys_scan.c: src/parser/mys_scan.l
 	@$(MKDIR_P) src/parser
-	$(FLEX) -CF -p -p -o'$@' $<
+	$(FLEX) -Cfe -p -p -o'$@' $<
 
 src/parser/mys_kwlist_d.h: src/parser/mys_kwlist.h tools/gen_keywordlist.pl tools/PerfectHash.pm
 	@$(MKDIR_P) src/parser

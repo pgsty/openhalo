@@ -1259,13 +1259,24 @@ mys_binary_ascii(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(VARSIZE_ANY_EXHDR(b) ? (unsigned char) *VARDATA_ANY(b) : 0);
 }
 
+static inline int
+bounded_char_width(const char *s, int rem)
+{
+	int			w;
+
+	if (rem <= 0 || *s == '\0')
+		return 1;
+	w = pg_encoding_verifymbchar(GetDatabaseEncoding(), s, rem);
+	return w > 0 ? w : 1;
+}
+
 /* These functions iterate explicitly: pg_mbstrlen_with_len stops at NUL. */
 static int
 string_chars(const char *s, int len)
 {
 	int chars = 0;
 	for (int i = 0; i < len; chars++)
-		i += s[i] == '\0' ? 1 : pg_mblen(s + i);
+		i += bounded_char_width(s + i, len - i);
 	return chars;
 }
 
@@ -1614,18 +1625,24 @@ string_wchars(bytea *value, bool binary, int *count)
 
 	for (int i = 0; i < len;)
 	{
-		int step = binary || s[i] == 0 ? 1 : pg_mblen((const char *) s + i);
+		int step = (binary || s[i] == 0) ? 1 :
+			pg_encoding_verifymbchar(GetDatabaseEncoding(), (const char *) s + i, len - i);
 
-		if (binary || s[i] == 0)
+		if (step <= 0)
+			wide[n++] = s[i++];
+		else if (binary || s[i] == 0)
+		{
 			wide[n++] = s[i];
+			i += step;
+		}
 		else
 		{
 			pg_wchar one[2];
 
 			pg_mb2wchar_with_len((const char *) s + i, one, step);
 			wide[n++] = one[0];
+			i += step;
 		}
-		i += step;
 	}
 	wide[n] = 0;
 	*count = n;
@@ -1759,7 +1776,7 @@ string_weight_position(MysSimpleCollation kind,
 	{
 		CHECK_FOR_INTERRUPTS();
 		if (++scanned > n)
-			window += pg_mblen(h + window);
+			window += bounded_char_width(h + window, hlen - window);
 		while (matched > 0 && weight != pattern[matched])
 			matched = failure[matched - 1];
 		if (weight == pattern[matched])
@@ -1816,14 +1833,16 @@ string_position(FunctionCallInfo fcinfo, bool instr)
 	int hlen = VARSIZE_ANY_EXHDR(haystack), plen = VARSIZE_ANY_EXHDR(needle);
 	bool binary = binary_string_arg(fcinfo, 0) || binary_string_arg(fcinfo, 1);
 	pg_locale_t locale;
-	int start = PG_NARGS() > 2 ? PG_GETARG_INT32(2) : 1;
+	int64 start = PG_NARGS() > 2 ?
+		(get_fn_expr_argtype(fcinfo->flinfo, 2) == INT8OID ?
+		 PG_GETARG_INT64(2) : (int64) PG_GETARG_INT32(2)) : 1;
 	int offset = 0, pos = 1;
 
-	if (start < 1)
+	if (start < 1 || start > (int64) hlen + 1)
 		return 0;
 	while (offset < hlen && pos < start)
 	{
-		offset += binary || h[offset] == 0 ? 1 : pg_mblen(h + offset);
+		offset += binary ? 1 : bounded_char_width(h + offset, hlen - offset);
 		pos++;
 	}
 	if (pos < start)
@@ -1852,12 +1871,12 @@ string_position(FunctionCallInfo fcinfo, bool instr)
 			 * boundaries, as PG18 does for nondeterministic collations. */
 			for (int end = offset; end < hlen;)
 			{
-				end += h[end] == 0 ? 1 : pg_mblen(h + end);
+				end += bounded_char_width(h + end, hlen - end);
 				if (string_search_equal(h + offset, end - offset, p, plen, locale))
 					return pos;
 			}
 		}
-		offset += binary || h[offset] == 0 ? 1 : pg_mblen(h + offset);
+		offset += binary ? 1 : bounded_char_width(h + offset, hlen - offset);
 	}
 	return 0;
 }

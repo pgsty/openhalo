@@ -173,7 +173,12 @@ user_lock_tag(FunctionCallInfo fcinfo, int argno, LOCKTAG *tag,
 	/* pg_mbstrlen_with_len() stops at NUL. A MySQL TEXT name does not. */
 	nchars = 0;
 	for (int i = 0; i < len; nchars++)
-		i += binary || name[i] == '\0' ? 1 : pg_mblen(name + i);
+	{
+		int			step = (binary || name[i] == '\0') ? 1 :
+			pg_encoding_verifymbchar(GetDatabaseEncoding(), name + i, len - i);
+
+		i += step > 0 ? step : 1;
+	}
 	if (len == 0 || nchars > MYS_LOCK_NAME_CHARS)
 		/* MySQL shows up to 192 bytes of the name */
 		wrong_lock_name(pnstrdup(name, binary ? Min(len, 192) : pg_mbcliplen(name, len, 192)));
@@ -190,12 +195,18 @@ user_lock_tag(FunctionCallInfo fcinfo, int argno, LOCKTAG *tag,
 		 * after case conversion.
 		 */
 		lower = palloc(nchars * 4);
-		for (int i = 0; i < len; i += pg_utf_mblen((const unsigned char *) name + i))
+		for (int i = 0; i < len;)
 		{
-			pg_wchar	code = utf8_to_unicode((const unsigned char *) name + i);
+			int			step = name[i] == '\0' ? 1 :
+				pg_encoding_verifymbchar(PG_UTF8, name + i, len - i);
+			pg_wchar	code;
 
+			if (step <= 0)
+				report_invalid_encoding(PG_UTF8, name + i, len - i);
+			code = utf8_to_unicode((const unsigned char *) name + i);
 			unicode_to_utf8(unicode_lowercase_simple(code), (unsigned char *) lower + n);
 			n += pg_utf_mblen((const unsigned char *) lower + n);
+			i += step;
 		}
 		len = n;
 	}
