@@ -581,6 +581,16 @@ mys_sync_foreign_key_checks(void)
 	/* RI trigger and TRUNCATE hooks consult the session variable directly. */
 }
 
+bool
+mys_default_autocommit(void)
+{
+	if (sessionSystemVars == NULL)
+		initSystemVariables();
+	if (global_shmem_ready())
+		return global_flag("autocommit");
+	return true;
+}
+
 /* ----------------------------------------------------------------
  *	SET [SESSION | GLOBAL] system variable implementation
  * ----------------------------------------------------------------
@@ -1791,29 +1801,13 @@ applySystemVarValue(const char *varName, const char *varValue)
 			pg_strcasecmp(varValue, "on") == 0)
 		{
 			if (autoCommit == 0)
-			{
 				needCommitTrx = true;
-				needStartNewTrx = false;
-			}
-			else
-			{
-				needCommitTrx = false;
-				needStartNewTrx = false;
-			}
+			needStartNewTrx = false;
 			autoCommit = 2;
 		}
 		else
 		{
-			if (autoCommit == 0)
-			{
-				needCommitTrx = false;
-				needStartNewTrx = false;
-			}
-			else
-			{
-				needCommitTrx = false;
-				needStartNewTrx = true;
-			}
+			needStartNewTrx = (autoCommit != 0);
 			autoCommit = 0;
 		}
 	}

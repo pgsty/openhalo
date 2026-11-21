@@ -278,7 +278,11 @@ extern uint16 mys_errno(int sqlerrcode);
 extern void mys_type_info(Oid typid, int32 typmod, uint8 *mtype, uint32 *len,
 						  uint16 *flags, uint8 *decimals, uint16 *charset);
 extern void mys_send_coldef(Form_pg_attribute attr, TargetEntry *tle);
+extern void mys_clear_diagnostics(void);
+extern void mys_begin_fastpath_probe(void);
+extern bool mys_end_fastpath_probe(void);
 extern void mys_proto_prepare_fast_exec(const struct MysStmtInfo *cached_info);
+extern void mys_proto_abort_fast_exec(void);
 
 /* mys_stmt.c: prepared statements */
 extern bool mys_binary_resultset;

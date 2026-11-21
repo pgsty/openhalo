@@ -19,7 +19,17 @@
 #include "fmgr.h"
 #include "nodes/pg_list.h"
 #include "postmaster/protocol_extension.h"
+#include "utils/fmgrprotos.h"
 #include "mys_binary.h"
+
+static inline int
+mys_trigger_depth(void)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+
+	InitFunctionCallInfoData(*fcinfo, NULL, 0, InvalidOid, NULL, NULL);
+	return DatumGetInt32(pg_trigger_depth(fcinfo));
+}
 
 /* GUC variables */
 extern int	halo_mysql_port;
@@ -54,6 +64,7 @@ extern void halo_mysql_lock_setup(void);
 extern void mys_sync_deadlock_timeout(void);
 extern bool mys_foreign_key_checks(void);
 extern void mys_sync_foreign_key_checks(void);
+extern bool mys_default_autocommit(void);
 extern void mys_sync_session_state(void);
 extern void mys_start_implicit_transaction(bool ddl);
 extern const char *mys_transaction_start(int explicit_read_only, bool *snapshot, bool *read_only,
@@ -66,6 +77,7 @@ extern bool mys_server_read_only;
 extern bool mys_server_read_only_applies(void);
 extern void mys_flush_rewrite_warnings(List *warnings);
 extern void mys_discard_rewrite_warnings(void);
+extern void mys_discard_stmt_warnings(List *infos);
 extern bool mys_index_prefix(Node *expr, AttrNumber *attnum, int *length, bool *bytes,
 							 bool *digest);
 
@@ -107,8 +119,11 @@ typedef enum MysTxnOp
 {
 	MYS_TXNOP_NONE = 0,
 	MYS_TXNOP_BEGIN,
+	MYS_TXNOP_BEGIN_AUTO_OFF,	/* BEGIN when dynamic autocommit = 0 */
 	MYS_TXNOP_COMMIT,
 	MYS_TXNOP_COMMIT_IDLE,		/* finish an unused autocommit=0 block */
+	MYS_TXNOP_COMMIT_AUTOCOMMIT,/* commit after dynamic SET autocommit 0 -> 1 */
+	MYS_TXNOP_COMMIT_IF_BLOCK,	/* implicit commit before BEGIN / DDL if in block */
 	MYS_TXNOP_SAVEPOINT,		/* statement-level rollback point */
 	MYS_TXNOP_RELEASE
 } MysTxnOp;

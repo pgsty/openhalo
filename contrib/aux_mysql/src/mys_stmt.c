@@ -48,6 +48,7 @@
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
+#include "commands/trigger.h"
 #include "executor/executor.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
@@ -111,7 +112,9 @@ typedef struct MysPrepStmt
 	Oid		   *cached_deduced_oids;
 	uint64		cached_sql_mode;
 	char	   *cached_db;
+	char	   *cached_version;
 	Oid			cached_role;
+	Oid			cached_session_role;
 	bool		cached_row_security;
 	bool		cached_hexlit;
 	MysStmtInfo	cached_info;
@@ -190,6 +193,11 @@ drop_stmt_cached_plan(MysPrepStmt *stmt)
 	{
 		pfree(stmt->cached_db);
 		stmt->cached_db = NULL;
+	}
+	if (stmt->cached_version != NULL)
+	{
+		pfree(stmt->cached_version);
+		stmt->cached_version = NULL;
 	}
 	if (stmt->cached_info.update_cols != NIL)
 	{
@@ -572,10 +580,11 @@ describe_statement(const char *query, int nparams, const int *locs,
 
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(oldcxt);
+	mys_begin_fastpath_probe();
 	PG_TRY();
 	{
 		List	   *raw;
-		List	   *infos;
+		List	   *infos = NIL;
 		RawStmt    *last = NULL;
 		MysStmtInfo *last_info = NULL;
 		int			visible = 0;
@@ -594,7 +603,7 @@ describe_statement(const char *query, int nparams, const int *locs,
 		{
 			raw = mys_rewrite_raw_stmts(mysql_raw_parser(text.data), text.data, &infos);
 			/* EXECUTE rewrites it again and reports them */
-			mys_discard_rewrite_warnings();
+			mys_discard_stmt_warnings(infos);
 		}
 		forboth(lc, raw, lc2, infos)
 		{
@@ -659,6 +668,7 @@ describe_statement(const char *query, int nparams, const int *locs,
 			}
 		}
 		mys_text_map = saved_map;
+		(void) mys_end_fastpath_probe();
 
 		/* Release any locks acquired during analysis */
 		RollbackAndReleaseCurrentSubTransaction();
@@ -670,6 +680,7 @@ describe_statement(const char *query, int nparams, const int *locs,
 		ErrorData  *edata;
 
 		mys_text_map = saved_map;
+		(void) mys_end_fastpath_probe();
 		mys_discard_rewrite_warnings();
 		MemoryContextSwitchTo(oldcxt);
 		edata = CopyErrorData();
@@ -731,6 +742,7 @@ mys_stmt_prepare(StringInfo pkt)
 	ErrorData  *volatile error = NULL;
 
 	init_hash();
+	mys_clear_diagnostics();
 	if (prepared_stmt_count() >= MYS_MAX_PREPARED_STMTS)
 	{
 		mys_send_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED,
@@ -1269,6 +1281,8 @@ raw_has_paramref_walker(Node *node, void *context)
 static bool
 raw_has_positional_param_walker(Node *node, void *context)
 {
+	bool		is_modify = context != NULL && *(const bool *) context;
+
 	if (node == NULL)
 		return false;
 	if (IsA(node, SelectStmt))
@@ -1278,7 +1292,7 @@ raw_has_positional_param_walker(Node *node, void *context)
 		if (raw_has_paramref_walker((Node *) sel->sortClause, NULL) ||
 			raw_has_paramref_walker((Node *) sel->groupClause, NULL) ||
 			raw_has_paramref_walker((Node *) sel->distinctClause, NULL) ||
-			(sel->limitOption == LIMIT_OPTION_WITH_TIES &&
+			((is_modify || sel->limitOption == LIMIT_OPTION_WITH_TIES) &&
 			 raw_has_paramref_walker(sel->limitCount, NULL)))
 			return true;
 	}
@@ -1296,12 +1310,13 @@ query_has_user_vars_walker(Node *node, void *context)
 
 		if (fname != NULL)
 		{
-			bool		is_uvar = (strcmp(fname, "get_user_var") == 0 ||
-								   strcmp(fname, "set_user_var") == 0 ||
-								   strcmp(fname, "set_user_var_in_expr") == 0);
+			bool		unsafe = (strcmp(fname, "get_user_var") == 0 ||
+								  strcmp(fname, "set_user_var") == 0 ||
+								  strcmp(fname, "set_user_var_in_expr") == 0 ||
+								  strcmp(fname, "convert_text_to_digit_text_for_mysql") == 0);
 
 			pfree(fname);
-			if (is_uvar)
+			if (unsafe)
 				return true;
 		}
 	}
@@ -1383,7 +1398,11 @@ fastpath_env_matches(const MysPrepStmt *stmt, const Oid *sig_oids)
 		return false;
 	if (stmt->cached_sql_mode != mys_sqlMode ||
 		stmt->cached_role != GetUserId() ||
+		stmt->cached_session_role != GetSessionUserId() ||
 		stmt->cached_row_security != row_security)
+		return false;
+	if (stmt->cached_version == NULL ||
+		strcmp(stmt->cached_version, halo_mysql_version) != 0)
 		return false;
 	if ((stmt->cached_db == NULL) != (cur_db == NULL) ||
 		(cur_db != NULL && strcmp(stmt->cached_db, cur_db) != 0))
@@ -1437,6 +1456,7 @@ build_fastpath_plansource(MysPrepStmt *stmt, const Oid *sig_oids)
 
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(oldcxt);
+	mys_begin_fastpath_probe();
 	PG_TRY();
 	{
 		List	   *raw;
@@ -1456,8 +1476,7 @@ build_fastpath_plansource(MysPrepStmt *stmt, const Oid *sig_oids)
 				  IsA(orig_rs->stmt, InsertStmt) ||
 				  IsA(orig_rs->stmt, UpdateStmt) ||
 				  IsA(orig_rs->stmt, DeleteStmt)) ||
-				ps_marker_name(orig_rs->stmt) != NULL ||
-				raw_has_positional_param_walker(orig_rs->stmt, NULL))
+				ps_marker_name(orig_rs->stmt) != NULL)
 			{
 				stmt->fastpath_state = -1;
 			}
@@ -1465,27 +1484,38 @@ build_fastpath_plansource(MysPrepStmt *stmt, const Oid *sig_oids)
 			{
 				List	   *infos = NIL;
 				List	   *rewritten = mys_rewrite_raw_stmts(raw, stmt->query, &infos);
+				bool		has_rewrite_warn = false;
 
-				mys_discard_rewrite_warnings();
 				if (list_length(rewritten) == 1 && list_length(infos) == 1)
+					has_rewrite_warn = (((MysStmtInfo *) linitial(infos))->rewrite_warnings != NIL);
+				mys_discard_stmt_warnings(infos);
+
+				if (list_length(rewritten) != 1 || list_length(infos) != 1)
+				{
+					stmt->fastpath_state = -1;
+				}
+				else
 				{
 					RawStmt    *rs = linitial_node(RawStmt, rewritten);
 					MysStmtInfo *info = linitial(infos);
+					bool		is_modify = IsA(rs->stmt, UpdateStmt) ||
+						IsA(rs->stmt, DeleteStmt);
 
-					if (raw_has_positional_param_walker(rs->stmt, NULL))
+					if (has_rewrite_warn ||
+						raw_has_positional_param_walker(rs->stmt, &is_modify) ||
+						info->silent || info->suppress_response ||
+						info->continued || info->diagnostic ||
+						info->txn_control ||
+						info->txn_kind != MYS_TXN_REGULAR ||
+						!(IsA(rs->stmt, SelectStmt) ||
+						  IsA(rs->stmt, InsertStmt) ||
+						  IsA(rs->stmt, UpdateStmt) ||
+						  IsA(rs->stmt, DeleteStmt)) ||
+						ps_marker_name(rs->stmt) != NULL)
 					{
 						stmt->fastpath_state = -1;
 					}
-					else if (info->rewrite_warnings == NIL &&
-						!info->silent && !info->suppress_response &&
-						!info->continued && !info->diagnostic &&
-						!info->txn_control &&
-						info->txn_kind == MYS_TXN_REGULAR &&
-						(IsA(rs->stmt, SelectStmt) ||
-						 IsA(rs->stmt, InsertStmt) ||
-						 IsA(rs->stmt, UpdateStmt) ||
-						 IsA(rs->stmt, DeleteStmt)) &&
-						ps_marker_name(rs->stmt) == NULL)
+					else
 					{
 						Oid		   *deduced = palloc0(sizeof(Oid) * Max(stmt->nparams, 1));
 						int			num_params = stmt->nparams;
@@ -1527,7 +1557,11 @@ build_fastpath_plansource(MysPrepStmt *stmt, const Oid *sig_oids)
 						{
 							List	   *qlist = pg_rewrite_query(query);
 
-							if (list_length(qlist) == 1)
+							if (mys_end_fastpath_probe())
+							{
+								stmt->fastpath_state = -1;
+							}
+							else if (list_length(qlist) == 1)
 							{
 								Query	   *q = linitial_node(Query, qlist);
 								PortalStrategy strat = ChoosePortalStrategy(qlist);
@@ -1546,38 +1580,49 @@ build_fastpath_plansource(MysPrepStmt *stmt, const Oid *sig_oids)
 									const char *cur_db = mys_selected_database();
 									MemoryContext cxt_save;
 
+									mys_begin_fastpath_probe();
 									psrc = CreateCachedPlan(rs, stmt->query, tag);
 									CompleteCachedPlan(psrc, qlist, NULL,
 													   stmt->nparams > 0 ? deduced : NULL,
 													   stmt->nparams, NULL, NULL,
 													   CURSOR_OPT_PARALLEL_OK, false);
-									SetPostRewriteHook(psrc, fastpath_post_rewrite, stmt);
-									SaveCachedPlan(psrc);
-
-									cxt_save = MemoryContextSwitchTo(stmt->cxt);
-									stmt->plansource = psrc;
-									if (stmt->nparams > 0)
+									if (mys_end_fastpath_probe())
 									{
-										memcpy(stmt->cached_sig_oids, sig_oids,
-											   sizeof(Oid) * stmt->nparams);
-										memcpy(stmt->cached_deduced_oids, deduced,
-											   sizeof(Oid) * stmt->nparams);
+										DropCachedPlan(psrc);
+										stmt->fastpath_state = -1;
 									}
-									stmt->cached_sql_mode = mys_sqlMode;
-									stmt->cached_hexlit = mys_hexlit_available;
-									stmt->cached_role = GetUserId();
-									stmt->cached_row_security = row_security;
-									stmt->cached_db = cur_db ? pstrdup(cur_db) : NULL;
-									stmt->cached_info = *info;
-									stmt->cached_info.rewrite_warnings = NIL;
-									stmt->cached_info.update_cols = NIL;
-									foreach_ptr(char, col, info->update_cols)
-										stmt->cached_info.update_cols =
-											lappend(stmt->cached_info.update_cols, pstrdup(col));
-									stmt->cached_tag = tag;
-									stmt->revalidated_stale = false;
-									MemoryContextSwitchTo(cxt_save);
-									ok = true;
+									else
+									{
+										SetPostRewriteHook(psrc, fastpath_post_rewrite, stmt);
+										SaveCachedPlan(psrc);
+
+										cxt_save = MemoryContextSwitchTo(stmt->cxt);
+										stmt->plansource = psrc;
+										if (stmt->nparams > 0)
+										{
+											memcpy(stmt->cached_sig_oids, sig_oids,
+												   sizeof(Oid) * stmt->nparams);
+											memcpy(stmt->cached_deduced_oids, deduced,
+												   sizeof(Oid) * stmt->nparams);
+										}
+										stmt->cached_sql_mode = mys_sqlMode;
+										stmt->cached_hexlit = mys_hexlit_available;
+										stmt->cached_role = GetUserId();
+										stmt->cached_session_role = GetSessionUserId();
+										stmt->cached_row_security = row_security;
+										stmt->cached_db = cur_db ? pstrdup(cur_db) : NULL;
+										stmt->cached_version = pstrdup(halo_mysql_version);
+										stmt->cached_info = *info;
+										stmt->cached_info.rewrite_warnings = NIL;
+										stmt->cached_info.update_cols = NIL;
+										foreach_ptr(char, col, info->update_cols)
+											stmt->cached_info.update_cols =
+												lappend(stmt->cached_info.update_cols, pstrdup(col));
+										stmt->cached_tag = tag;
+										stmt->revalidated_stale = false;
+										MemoryContextSwitchTo(cxt_save);
+										ok = true;
+									}
 								}
 							}
 						}
@@ -1586,6 +1631,11 @@ build_fastpath_plansource(MysPrepStmt *stmt, const Oid *sig_oids)
 			}
 		}
 
+		if (mys_end_fastpath_probe())
+		{
+			stmt->fastpath_state = -1;
+			ok = false;
+		}
 		mys_text_map = saved_map;
 		if (ok)
 			ReleaseCurrentSubTransaction();
@@ -1598,6 +1648,7 @@ build_fastpath_plansource(MysPrepStmt *stmt, const Oid *sig_oids)
 	{
 		ErrorData  *edata;
 
+		(void) mys_end_fastpath_probe();
 		mys_text_map = saved_map;
 		mys_discard_rewrite_warnings();
 		MemoryContextSwitchTo(oldcxt);
@@ -1805,7 +1856,8 @@ mys_stmt_try_execute(StringInfo inBuf)
 	sig_oids = palloc0(sizeof(Oid) * Max(stmt->nparams, 1));
 	if (halo_mysql_parser != MYS_PARSER_MYSQL ||
 		stmt->fastpath_state < 0 ||
-		(mys_sqlMode & MYS_MODE_STRICT_TRANS_TABLES) == 0 ||
+		Transform_null_equals ||
+		(mys_sqlMode & (MYS_MODE_STRICT_TRANS_TABLES | MYS_MODE_STRICT_ALL_TABLES)) == 0 ||
 		IsAbortedTransactionBlockState() ||
 		(IsTransactionBlock() && !mys_transaction_active()) ||
 		(autoCommit == 0 && !mys_transaction_active()) ||
@@ -1923,6 +1975,7 @@ mys_stmt_try_execute(StringInfo inBuf)
 				mys_txn_leave_stmt_savepoint();
 			mys_txn_arm_fallback_stmt_timeout();
 			debug_query_string = NULL;
+			mys_proto_abort_fast_exec();
 			mys_stmt_query_done();
 			MemoryContextSwitchTo(msg_cxt);
 			render_decoded_execute_query(inBuf, stmt, dparams);
@@ -1989,10 +2042,10 @@ mys_stmt_try_execute(StringInfo inBuf)
 	disable_fast_stmt_timeout();
 	CommitTransactionCommand();
 
-	EndCommand(&qc, DestRemote, false);
-
 	if (wrap_savepoint)
 		mys_txn_leave_stmt_savepoint();
+
+	EndCommand(&qc, DestRemote, false);
 
 	switch (check_log_duration(msec_str, was_logged))
 	{
@@ -2051,6 +2104,7 @@ mys_stmt_reset(StringInfo pkt)
 	MysPrepStmt *stmt = NULL;
 	uint64		id = 0;
 
+	mys_clear_diagnostics();
 	pkt->cursor = 1;
 	if (get_uint(pkt, 4, &id))
 		stmt = lookup_stmt((uint32) id, "mysqld_stmt_reset", true);
@@ -2509,6 +2563,12 @@ mys_sql_ps_utility(Node *parsetree, const char *queryString)
 
 	if (marker == NULL)
 		return false;
+	if (mys_trigger_depth() > 0 || mys_binary_resultset ||
+		(strcmp(marker, PS_EXECUTE_MARKER) == 0 &&
+		 (mys_current_stmt_info() == NULL || !mys_current_stmt_info()->continued)))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Dynamic SQL is not allowed in stored function or trigger")));
 	if (strcmp(marker, PS_PREPARE_MARKER) == 0)
 		sql_prepare((DoStmt *) parsetree);
 	else if (strcmp(marker, PS_EXECUTE_MARKER) == 0)

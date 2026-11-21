@@ -37,6 +37,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/discard.h"
+#include "commands/trigger.h"
 #include "common/string.h"
 #include "funcapi.h"
 #include "utils/tuplestore.h"
@@ -104,8 +105,10 @@ static struct
 static int	ndiagnostics = 0;
 static MemoryContext diagnostics_context = NULL;
 static bool diagnostics_pending = false;
+static bool fastpath_probe_active = false;
+static bool fastpath_probe_saw_warning = false;
 
-static void
+void
 mys_clear_diagnostics(void)
 {
 	if (diagnostics_context)
@@ -115,9 +118,31 @@ mys_clear_diagnostics(void)
 	diagnostics_pending = false;
 }
 
+void
+mys_begin_fastpath_probe(void)
+{
+	fastpath_probe_active = true;
+	fastpath_probe_saw_warning = false;
+}
+
+bool
+mys_end_fastpath_probe(void)
+{
+	bool		saw = fastpath_probe_saw_warning;
+
+	fastpath_probe_active = false;
+	fastpath_probe_saw_warning = false;
+	return saw;
+}
+
 static void
 mys_record_diagnostic(bool error, uint16 code, const char *message)
 {
+	if (fastpath_probe_active && !error)
+	{
+		fastpath_probe_saw_warning = true;
+		return;
+	}
 	if (diagnostics_pending)
 		mys_clear_diagnostics();
 	if (!diagnostics_context)
@@ -1617,7 +1642,9 @@ mys_proto_prepare_fast_exec(const MysStmtInfo *cached_info)
 	MysStmtInfo *exec_info = palloc(sizeof(MysStmtInfo));
 
 	*exec_info = *cached_info;
-	exec_info->update_cols = list_copy(cached_info->update_cols);
+	exec_info->update_cols = NIL;
+	foreach_ptr(char, col, cached_info->update_cols)
+		exec_info->update_cols = lappend(exec_info->update_cols, pstrdup(col));
 	exec_info->rewrite_warnings = NIL;
 	stmt_infos = list_make1(exec_info);
 	stmt_index = 0;
@@ -1633,6 +1660,14 @@ mys_proto_prepare_fast_exec(const MysStmtInfo *cached_info)
 	mys_text_map = NULL;
 }
 
+void
+mys_proto_abort_fast_exec(void)
+{
+	stmt_infos = NIL;
+	stmt_index = 0;
+	mys_binary_resultset = false;
+}
+
 static bool
 mys_process_command(int firstchar, StringInfo inBuf)
 {
@@ -1641,7 +1676,7 @@ mys_process_command(int firstchar, StringInfo inBuf)
 	if (firstchar == PqMsg_Query && pending_stmt_execute)
 	{
 		pending_stmt_execute = false;
-	mys_txn_clear_fallback_stmt_timeout();
+		mys_txn_clear_fallback_stmt_timeout();
 		return mys_stmt_try_execute(inBuf);
 	}
 	if (firstchar < MYS_MSG_BASE)
@@ -1656,6 +1691,7 @@ mys_process_command(int firstchar, StringInfo inBuf)
 				int			err_code = 0;
 				char	   *err_msg = NULL;
 
+				mys_clear_diagnostics();
 				if (mys_select_database_impl(db, false, &err_code, &err_msg))
 					mys_send_ok(0, 0, false, false);
 				else
@@ -1664,6 +1700,7 @@ mys_process_command(int firstchar, StringInfo inBuf)
 				break;
 			}
 		case COM_PING:
+			mys_clear_diagnostics();
 			mys_send_ok(0, 0, false, false);
 			break;
 		case COM_RESET_CONNECTION:
@@ -1712,23 +1749,27 @@ mys_process_command(int firstchar, StringInfo inBuf)
 			break;
 		case COM_STMT_FETCH:
 			/* COM_STMT_EXECUTE never opens a cursor */
+			mys_clear_diagnostics();
 			mys_send_error(ERRCODE_INVALID_CURSOR_STATE,
 						   "The statement has no open cursor.");
 			break;
 		case MYS_DEFERRED_ERROR:
 			/* COM_STMT_EXECUTE could not be decoded: nothing ran */
+			mys_clear_diagnostics();
 			mys_send_error(deferred_error->sqlerrcode, deferred_error->message);
 			FreeErrorData(deferred_error);
 			deferred_error = NULL;
 			break;
 		case COM_FIELD_LIST:
 			/* column list for tab completion: answer with an empty list */
+			mys_clear_diagnostics();
 			mys_send_resultset_end(false);
 			break;
 		case COM_SET_OPTION:
 			{
 				uint64		opt = 0;
 
+				mys_clear_diagnostics();
 				inBuf->cursor = 1;
 				if (!get_uint(inBuf, 2, &opt))
 				{
@@ -1753,6 +1794,7 @@ mys_process_command(int firstchar, StringInfo inBuf)
 			{
 				const char *s = "Uptime: 1  Threads: 1  Questions: 0  Slow queries: 0  Opens: 0  Flush tables: 0  Open tables: 0";
 
+				mys_clear_diagnostics();
 				mys_send_packet(s, strlen(s));
 				break;
 			}
@@ -1760,6 +1802,7 @@ mys_process_command(int firstchar, StringInfo inBuf)
 			{
 				char		msg[64];
 
+				mys_clear_diagnostics();
 				snprintf(msg, sizeof(msg), "Unsupported MySQL command 0x%02x", cmd);
 				mys_send_err(1047, "08S01", msg);
 				break;
@@ -1885,7 +1928,7 @@ mys_record_upsert_row(TupleTableSlot *oldslot, TupleTableSlot *newslot, uint64 d
 {
 	uint64		row;
 
-	if (current_stmt_info()->upsert == MYS_UPSERT_NONE)
+	if (mys_trigger_depth() > 0 || current_stmt_info()->upsert == MYS_UPSERT_NONE)
 		return;
 	row = mys_upsert_row(oldslot, newslot, deleted);
 	if (row <= MYS_ROW_UNCHANGED)
@@ -2135,6 +2178,9 @@ static void
 mys_comm_reset(void)
 {
 	clear_pending_err();
+	fastpath_probe_active = false;
+	fastpath_probe_saw_warning = false;
+	mys_discard_rewrite_warnings();
 	pending_stmt_execute = false;
 	mys_txn_clear_fallback_stmt_timeout();
 	memset(upsert_rows, 0, sizeof(upsert_rows));

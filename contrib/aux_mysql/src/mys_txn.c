@@ -50,6 +50,7 @@
 
 /* sysvar_core.c: 0 = off, otherwise on */
 extern int	autoCommit;
+extern bool needCommitTrx;
 
 bool		halo_mysql_statement_rollback = true;
 
@@ -81,6 +82,8 @@ autocommit_value(Node *expr)
 				{
 					const char *s = strVal(&c->val);
 
+					if (strcmp(s, "halo_mysql_system_var_default") == 0)
+						return mys_default_autocommit() ? 1 : 0;
 					if (pg_strcasecmp(s, "1") == 0 || pg_strcasecmp(s, "on") == 0 ||
 						pg_strcasecmp(s, "true") == 0)
 						return 1;
@@ -135,7 +138,11 @@ find_set_autocommit(Node *set)
 		name = linitial(fc->args);
 		if (IsA(name, A_Const) && IsA(&((A_Const *) name)->val, String) &&
 			pg_strcasecmp(strVal(&((A_Const *) name)->val), "autocommit") == 0)
+		{
+			if (result != -2)
+				return -1;
 			result = autocommit_value(lsecond(fc->args));
+		}
 	}
 	return result;
 }
@@ -274,25 +281,32 @@ make_txn_stmt(TransactionStmtKind kind, int location)
 }
 
 static void
-emit_txn(List **stmts, List **infos, TransactionStmtKind kind, int location)
+emit_txn_op(List **stmts, List **infos, TransactionStmtKind kind, MysTxnOp op, int location)
 {
 	MysStmtInfo *info = palloc0(sizeof(MysStmtInfo));
 
 	info->suppress_response = true;
 	info->txn_control = true;
-	info->txn_op = kind == TRANS_STMT_BEGIN ? MYS_TXNOP_BEGIN :
-		kind == TRANS_STMT_COMMIT ? MYS_TXNOP_COMMIT :
-		kind == TRANS_STMT_SAVEPOINT ? MYS_TXNOP_SAVEPOINT : MYS_TXNOP_RELEASE;
+	info->txn_op = op;
 	info->set_autocommit = -1;
 	*stmts = lappend(*stmts, make_txn_stmt(kind, location));
 	*infos = lappend(*infos, info);
 }
 
 static void
+emit_txn(List **stmts, List **infos, TransactionStmtKind kind, int location)
+{
+	MysTxnOp	op = kind == TRANS_STMT_BEGIN ? MYS_TXNOP_BEGIN :
+		kind == TRANS_STMT_COMMIT ? MYS_TXNOP_COMMIT :
+		kind == TRANS_STMT_SAVEPOINT ? MYS_TXNOP_SAVEPOINT : MYS_TXNOP_RELEASE;
+
+	emit_txn_op(stmts, infos, kind, op, location);
+}
+
+static void
 emit_idle_commit(List **stmts, List **infos, int location)
 {
-	emit_txn(stmts, infos, TRANS_STMT_COMMIT, location);
-	((MysStmtInfo *) llast(*infos))->txn_op = MYS_TXNOP_COMMIT_IDLE;
+	emit_txn_op(stmts, infos, TRANS_STMT_COMMIT, MYS_TXNOP_COMMIT_IDLE, location);
 }
 
 /*
@@ -307,10 +321,13 @@ mys_txn_apply(List *stmts, List **infos)
 	List	   *out_infos = NIL;
 	bool		in_block = IsTransactionBlock();
 	bool		autocommit = (autoCommit != 0);
+	bool		autocommit_unknown = false;
 	int			ngroups = 0;
 	int			group = 0;
 	int			n = list_length(stmts);
 	int			i = 0;
+
+	needCommitTrx = false;
 
 	/* A failed statement can leave a provisional block behind.  End it
 	 * before planning another statement, so its snapshot/isolation cannot
@@ -342,27 +359,43 @@ mys_txn_apply(List *stmts, List **infos)
 		RawStmt    *rs = list_nth(stmts, i);
 		int			kind = first->txn_kind;
 		int			loc = rs->stmt_location;
+		bool		dynamic_ac = (kind == MYS_TXN_SET_AUTOCOMMIT && first->set_autocommit < 0);
 		bool		wrap;
 
 		/* implicit commit before */
-		if (in_block &&
+		if (autocommit_unknown &&
 			(kind == MYS_TXN_BEGIN || kind == MYS_TXN_IMPLICIT_COMMIT ||
-			 (kind == MYS_TXN_SET_AUTOCOMMIT && first->set_autocommit == 1 && !autocommit)))
+			 (kind == MYS_TXN_SET_AUTOCOMMIT && first->set_autocommit == 1)))
+		{
+			emit_txn_op(&out, &out_infos, TRANS_STMT_COMMIT, MYS_TXNOP_COMMIT_IF_BLOCK, loc);
+			if (kind != MYS_TXN_SET_AUTOCOMMIT)
+				in_block = false;
+		}
+		else if (in_block &&
+				 (kind == MYS_TXN_BEGIN || kind == MYS_TXN_IMPLICIT_COMMIT ||
+				  (kind == MYS_TXN_SET_AUTOCOMMIT && first->set_autocommit == 1 && !autocommit)))
 		{
 			emit_txn(&out, &out_infos, TRANS_STMT_COMMIT, loc);
 			in_block = false;
 		}
 
 		/* autocommit = 0: implicit begin */
-		if (!autocommit &&
-			(kind == MYS_TXN_REGULAR || kind == MYS_TXN_SAVEPOINT))
+		if (kind == MYS_TXN_REGULAR || kind == MYS_TXN_SAVEPOINT)
 		{
-			emit_txn(&out, &out_infos, TRANS_STMT_BEGIN, loc);
-			in_block = true;
+			if (autocommit_unknown)
+			{
+				emit_txn_op(&out, &out_infos, TRANS_STMT_BEGIN, MYS_TXNOP_BEGIN_AUTO_OFF, loc);
+				in_block = true;
+			}
+			else if (!autocommit)
+			{
+				emit_txn(&out, &out_infos, TRANS_STMT_BEGIN, loc);
+				in_block = true;
+			}
 		}
 
 		/* statement-level rollback point */
-		wrap = in_block && halo_mysql_statement_rollback &&
+		wrap = (in_block || autocommit_unknown) && halo_mysql_statement_rollback &&
 			(kind == MYS_TXN_REGULAR || kind == MYS_TXN_NEUTRAL ||
 			 kind == MYS_TXN_SET_AUTOCOMMIT);
 		if (wrap)
@@ -371,14 +404,28 @@ mys_txn_apply(List *stmts, List **infos)
 		/* the statements of this MySQL statement */
 		do
 		{
+			MysStmtInfo *cur = list_nth(*infos, i);
+
+			if (dynamic_ac)
+				cur->suppress_response = true;
 			out = lappend(out, list_nth(stmts, i));
-			out_infos = lappend(out_infos, list_nth(*infos, i));
+			out_infos = lappend(out_infos, cur);
 			i++;
 		} while (i < n && !((MysStmtInfo *) list_nth(*infos, i))->group_start);
 		group++;
 
 		if (wrap)
 			emit_txn(&out, &out_infos, TRANS_STMT_RELEASE, loc);
+
+		if (dynamic_ac)
+		{
+			MysStmtInfo *ac_info;
+
+			emit_txn_op(&out, &out_infos, TRANS_STMT_COMMIT, MYS_TXNOP_COMMIT_AUTOCOMMIT, loc);
+			ac_info = (MysStmtInfo *) llast(out_infos);
+			ac_info->suppress_response = false;
+			ac_info->silent = true;
+		}
 
 		switch (kind)
 		{
@@ -390,7 +437,12 @@ mys_txn_apply(List *stmts, List **infos)
 				break;
 			case MYS_TXN_SET_AUTOCOMMIT:
 				if (first->set_autocommit >= 0)
+				{
 					autocommit = (first->set_autocommit == 1);
+					autocommit_unknown = false;
+				}
+				else
+					autocommit_unknown = true;
 				break;
 			default:
 				break;
@@ -399,14 +451,17 @@ mys_txn_apply(List *stmts, List **infos)
 		/* Runtime table access decides whether the provisional BEGIN stays.
 		 * The next BEGIN/SAVEPOINT is conditional too: a packet can contain
 		 * any mixture of table reads, table-free SELECTs, SET and EXECUTE. */
-		if (in_block && !autocommit)
+		if (!dynamic_ac && (autocommit_unknown || (in_block && !autocommit)))
 			emit_idle_commit(&out, &out_infos, loc);
 
 		/*
 		 * Outside a transaction, a statement of a multi-statement query is
-		 * committed on its own (and DDL always is).
+		 * committed on its own (and DDL always is).  When autocommit_unknown
+		 * is set, emit_idle_commit above already commits whenever no active
+		 * transaction block is open.
 		 */
-		if (!in_block && group < ngroups && kind != MYS_TXN_END)
+		if (!dynamic_ac && !autocommit_unknown && !in_block &&
+			group < ngroups && kind != MYS_TXN_END)
 			emit_txn(&out, &out_infos, TRANS_STMT_COMMIT, loc);
 	}
 
@@ -422,6 +477,17 @@ mys_txn_skip_control(MysStmtInfo *info)
 		return mys_transaction_active();
 	if (info->txn_op == MYS_TXNOP_BEGIN)
 		return mys_transaction_has_block();
+	if (info->txn_op == MYS_TXNOP_BEGIN_AUTO_OFF)
+		return autoCommit != 0 || mys_transaction_has_block();
+	if (info->txn_op == MYS_TXNOP_COMMIT_AUTOCOMMIT)
+	{
+		bool		commit = needCommitTrx;
+
+		needCommitTrx = false;
+		return mys_transaction_has_block() && !commit;
+	}
+	if (info->txn_op == MYS_TXNOP_COMMIT_IF_BLOCK)
+		return !mys_transaction_has_block();
 	if ((info->txn_op == MYS_TXNOP_SAVEPOINT || info->txn_op == MYS_TXNOP_RELEASE) &&
 		!mys_transaction_has_block())
 	{
@@ -548,6 +614,7 @@ mys_txn_recover(void)
 	MemoryContext oldcxt;
 
 	mys_txn_clear_fallback_stmt_timeout();
+	needCommitTrx = false;
 
 	if (abort_transaction)
 	{

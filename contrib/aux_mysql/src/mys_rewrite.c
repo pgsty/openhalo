@@ -313,9 +313,10 @@ static List *rewrite_warnings = NIL;
 static void
 queue_rewrite_warning(List **warnings, const char *message)
 {
+	MemoryContext target = MessageContext ? MessageContext : CurrentMemoryContext;
 	MemoryContext oldcontext;
 
-	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	oldcontext = MemoryContextSwitchTo(target);
 	foreach_ptr(char, previous, *warnings)
 		if (strcmp(previous, message) == 0)
 		{
@@ -678,6 +679,20 @@ mys_discard_rewrite_warnings(void)
 {
 	list_free_deep(rewrite_warnings);
 	rewrite_warnings = NIL;
+}
+
+void
+mys_discard_stmt_warnings(List *infos)
+{
+	foreach_ptr(MysStmtInfo, info, infos)
+	{
+		if (info->rewrite_warnings != NIL)
+		{
+			list_free_deep(info->rewrite_warnings);
+			info->rewrite_warnings = NIL;
+		}
+	}
+	mys_discard_rewrite_warnings();
 }
 
 /* type of a column defined in this statement, or else in the catalog */
