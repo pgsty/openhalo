@@ -123,7 +123,28 @@ strip_relabel(Node *node)
 	return node;
 }
 
-/* Accept only a column = constant/external parameter in the index opfamily. */
+static bool
+has_non_extern_param_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+		return ((Param *) node)->paramkind != PARAM_EXTERN;
+	if (IsA(node, SubPlan) || IsA(node, AlternativeSubPlan) || IsA(node, SubLink))
+		return true;
+	return expression_tree_walker(node, has_non_extern_param_walker, context);
+}
+
+static bool
+is_safe_key_rhs(Node *expr)
+{
+	return expr != NULL &&
+		!contain_var_clause(expr) &&
+		!contain_volatile_functions(expr) &&
+		!has_non_extern_param_walker(expr, NULL);
+}
+
+/* Accept a column = constant/runtime-parameter expression in the index opfamily. */
 static OpExpr *
 key_qual(List *quals, Relation index, int key, Index rti)
 {
@@ -132,7 +153,6 @@ key_qual(List *quals, Relation index, int key, Index rti)
 		OpExpr	   *op;
 		Node	   *left;
 		Node	   *right;
-		Node	   *right_bare;
 		Oid			opno;
 		Var		   *var;
 		OpExpr	   *result;
@@ -149,11 +169,7 @@ key_qual(List *quals, Relation index, int key, Index rti)
 			right = linitial(op->args);
 			opno = get_commutator(opno);
 		}
-		right_bare = strip_relabel(right);
-		if (!IsA(left, Var) || !OidIsValid(opno) ||
-			!(IsA(right_bare, Const) ||
-			  (IsA(right_bare, Param) &&
-			   ((Param *) right_bare)->paramkind == PARAM_EXTERN)))
+		if (!IsA(left, Var) || !OidIsValid(opno) || !is_safe_key_rhs(right))
 			continue;
 		var = (Var *) left;
 		if (var->varno != rti || var->varlevelsup != 0 ||
@@ -870,6 +886,7 @@ mys_current_read_plan(PlannedStmt *stmt, bool has_row_security)
 							  &indexid, &keys))
 	{
 		bool		allow_defer = !modify->onConflictIgnore && modify->canSetTag &&
+			stmt->subplans == NIL &&
 			!contain_volatile_functions((Node *) scan->plan.targetlist) &&
 			!contain_volatile_functions((Node *) quals);
 
@@ -1055,7 +1072,7 @@ current_read_next(ScanState *ss)
 	MysCurrentRead *node = (MysCurrentRead *) ss;
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 
-	if (node->done)
+	if (node->done || ss->ps.state->es_epq_active != NULL)
 		return ExecClearTuple(slot);
 	if (node->scan == NULL)
 		open_index_scan(node, ss, false);

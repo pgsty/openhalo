@@ -34,6 +34,7 @@
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_depend.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
 #include "commands/defrem.h"
@@ -118,6 +119,16 @@ make_column_generated(Oid relid, const char *name)
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "column %s does not exist", name);
 	att = (Form_pg_attribute) GETSTRUCT(tuple);
+	if (get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE ||
+		has_subclass(relid) || att->attinhcount > 0)
+	{
+		heap_freetuple(tuple);
+		table_close(attrs, RowExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot convert existing column \"%s\" of partitioned or inherited table to generated column",
+						name)));
+	}
 	Assert(!att->attgenerated && !att->attidentity && !att->atthasdef);
 	attnum = att->attnum;
 	placeholder = (Node *) makeNullConst(att->atttypid, att->atttypmod,
@@ -354,11 +365,18 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 	Constraint *identity = NULL;
 	Constraint *generated = NULL;
 	AttrNumber	attnum = get_attnum(relid, colname);
-	bool		was_identity = attnum > 0 && column_is_identity(relid, attnum);
-	bool		was_generated = attnum > 0 && get_attgenerated(relid, attnum) != '\0';
+	bool		was_identity;
+	bool		was_generated;
 	bool		keep_type = false;
 	List	   *checks = NIL;
 	ListCell   *lc;
+
+	if (attnum <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("Unknown column '%s' in '%s'", colname, get_rel_name(relid))));
+	was_identity = column_is_identity(relid, attnum);
+	was_generated = get_attgenerated(relid, attnum) != '\0';
 
 	foreach(lc, def->constraints)
 	{
@@ -1202,11 +1220,12 @@ generation_expression(Node *raw, TypeName *type, List *columns, Oid nspid,
 	if (row_anchor)
 		argtypes[n++] = OIDOID;
 
-	/* named after what it computes, including the typmod and conversion */
+	/* named after what it computes, including the typmod, conversion, and owner */
 	initStringInfo(&key);
-	appendStringInfo(&key, "2|%s|%s|%u", nodeToString(body),
+	appendStringInfo(&key, "3|%s|%s|%u|%u", nodeToString(body),
 					 GetConfigOption("search_path", false, false),
-					 typenameTypeId(NULL, type));
+					 typenameTypeId(NULL, type),
+					 GetUserId());
 	for (int i = 0; i < n; i++)
 		appendStringInfo(&key, ",%u", argtypes[i]);
 	snprintf(name, sizeof(name), "%s%016" PRIx64 "%016" PRIx64, MYS_GENERATOR_PREFIX,
@@ -1214,47 +1233,59 @@ generation_expression(Node *raw, TypeName *type, List *columns, Oid nspid,
 			 hash_bytes_extended((unsigned char *) key.data, key.len, UINT64CONST(0x9e3779b97f4a7c15)));
 	funcname = list_make2(makeString(get_namespace_name(nspid)), makeString(pstrdup(name)));
 
-	if (!OidIsValid(LookupFuncName(funcname, n, argtypes, true)))
 	{
-		CreateFunctionStmt *f = makeNode(CreateFunctionStmt);
-		ReturnStmt *ret = makeNode(ReturnStmt);
-		VariableSetStmt *path = makeNode(VariableSetStmt);
+		Oid			existing_fn = LookupFuncName(funcname, n, argtypes, true);
 
-		foreach_ptr(char, colname, known)
+		if (OidIsValid(existing_fn))
 		{
-			FunctionParameter *p = makeNode(FunctionParameter);
+			GenPolicy	policy = {NIL, true};
 
-			p->name = colname;
-			p->argType = copyObject(find_gen_column(columns, colname)->type);
-			p->mode = FUNC_PARAM_IN;
-			p->location = -1;
-			f->parameters = lappend(f->parameters, p);
+			if (!object_ownercheck(ProcedureRelationId, existing_fn, GetUserId()))
+				aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_FUNCTION, name);
+			gen_policy_function(existing_fn, NULL, &policy);
 		}
-		if (row_anchor)
+		else
 		{
-			FunctionParameter *p = makeNode(FunctionParameter);
+			CreateFunctionStmt *f = makeNode(CreateFunctionStmt);
+			ReturnStmt *ret = makeNode(ReturnStmt);
+			VariableSetStmt *path = makeNode(VariableSetStmt);
 
-			p->argType = makeTypeNameFromOid(OIDOID, -1);
-			p->mode = FUNC_PARAM_IN;
-			p->location = -1;
-			f->parameters = lappend(f->parameters, p);
+			foreach_ptr(char, colname, known)
+			{
+				FunctionParameter *p = makeNode(FunctionParameter);
+
+				p->name = colname;
+				p->argType = copyObject(find_gen_column(columns, colname)->type);
+				p->mode = FUNC_PARAM_IN;
+				p->location = -1;
+				f->parameters = lappend(f->parameters, p);
+			}
+			if (row_anchor)
+			{
+				FunctionParameter *p = makeNode(FunctionParameter);
+
+				p->argType = makeTypeNameFromOid(OIDOID, -1);
+				p->mode = FUNC_PARAM_IN;
+				p->location = -1;
+				f->parameters = lappend(f->parameters, p);
+			}
+			/*
+			 * aux_mysql's PL/pgSQL functions resolve their names at run time,
+			 * through search_path: mysql, as in MySQL sessions, also when a
+			 * PostgreSQL session or pg_restore writes the table.
+			 */
+			path->kind = VAR_SET_VALUE;
+			path->name = "search_path";
+			path->args = list_make2(makeStringConst("mysql", -1), makeStringConst("pg_catalog", -1));
+			f->funcname = funcname;
+			f->returnType = copyObject(type);
+			f->options = list_make2(makeDefElem("volatility", (Node *) makeString("immutable"), -1),
+									makeDefElem("set", (Node *) path, -1));
+			ret->returnval = body;
+			f->sql_body = (Node *) ret;
+			run_utility((Node *) f, pstmt, queryString, params, queryEnv);
+			CommandCounterIncrement();
 		}
-		/*
-		 * aux_mysql's PL/pgSQL functions resolve their names at run time,
-		 * through search_path: mysql, as in MySQL sessions, also when a
-		 * PostgreSQL session or pg_restore writes the table.
-		 */
-		path->kind = VAR_SET_VALUE;
-		path->name = "search_path";
-		path->args = list_make2(makeStringConst("mysql", -1), makeStringConst("pg_catalog", -1));
-		f->funcname = funcname;
-		f->returnType = copyObject(type);
-		f->options = list_make2(makeDefElem("volatility", (Node *) makeString("immutable"), -1),
-								makeDefElem("set", (Node *) path, -1));
-		ret->returnval = body;
-		f->sql_body = (Node *) ret;
-		run_utility((Node *) f, pstmt, queryString, params, queryEnv);
-		CommandCounterIncrement();
 	}
 	foreach_ptr(char, colname, known)
 	{

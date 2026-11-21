@@ -676,7 +676,8 @@ RI_FKey_check_update(Relation rel, TupleTableSlot *oldslot, TupleTableSlot *news
 		 !MyProtocolExtension->foreign_key_checks()))
 		return true;
 
-	if (MyProtocolExtension && MyProtocolExtension->foreign_key_insert &&
+	if (rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE &&
+		MyProtocolExtension && MyProtocolExtension->foreign_key_insert &&
 		!MyProtocolExtension->foreign_key_insert(rel, oldslot, newslot, true))
 		return false;
 
@@ -690,7 +691,8 @@ RI_FKey_check_update(Relation rel, TupleTableSlot *oldslot, TupleTableSlot *news
 
 		if (trigger->tgfoid == F_RI_FKEY_CHECK_UPD)
 		{
-			if (!RI_FKey_fk_upd_check_required(trigger, rel, oldslot, newslot))
+			if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+				!RI_FKey_fk_upd_check_required(trigger, rel, oldslot, newslot))
 				continue;
 			td.type = T_TriggerData;
 			td.tg_event = TRIGGER_EVENT_UPDATE | TRIGGER_EVENT_ROW;

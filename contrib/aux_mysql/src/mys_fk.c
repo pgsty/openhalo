@@ -413,7 +413,12 @@ pending_tables(bool first_only)
 			Form_pg_trigger row = (Form_pg_trigger) GETSTRUCT(trigger_tuple);
 
 			if (row->tgfoid == func && row->tgparentid == InvalidOid)
-				result = list_append_unique_oid(result, row->tgrelid);
+			{
+				Oid relnsp = get_rel_namespace(row->tgrelid);
+
+				if (OidIsValid(relnsp) && !isOtherTempNamespace(relnsp))
+					result = list_append_unique_oid(result, row->tgrelid);
+			}
 		}
 		systable_endscan(trigger_scan);
 		if (first_only && result != NIL) break;
@@ -603,14 +608,17 @@ require_owner(Oid relid)
  * FK REFERENCES checks (table grant or every referenced column), and check
  * namespace USAGE before inspecting an otherwise inaccessible parent. */
 static bool
-owner_can_reference(Oid child, Oid parent, Constraint *c)
+owner_can_reference(Oid child, Oid parent, Constraint *c, bool lock_parent)
 {
-	Relation childrel = table_open(child, NoLock);
-	Oid owner = childrel->rd_rel->relowner;
+	HeapTuple ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(child));
+	Oid owner;
 	Relation parentrel;
 	bool allowed = true;
 
-	table_close(childrel, NoLock);
+	if (!HeapTupleIsValid(ctup))
+		return false;
+	owner = ((Form_pg_class) GETSTRUCT(ctup))->relowner;
+	ReleaseSysCache(ctup);
 	/* Check ACLs under AccessShareLock first before taking ShareRowExclusiveLock. */
 	parentrel = table_open(parent, AccessShareLock);
 	if (object_aclcheck(NamespaceRelationId, RelationGetNamespace(parentrel), owner,
@@ -655,6 +663,8 @@ owner_can_reference(Oid child, Oid parent, Constraint *c)
 	table_close(parentrel, AccessShareLock);
 	if (!allowed)
 		return false;
+	if (!lock_parent)
+		return true;
 	/* Retain an authorized parent's lock until ALTER has installed the FK. */
 	LockRelationOid(parent, ShareRowExclusiveLock);
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(parent)))
@@ -683,25 +693,12 @@ extract_missing(List *nodes, const char *column, RangeVar *child, Oid relid,
 			continue;
 		}
 		c = (Constraint *) node;
+		if (isTempNamespace(get_namespace_oid(child->schemaname, false)))
+			ereport(ERROR,
+					(errcode(MAKE_SQLSTATE('M','1','2','1','5')),
+					 errmsg("Cannot add foreign key constraint")));
 		if (c->pktable->schemaname == NULL)
-		{
-			Oid child_nsp = get_namespace_oid(child->schemaname, false);
-
-			if (isTempNamespace(child_nsp) &&
-				strcmp(c->pktable->relname, child->relname) != 0 &&
-				!OidIsValid(get_relname_relid(c->pktable->relname, child_nsp)))
-			{
-				const char *sel = mys_selected_database();
-
-				if (sel == NULL)
-					ereport(ERROR,
-							(errcode(MYS_ERRCODE_NO_DB_ERROR),
-							 errmsg("No database selected")));
-				c->pktable->schemaname = pstrdup(mys_catalog_schema_name(sel));
-			}
-			else
-				c->pktable->schemaname = pstrdup(child->schemaname);
-		}
+			c->pktable->schemaname = pstrdup(child->schemaname);
 		if (OidIsValid(parent_oid(c)) ||
 			(strcmp(child->relname, c->pktable->relname) == 0 &&
 			 strcmp(child->schemaname, c->pktable->schemaname) == 0))
@@ -1055,12 +1052,31 @@ rename_column_list(List *columns, const char *old, const char *new)
 static void
 rename_pending(MysFKUtility *state)
 {
+	Oid target_nsp;
+
 	if (!state->old_schema || (!state->new_schema && !OidIsValid(state->target))) return;
+	target_nsp = state->new_schema ?
+		get_namespace_oid(state->new_schema, true) :
+		get_rel_namespace(state->target);
 	foreach_oid(child, pending_tables(false))
 	{
-		List *keys = pending_keys(child);
+		List *keys;
 		bool changed = false;
 
+		if (child != state->target)
+		{
+			HeapTuple ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(child));
+			Oid owner;
+
+			if (!HeapTupleIsValid(ctup))
+				continue;
+			owner = ((Form_pg_class) GETSTRUCT(ctup))->relowner;
+			ReleaseSysCache(ctup);
+			if (!OidIsValid(target_nsp) ||
+				object_aclcheck(NamespaceRelationId, target_nsp, owner, ACL_USAGE) != ACLCHECK_OK)
+				continue;
+		}
+		keys = pending_keys(child);
 		foreach_node(Constraint, c, keys)
 		{
 			bool parent = strcmp(c->pktable->schemaname, state->old_schema) == 0 &&
@@ -1084,7 +1100,8 @@ rename_pending(MysFKUtility *state)
 		if (changed)
 		{
 			LockRelationOid(child, AccessExclusiveLock);
-			save_keys(child, keys);
+			if (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(child)))
+				save_keys(child, keys);
 		}
 	}
 }
@@ -1133,8 +1150,18 @@ mys_fk_after_utility(MysFKUtility *state)
 				remaining = lappend(remaining, c);
 				continue;
 			}
+			if (!owner_can_reference(child, parent, c, false))
+			{
+				ereport(WARNING, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					errmsg("foreign key \"%s\" remains pending: child owner lacks USAGE or REFERENCES on \"%s.%s\"",
+						   c->conname, c->pktable->schemaname, c->pktable->relname)));
+				remaining = lappend(remaining, c);
+				continue;
+			}
 			LockRelationOid(child, AccessExclusiveLock);
-			if (!owner_can_reference(child, parent, c))
+			if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(child)))
+				break;
+			if (!owner_can_reference(child, parent, c, true))
 			{
 				ereport(WARNING, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					errmsg("foreign key \"%s\" remains pending: child owner lacks USAGE or REFERENCES on \"%s.%s\"",

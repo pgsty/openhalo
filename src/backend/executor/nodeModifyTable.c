@@ -2158,6 +2158,99 @@ ExecCrossPartitionUpdate(ModifyTableContext *context,
 		MemoryContextSwitchTo(oldcxt);
 	}
 
+	if (((ModifyTable *) mtstate->ps.plan)->onConflictIgnore &&
+		mtstate->operation == CMD_UPDATE &&
+		tupleid != NULL && ItemPointerIsValid(tupleid) &&
+		updateCxt->oldSlot != NULL)
+	{
+		TupleTableSlot *lockSlot = ExecGetReturningSlot(estate, resultRelInfo);
+		TM_Result	lockRes;
+
+		lockRes = table_tuple_lock(resultRelInfo->ri_RelationDesc, tupleid,
+								   estate->es_snapshot, lockSlot,
+								   estate->es_output_cid,
+								   LockTupleExclusive, LockWaitBlock,
+								   0, &context->tmfd);
+		ExecClearTuple(lockSlot);
+		if (lockRes == TM_Ok)
+		{
+			ResultRelInfo *rootRelInfo = mtstate->rootResultRelInfo;
+			TupleTableSlot *rootSlot = slot;
+			TupleTableSlot *oldRootSlot = updateCxt->oldSlot;
+			TupleTableSlot *freeOldRoot = NULL;
+			ResultRelInfo *partrel;
+			TupleConversionMap *map;
+			TupleTableSlot *dstSlot;
+			TupleTableSlot *checkSlot;
+			ItemPointerData conflictTid;
+			ItemPointerData invalidItemPtr;
+
+			tupconv_map = ExecGetChildToRootMap(resultRelInfo);
+			if (tupconv_map != NULL)
+			{
+				rootSlot = execute_attr_map_slot(tupconv_map->attrMap,
+												 slot,
+												 mtstate->mt_root_tuple_slot);
+				freeOldRoot = MakeSingleTupleTableSlot(RelationGetDescr(rootRelInfo->ri_RelationDesc),
+													   &TTSOpsVirtual);
+				oldRootSlot = execute_attr_map_slot(tupconv_map->attrMap,
+													updateCxt->oldSlot,
+													freeOldRoot);
+			}
+
+			partrel = ExecFindPartition(mtstate, rootRelInfo,
+										mtstate->mt_partition_tuple_routing,
+										rootSlot, estate);
+			map = ExecGetRootToChildMap(partrel, estate);
+			dstSlot = map ? execute_attr_map_slot(map->attrMap, rootSlot,
+												  partrel->ri_PartitionTupleSlot) : rootSlot;
+			checkSlot = ExecGetReturningSlot(estate, partrel);
+			ExecCopySlot(checkSlot, dstSlot);
+			checkSlot->tts_tableOid = RelationGetRelid(partrel->ri_RelationDesc);
+			if (partrel->ri_RelationDesc->rd_att->constr &&
+				partrel->ri_RelationDesc->rd_att->constr->has_generated_stored)
+				ExecComputeStoredGenerated(partrel, estate, checkSlot, CMD_INSERT);
+			if (partrel->ri_WithCheckOptions != NIL)
+				ExecWithCheckOptions(WCO_RLS_UPDATE_CHECK, partrel, checkSlot, estate);
+			if (partrel->ri_RelationDesc->rd_att->constr)
+				ExecConstraints(partrel, checkSlot, estate);
+			if (partrel->ri_RelationDesc->rd_rel->relhasindex &&
+				partrel->ri_IndexRelationDescs == NULL)
+				ExecOpenIndices(partrel, true);
+
+			ItemPointerSetInvalid(&invalidItemPtr);
+			if (partrel->ri_NumIndices > 0 &&
+				!ExecCheckIndexConstraints(partrel, checkSlot, estate,
+										   &conflictTid, &invalidItemPtr, NIL))
+			{
+				ereport(WARNING,
+						(errcode(ERRCODE_UNIQUE_VIOLATION),
+						 errmsg("Duplicate entry for unique key")));
+				ExecClearTuple(checkSlot);
+				if (freeOldRoot)
+					ExecDropSingleTupleTableSlot(freeOldRoot);
+				updateCxt->ignored = true;
+				return true;
+			}
+
+			if (mtstate->mt_has_written)
+				CommandCounterIncrement();
+			if (!RI_FKey_check_insert(partrel->ri_RelationDesc, checkSlot) ||
+				!RI_FKey_check_update(rootRelInfo->ri_RelationDesc,
+									  oldRootSlot, rootSlot))
+			{
+				ExecClearTuple(checkSlot);
+				if (freeOldRoot)
+					ExecDropSingleTupleTableSlot(freeOldRoot);
+				updateCxt->ignored = true;
+				return true;
+			}
+			ExecClearTuple(checkSlot);
+			if (freeOldRoot)
+				ExecDropSingleTupleTableSlot(freeOldRoot);
+		}
+	}
+
 	/*
 	 * Row movement, part 1.  Delete the tuple, but skip RETURNING processing.
 	 * We want to return rows from INSERT.
@@ -2401,6 +2494,9 @@ lreplace:
 									 &inserted_tuple,
 									 &insert_destrel))
 		{
+			if (updateCxt->ignored)
+				return TM_Ok;
+
 			/* success! */
 			updateCxt->crossPartUpdate = true;
 
@@ -2967,7 +3063,10 @@ ExecOnConflictDelete(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 		elog(ERROR, "unexpected tuple lock status during conflict deletion: %u", result);
 	ExecCheckTupleVisible(estate, rel, existing);
 	if (resultRelInfo->ri_WithCheckOptions != NIL)
+	{
 		ExecWithCheckOptions(WCO_RLS_CONFLICT_CHECK, resultRelInfo, existing, estate);
+		ExecWithCheckOptions(WCO_VIEW_CONFLICT_CHECK, resultRelInfo, existing, estate);
+	}
 	CheckCmdReplicaIdentity(rel, CMD_DELETE);
 
 	for (int i = 0; i < resultRelInfo->ri_NumIndices; i++)

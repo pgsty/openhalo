@@ -313,7 +313,7 @@ mys_on_update_trigger(PG_FUNCTION_ARGS)
 	newt = td->tg_newtuple;
 	tg = td->tg_trigger;
 	natts = desc->natts;
-	info = mys_current_stmt_info();
+	info = mys_trigger_depth() <= 1 ? mys_current_stmt_info() : NULL;
 
 	auto_cols = palloc0(sizeof(int) * (natts + 1));
 	for (int i = 0; i < tg->tgnargs; i++)
@@ -375,6 +375,7 @@ typedef struct AutoIncCache
 	Oid			relid;
 	AttrNumber	attnum;
 	Oid			seqoid;
+	Oid			seqowner;
 	Oid			typid;
 } AutoIncCache;
 
@@ -508,6 +509,18 @@ mys_autoinc_trigger(PG_FUNCTION_ARGS)
 					break;
 			}
 		}
+		if (OidIsValid(cache->seqoid))
+		{
+			HeapTuple	seqtup = SearchSysCache1(RELOID, ObjectIdGetDatum(cache->seqoid));
+
+			if (HeapTupleIsValid(seqtup))
+			{
+				cache->seqowner = ((Form_pg_class) GETSTRUCT(seqtup))->relowner;
+				ReleaseSysCache(seqtup);
+			}
+			else
+				cache->seqowner = rel->rd_rel->relowner;
+		}
 		fcinfo->flinfo->fn_extra = cache;
 	}
 	if (!OidIsValid(cache->seqoid))
@@ -551,11 +564,11 @@ mys_autoinc_trigger(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * The sequence belongs to the table's owner; inserting into the table is
-	 * what entitles to move it (as nextval() for the identity does).
+	 * The sequence belongs to the identity column's table owner; inserting
+	 * into the table (or leaf partition) entitles moving it.
 	 */
 	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	SetUserIdAndSecContext(rel->rd_rel->relowner,
+	SetUserIdAndSecContext(OidIsValid(cache->seqowner) ? cache->seqowner : rel->rd_rel->relowner,
 						   save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
 						   SECURITY_RESTRICTED_OPERATION);
 

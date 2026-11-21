@@ -3882,7 +3882,8 @@ rewriteTargetView(Query *parsetree, Relation view)
 		bool		cascaded = RelationHasCascadedCheckOption(view);
 		bool		do_conflict_check = parsetree->onConflict &&
 			(parsetree->onConflict->action == ONCONFLICT_UPDATE ||
-			 parsetree->onConflict->action == ONCONFLICT_SELECT);
+			 parsetree->onConflict->action == ONCONFLICT_SELECT ||
+			 parsetree->onConflict->replace);
 
 		/*
 		 * If the parent view has a cascaded check option, treat this view as
