@@ -17,27 +17,35 @@ version is `19.0.0`, reported by `SHOW openhalo.version` and MySQL
 
 ## 19.0.0 (unreleased)
 
-- Check for deadlocks when MySQL tuple/transaction lock waits enter the queue,
-  avoiding repeated one-second detection delays in hotspot workloads. Preserve
-  timed fallback, ordinary waits, native PG behavior and lock-wait log thresholds;
-  add the administrator-controlled `mysql.early_deadlock_check` switch.
-- Apply current unique-key writes to BitmapHeapScan plans too. Sustained writes
-  could change the cost-based plan and reintroduce skipped deletes and 1062.
-  Add deterministic cycle, cancellation, ledger-based transfer and repeated
-  sysbench tests; see the [hotspot report](contrib/aux_mysql/HOTSPOT-19.0.0.md).
+- Apply a reloadable dynamic-default `mysql.deadlock_timeout` (`50ms` default,
+  `0` inherits PostgreSQL's `deadlock_timeout`) to MySQL protocol sessions so
+  multi-row hotspot deadlocks resolve promptly without invoking eager lock-table
+  scans in `ProcSleep()` or affecting native PostgreSQL sessions.
 - Fix concurrent MySQL unique-key UPDATE/DELETE skipping a row deleted and
-  reinserted by another transaction, which made sysbench's following INSERT
-  fail with 1062. Resolve the current row under a tuple lock before evaluating
-  predicates and writes; preserve native PG and transaction-snapshot semantics.
+  reinserted by another transaction across `SeqScan`, `IndexScan`,
+  `BitmapHeapScan`, relabeled `VARCHAR` parameters, and single-table `LIMIT N`
+  (`N >= 1`) wrappers. Uncontended target rows modify directly without extra
+  pre-lock WAL or locks on false residual `WHERE` predicates; contended paths
+  use `ExecUpdateLockMode` (preserving child `FOR KEY SHARE` concurrency) and
+  non-chasing tuple locks.
 - Roll back the whole transaction after deadlocks/serialization failures and
-  report 1213 / 40001. Recover before setting idle state/timeouts so a rolled-back
-  connection is not treated as idle in a transaction. Add deterministic races
-  and remove 1062/1020 from sysbench's retry list.
+  report 1213 / 40001; defer in-session `ERROR` wire delivery until transaction
+  or statement-savepoint cleanup finishes; and re-arm `transaction_timeout` when
+  a transaction survives a statement error via its hidden savepoint.
+- Sanitize MySQL handshake `program_name` attributes via `pg_clean_ascii()`,
+  preserve `B_DEAD_END_BACKEND` during rejected handshakes, validate
+  `ProtocolExtensionConfig` size at registration (`RegisterProtocolExtensionSized`),
+  and fix `utf8mb4_general_ci` `pg_strxfrm` NUL-free encoding for PG19 planner
+  range selectivity while keeping persistent hash values unchanged.
+- Add the `aux_mysql` `1.9 → 2.0` extension upgrade script
+  (`ALTER EXTENSION aux_mysql UPDATE TO '2.0'`) with full catalog and ACL parity
+  for `pg_upgrade` migrations from `v18.6.1`.
 - Add a single product version definition and read-only `openhalo.version` /
   MySQL `version_comment` identifiers, separate from the kernel and SQL versions.
-- Accept keyword `version` in scoped/unscoped MySQL SET statements and reject
-  changes to version identifiers with error 1238 / HY000. Report error 1227 /
-  42000 for an ordinary user's SET GLOBAL privilege denial.
+- Accept unreserved and column-name keywords in scoped/unscoped MySQL `SET`
+  statements, report `1193` with the actual variable name for unknown variables,
+  reject changes to version identifiers with error 1238 / HY000, and report
+  error 1227 / 42000 for an ordinary user's `SET GLOBAL` privilege denial.
 - Correct the REPLACE no-op RETURNING path to use PG19's boolean `isDelete`
   argument instead of a PostgreSQL 18 command enum.
 - Align the configuration sample with PG19's formatting checks; keep the
@@ -49,14 +57,6 @@ version is `19.0.0`, reported by `SHOW openhalo.version` and MySQL
 - Preserve the new native `ON CONFLICT DO SELECT` locking fields in stored queries,
   native cancellation/TLS startup, sequence synchronization and the FK fast path.
 - Keep the MySQL grammar and consolidated 2.0 SQL as maintained source files.
-  A 1.x → 2.0 extension upgrade path is not included in this branch.
-- See [`PG19.md`](contrib/aux_mysql/PG19.md) for source provenance, validation and
-  migration boundaries. This is development work, not a published release.
-- See the [19.0.0 review report](contrib/aux_mysql/REVIEW-19.0.0.md) for the new
-  cross-platform, sanitizer, PGXS, replication and compatibility test round,
-  including the original sysbench failure. The
-  [concurrency investigation](contrib/aux_mysql/CONCURRENCY-19.0.0.md) records its
-  subsequent fixes and validation.
 
 ## v18.6.1
 

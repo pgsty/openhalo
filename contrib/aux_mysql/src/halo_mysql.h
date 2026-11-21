@@ -29,6 +29,7 @@ extern char *halo_mysql_database;
 extern bool halo_mysql_listener_on;
 extern char *halo_mysql_version;	/* mysql.halo_mysql_version (mys_compat.c) */
 extern int	halo_mysql_parser;
+extern int	halo_mysql_deadlock_timeout;
 
 typedef enum
 {
@@ -50,7 +51,7 @@ extern void mys_clear_selected_database_if_matches(const char *db);
 extern void mys_sync_selected_database(void);
 extern void halo_mysql_ensure_extension(void);
 extern void halo_mysql_lock_setup(void);
-extern bool mys_early_deadlock_check(const struct LOCKTAG *locktag);
+extern void mys_sync_deadlock_timeout(void);
 extern bool mys_foreign_key_checks(void);
 extern void mys_sync_foreign_key_checks(void);
 extern void mys_sync_session_state(void);

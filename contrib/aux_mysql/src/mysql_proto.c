@@ -821,9 +821,12 @@ mys_parse_connect_attrs(StringInfo b, Port *port)
 		if (klen == 12 && strncmp(k, "program_name", 12) == 0)
 		{
 			char	   *appname = pnstrdup(v, Min(vlen, NAMEDATALEN - 1));
+			char	   *clean = pg_clean_ascii(appname, 0);
 
-			pg_clean_ascii(appname, 0);
-			port->application_name = appname;
+			pfree(appname);
+			if (port->application_name)
+				pfree(port->application_name);
+			port->application_name = clean;
 		}
 	}
 }
@@ -1428,6 +1431,24 @@ mys_sync_selected_database(void)
  * Main loop hooks
  * ----------------------------------------------------------------
  */
+static bool pending_err_active = false;
+static uint16 pending_err_code = 0;
+static char pending_err_sqlstate[6];
+static char *pending_err_msg = NULL;
+
+static void
+clear_pending_err(void)
+{
+	if (pending_err_msg != NULL)
+	{
+		pfree(pending_err_msg);
+		pending_err_msg = NULL;
+	}
+	pending_err_active = false;
+	pending_err_code = 0;
+	pending_err_sqlstate[0] = '\0';
+}
+
 static void
 mys_send_ready_for_query(CommandDest dest)
 {
@@ -1437,6 +1458,7 @@ mys_send_ready_for_query(CommandDest dest)
 		PG_TRY();
 		{
 			halo_mysql_ensure_extension();
+			mys_sync_deadlock_timeout();
 			/* GLOBAL defaults (transaction_read_only ...) reach the first statement */
 			StartTransactionCommand();
 			mys_sync_session_state();
@@ -1475,6 +1497,11 @@ mys_send_ready_for_query(CommandDest dest)
 			mys_apply_selected_search_path();
 		}
 		mys_send_ok(0, 0, false, false);
+	}
+	if (pending_err_active)
+	{
+		mys_send_err(pending_err_code, pending_err_sqlstate, pending_err_msg);
+		clear_pending_err();
 	}
 	resultset_active = false;
 	stmt_infos = NIL;
@@ -1994,13 +2021,30 @@ mys_error_number(ErrorData *edata)
 		edata->message_id &&
 		strncmp(edata->message_id, "update or delete on table", 24) == 0)
 		return 1451;
+	if ((edata->sqlerrcode == ERRCODE_UNDEFINED_OBJECT ||
+		 edata->sqlerrcode == ERRCODE_RAISE_EXCEPTION) &&
+		((edata->message_id &&
+		  strncmp(edata->message_id, "Unknown system variable ", 24) == 0) ||
+		 (edata->message &&
+		  strncmp(edata->message, "Unknown system variable '", 25) == 0)))
+		return 1193;			/* ER_UNKNOWN_SYSTEM_VARIABLE */
 	return mys_errno(edata->sqlerrcode);
+}
+
+static const char *
+mys_error_sqlstate(ErrorData *edata, uint16 err_num)
+{
+	if (err_num == 1193)
+		return "HY000";
+	return mys_sqlstate(edata->sqlerrcode);
 }
 
 static void
 mys_send_message(ErrorData *edata)
 {
 	char	   *msg;
+	uint16		err_num;
+	const char *sqlstate;
 
 	if (edata->elevel < ERROR)
 	{
@@ -2011,6 +2055,8 @@ mys_send_message(ErrorData *edata)
 	}
 
 	mys_txn_note_error(edata->sqlerrcode);
+	err_num = mys_error_number(edata);
+	sqlstate = mys_error_sqlstate(edata, err_num);
 	msg = edata->message ? edata->message : "missing error text";
 	/* a key (a unique violation, ...): its MySQL name, not the PostgreSQL one */
 	if (edata->constraint_name)
@@ -2022,9 +2068,29 @@ mys_send_message(ErrorData *edata)
 		if (at && strcmp(key, edata->constraint_name) != 0)
 			msg = psprintf("%.*s\"%s\"%s", (int) (at - msg), msg, key, at + strlen(pgname));
 	}
-	mys_send_err(mys_error_number(edata),
-				 mys_sqlstate(edata->sqlerrcode), msg);
-	mys_flush();
+	/*
+	 * Defer serializing and flushing recoverable in-session ERROR packets
+	 * until mys_send_ready_for_query(), after AbortCurrentTransaction() and
+	 * mys_txn_recover() have released aborted locks.  Using a dedicated slot
+	 * instead of outbuf also prevents mys_send_packet()'s 64KB auto-flush from
+	 * exposing the error to fast-retrying clients prematurely.
+	 */
+	if (!handshake_done || edata->elevel >= FATAL || proc_exit_inprogress)
+	{
+		clear_pending_err();
+		mys_send_err(err_num, sqlstate, msg);
+		mys_flush();
+	}
+	else
+	{
+		clear_pending_err();
+		pending_err_code = err_num;
+		memcpy(pending_err_sqlstate, sqlstate, 5);
+		pending_err_sqlstate[5] = '\0';
+		pending_err_msg = MemoryContextStrdup(TopMemoryContext, msg);
+		pending_err_active = true;
+		discard_queued_queries();
+	}
 	resultset_active = false;
 	stmt_infos = NIL;
 	stmt_index = 0;
@@ -2034,6 +2100,7 @@ mys_send_message(ErrorData *edata)
 static void
 mys_comm_reset(void)
 {
+	clear_pending_err();
 	memset(upsert_rows, 0, sizeof(upsert_rows));
 	upsert_deleted = 0;
 	resultset_active = false;
@@ -2644,7 +2711,6 @@ const ProtocolExtensionConfig mysql_protocol_config = {
 	.sequence_write = mys_sequence_write,
 	.on_conflict_row = mys_record_upsert_row,
 	.prepare_for_query = mys_txn_recover,
-	.early_deadlock_check = mys_early_deadlock_check,
 };
 
 bool

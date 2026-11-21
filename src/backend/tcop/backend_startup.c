@@ -329,7 +329,7 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 			if (userlen >= NAMEDATALEN)
 				port->user_name[pg_encoding_mbcliplen(PG_UTF8, port->user_name,
 													  (int) userlen, NAMEDATALEN - 1)] = '\0';
-			MyBackendType = B_BACKEND;
+			Assert(MyBackendType == B_BACKEND || MyBackendType == B_DEAD_END_BACKEND);
 		}
 	}
 	else

@@ -4,7 +4,6 @@ Use disposable instances with the matching kernel and extension. Build debug
 (`--enable-debug --enable-cassert`) and release binaries separately; enable
 `--enable-depend`, or clean all objects after changing node/protocol headers.
 Keep build directories, data directories and logs outside this repository.
-The [19.0.0 acceptance report](REVIEW-19.0.0.md) records the latest review round.
 
 `tests/run.sh` recreates its `test` schema. The transaction and AB suites also
 exercise global read-only flags: never point these suites at a shared production
@@ -92,6 +91,7 @@ python3 tests/pg19_kernel.py
 python3 tests/release_review.py
 python3 tests/point_write_concurrency.py
 python3 tests/hotspot_deadlocks.py
+python3 tests/adversarial_fixes.py
 python3 tests/pg19_upgrade.py --old-prefix /path/to/openhalo18-aux2 \
   --new-prefix /path/to/openhalo19 --work-dir /tmp/openhalo-major-upgrade
 python3 tests/release_roundtrip.py
@@ -127,15 +127,15 @@ schema and remove it on exit.
 `sysbench.sh` retries only 1213/1205. Errors 1062/1020 fail the workload immediately.
 Its exit status still requires zero ignored errors, including genuine deadlocks;
 report the completed workloads and retry counts separately. `MYSQL_HOST` selects
-the target for reference comparisons. See [the concurrency report](CONCURRENCY-19.0.0.md)
-for the fix and subsequent stress runs.
+the target for reference comparisons.
 
-`hotspot_deadlocks.py` checks eager detection in 2/3/16-session cycles, the timed
-fallback and disable switch, native/mixed sessions, ordinary waits, cancellation,
-lock timeouts and soft cycles resolved by queue reordering. Two 16-thread transfer
-runs compare every balance against a commit ledger, including retries without
-an explicit MySQL ROLLBACK. It requires administrative PG/MySQL connections;
-`MYSQL_ADMIN_USER`/`MYSQL_ADMIN_PASSWORD` default to `PGUSER`/`PGPASSWORD`.
+`hotspot_deadlocks.py` checks default `mysql.deadlock_timeout` (`50ms`) detection in
+2/3/16-session cycles, explicit session `deadlock_timeout` overrides, native/mixed
+sessions, ordinary waits, cancellation, lock timeouts and soft cycles resolved by
+queue reordering, plus 16-thread and 64-thread transfer runs against a commit ledger
+(including retries without an explicit MySQL ROLLBACK). It requires administrative
+PG/MySQL connections; `MYSQL_ADMIN_USER`/`MYSQL_ADMIN_PASSWORD` default to
+`PGUSER`/`PGPASSWORD`.
 
 For repeated sysbench hotspot stress, use a disposable fixture and an output
 directory outside the source tree:
@@ -169,8 +169,12 @@ suite, `make check NO_TEMP_INSTALL=1` reuses the already prepared temporary
 installation; preserve the Makefile's exported test environment when rerunning.
 
 Historical 1.5 → 1.9 extension upgrade suites and PG14 import generators were
-removed by the 2.0 source cleanup. They belong to the PG18 release checkout.
-See [PG19 validation](PG19.md) for the major-version migration scope.
+removed by the 2.0 source cleanup; they belong to the PG18 release checkout.
+`tests/adversarial_fixes.py` covers `1.9 → 2.0` catalog/ACL parity, fast-path
+WAL/lock invariants, `LIMIT 1` / `VARCHAR` parameter current reads, deferred
+wire errors, `transaction_timeout` recovery, `mysql.deadlock_timeout` reload
+precedence, handshake `program_name` sanitization, `utf8mb4_general_ci`
+planner selectivity, and `SET` keyword variables.
 
 Run PostgreSQL's own regression suite against the debug kernel with the cluster's
 bootstrap superuser and a writable build tree:

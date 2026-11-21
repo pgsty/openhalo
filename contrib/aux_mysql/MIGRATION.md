@@ -9,10 +9,9 @@ PG19 data directory; the PG18 data files and WAL cannot be opened by PG19.
 
 The automated [major upgrade rehearsal](tests/pg19_upgrade.py) runs PG19's
 `pg_upgrade --check` and default copy-mode upgrade between disposable PG18.6
-and PG19.0 clusters, both with `aux_mysql 2.0`. It verifies binary bytes,
-generated values, AUTO_INCREMENT state, prefix uniqueness, foreign-key cascades,
-pending FK declarations and stored SQL function bodies after the upgrade.
-See [PG19.md](PG19.md) for the exact source and validation scope.
+and PG19.0 clusters, verifying binary bytes, generated values, AUTO_INCREMENT
+state, prefix uniqueness, foreign-key cascades, pending FK declarations and
+stored SQL function bodies after the upgrade.
 
 For a real installation, first rehearse on a backup with the same extensions,
 locales and application schema. Use the PG19 `pg_upgrade` and matching old/new
@@ -20,12 +19,14 @@ binary directories, retain the old cluster, then refresh optimizer statistics
 and verify both PostgreSQL and MySQL application traffic before cutover.
 The test's fixture data does not establish compatibility for every extension.
 
-The released PG18 versions use `aux_mysql 1.x`. This branch has no `1.x → 2.0`
-extension update script, so a direct production upgrade from those releases is
-not covered by the rehearsal. Review a logical export of application schema and
-data into a fresh 2.0 installation, or supply and validate a separate extension
-upgrade before using the binary major-upgrade path. Do not substitute a new
-extension version string for migrating its SQL objects.
+To upgrade from **`v18.6.1` (`aux_mysql 1.9`)** to **`19.0.0` (`aux_mysql 2.0`)**:
+1. Run PG19 `pg_upgrade` from the `v18.6.1` cluster into a newly initialized `19.0.0` cluster.
+2. Start the `19.0.0` server and execute `ALTER EXTENSION aux_mysql UPDATE TO '2.0';`
+   over a PostgreSQL connection in `mysql.database` (default `postgres`).
+
+If upgrading from **`v18.6` (`aux_mysql 1.5`)**, update the extension to `1.9` on
+`v18.6.1` before running `pg_upgrade` to `19.0.0`, or perform a reviewed logical
+export/import of application schema and data into a fresh `2.0` installation.
 
 PG19 always uses standard-conforming PostgreSQL string literals. Use PG19
 `pg_dump`/`pg_dumpall` for PostgreSQL logical migration. MySQL literals continue

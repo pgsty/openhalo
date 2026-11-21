@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, PGSTY PTE. LTD.
-"""Deterministic early deadlock detection and fallback checks on disposable data.
+"""Deterministic MySQL deadlock detection, queue reordering, and hotspot transfers.
 
 Uses PG*/MYSQL_* fixture variables; MYSQL_ADMIN_USER/PASSWORD default to PGUSER/
-PGPASSWORD. Both administrative connections must be superusers. Each session
-sets its own timeouts. No role or server defaults are changed.
+PGPASSWORD. Both administrative connections must be superusers. MySQL protocol
+sessions default to mysql.deadlock_timeout (50ms) without any kernel ProcSleep
+hook; explicit session deadlock_timeout overrides and native PG sessions are
+also verified.
 """
 from concurrent.futures import ThreadPoolExecutor
 import os
@@ -19,7 +21,7 @@ from point_write_concurrency import Suite, WireError, query, wire_dml
 
 
 class Deadlocks(Suite):
-    def endpoint(self, native=False, early=True, deadlock_ms=5000, lock_ms=2000):
+    def endpoint(self, native=False, deadlock_ms=None, lock_ms=2000):
         if native:
             c = psycopg2.connect(connect_timeout=5)
             c.autocommit = True
@@ -29,12 +31,12 @@ class Deadlocks(Suite):
                 port=int(os.getenv('MYSQL_PORT', '3306')),
                 user=os.getenv('MYSQL_ADMIN_USER', os.getenv('PGUSER', 'postgres')),
                 password=os.getenv('MYSQL_ADMIN_PASSWORD', os.getenv('PGPASSWORD', '')),
-                autocommit=True, connect_timeout=5, read_timeout=12, write_timeout=12)
+                autocommit=True, connect_timeout=5, read_timeout=15, write_timeout=15)
             query(c, 'USE ' + self.schema)
-        for name, value in [('deadlock_timeout', f'{deadlock_ms}ms'),
-                            ('lock_timeout', f'{lock_ms}ms'),
-                            ('statement_timeout', '8s'),
-                            ('mysql.early_deadlock_check', 'on' if early else 'off')]:
+        settings = [('lock_timeout', f'{lock_ms}ms'), ('statement_timeout', '8s')]
+        if deadlock_ms is not None:
+            settings.insert(0, ('deadlock_timeout', f'{deadlock_ms}ms'))
+        for name, value in settings:
             query(c, 'SELECT set_config(%s,%s,false)', (name, value))
         return c
 
@@ -50,7 +52,7 @@ class Deadlocks(Suite):
         raise AssertionError('wait not observed')
 
     def cycle(self, label, n=2, native_last=False, all_native=False,
-              early=True, expected='deadlock', deadlock_ms=5000, lock_ms=2000):
+              expected='deadlock', deadlock_ms=None, lock_ms=2000):
         query(self.admin, 'TRUNCATE TABLE t')
         query(self.admin, 'CREATE TABLE IF NOT EXISTS marks(id INT PRIMARY KEY)')
         query(self.admin, 'TRUNCATE TABLE marks')
@@ -59,7 +61,7 @@ class Deadlocks(Suite):
         native = [all_native or (native_last and i == n-1) for i in range(n)]
         # Let only the first waiter time out in the fallback controls. Equal
         # deadlines could cancel both transactions before either releases locks.
-        conns = [self.endpoint(flag, early, deadlock_ms,
+        conns = [self.endpoint(flag, deadlock_ms,
                               lock_ms if expected != 'timeout' or i == 0 else lock_ms+2000)
                  for i, flag in enumerate(native)]
         try:
@@ -101,9 +103,9 @@ class Deadlocks(Suite):
                 results = [f.result(timeout=10) for f in futures]
             victims = [r for r in results if r[1] != 'ok']
             assert len(victims) == 1 and victims[0][1] == expected, results
-            if expected == 'deadlock' and early and not native_last and not all_native:
-                # A 5s fallback and 2s lock timeout cannot produce this result.
-                assert victims[0][0] == n and victims[0][2] < 2, results
+            if expected == 'deadlock' and deadlock_ms is None and not native_last and not all_native:
+                # Default mysql.deadlock_timeout (50ms) resolves promptly (< 1s).
+                assert victims[0][2] < 1.0, results
             marks = tuple(r[0] for r in query(self.admin, 'SELECT id FROM marks ORDER BY id'))
             winners = tuple(i for i in range(1, n+1) if i != victims[0][0])
             assert marks == winners, (results, marks)
@@ -148,28 +150,30 @@ class Deadlocks(Suite):
         finally:
             a.close(); b.close()
 
-    def transfers(self, mixed=False):
+    def transfers(self, mixed=False, workers=16, iters=100, rows=8):
         # Match all committed changes to a transaction ledger. Row counts alone
         # cannot detect a victim whose first write survived its deadlock.
         query(self.admin, 'TRUNCATE TABLE t')
         query(self.admin, 'CREATE TABLE IF NOT EXISTS ledger('
               'worker INT, seq INT, src INT, dst INT, PRIMARY KEY(worker,seq))')
         query(self.admin, 'TRUNCATE TABLE ledger')
-        for i in range(1, 9):
+        for i in range(1, rows + 1):
             query(self.admin, 'INSERT INTO t VALUES(%s,0)', (i,))
-        barrier = threading.Barrier(16)
+        barrier = threading.Barrier(workers)
         deadline = time.monotonic()+90
 
         def worker(i):
             native = mixed and i % 2 == 0
-            c = self.endpoint(native=native, deadlock_ms=50, lock_ms=5000)
+            # MySQL sessions rely on built-in mysql.deadlock_timeout (50ms);
+            # native PG sessions set 50ms explicitly in the mixed test.
+            c = self.endpoint(native=native, deadlock_ms=50 if native else None, lock_ms=5000)
             rng = random.Random(i)
             retries = 0
             maximum = 0
             try:
                 barrier.wait(timeout=15)
-                for seq in range(100):
-                    src, dst = rng.sample(range(1, 9), 2)
+                for seq in range(iters):
+                    src, dst = rng.sample(range(1, rows + 1), 2)
                     start = time.monotonic()
                     while True:
                         assert time.monotonic() < deadline, ('transfer stalled', i, seq)
@@ -194,26 +198,27 @@ class Deadlocks(Suite):
                 c.close()
             return retries, maximum
 
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            results = list(pool.map(worker, range(16)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(worker, range(workers)))
         ledger = query(self.admin, 'SELECT worker,seq,src,dst FROM ledger')
-        assert len(ledger) == 1600
+        assert len(ledger) == workers * iters
         assert {(w, s) for w, s, _, _ in ledger} == {
-            (w, s) for w in range(16) for s in range(100)}
-        expected = {i: 0 for i in range(1, 9)}
+            (w, s) for w in range(workers) for s in range(iters)}
+        expected = {i: 0 for i in range(1, rows + 1)}
         for _, _, src, dst in ledger:
             expected[src] -= 1
             expected[dst] += 1
         actual = dict(query(self.admin, 'SELECT id,v FROM t'))
         assert actual == expected and sum(actual.values()) == 0, (actual, expected)
-        print('PASS 16-thread transfers', 'mixed protocols' if mixed else 'MySQL',
-              'commits=1600', 'retries='+str(sum(r[0] for r in results)),
+        print(f'PASS {workers}-thread transfers ({rows} rows)',
+              'mixed protocols' if mixed else 'MySQL',
+              f'commits={workers * iters}', 'retries='+str(sum(r[0] for r in results)),
               'max_seconds='+str(round(max(r[1] for r in results), 4)), flush=True)
 
     def soft_cycle(self):
         # A shares gate; B wants gate exclusively; C wants a share behind B.
         # A then waits for C's row. Moving C ahead of B resolves this soft cycle
-        # without aborting anyone. Only A's closing row wait uses the early hook.
+        # without aborting anyone.
         query(self.admin, 'CREATE TABLE gate(id INT)')
         query(self.admin, 'TRUNCATE TABLE t')
         query(self.admin, 'INSERT INTO t VALUES(1,0),(2,0)')
@@ -248,23 +253,24 @@ class Deadlocks(Suite):
                 conn.close()
 
     def run(self):
-        self.cycle('two-way eager detection')
-        self.cycle('three-way eager detection', n=3)
-        self.cycle('16-way eager detection', n=16)
-        self.cycle('disabled eager check obeys lock timeout', early=False,
-                   expected='timeout', lock_ms=500)
-        self.cycle('disabled eager check retains timed detector', early=False,
+        self.cycle('two-way default mysql.deadlock_timeout detection')
+        self.cycle('three-way default mysql.deadlock_timeout detection', n=3)
+        self.cycle('16-way default mysql.deadlock_timeout detection', n=16)
+        self.cycle('explicit session deadlock_timeout obeys lock timeout',
+                   deadlock_ms=5000, expected='timeout', lock_ms=500)
+        self.cycle('explicit session deadlock_timeout=250ms detector',
                    deadlock_ms=250)
-        self.cycle('native sessions retain timeout behavior', all_native=True,
+        self.cycle('native sessions retain 1s default timeout behavior', all_native=True,
                    expected='timeout', lock_ms=500)
-        self.cycle('mixed native closing edge uses fallback', n=3, native_last=True,
+        self.cycle('mixed native closing edge uses configured detector', n=3, native_last=True,
                    deadlock_ms=250)
         self.ordinary_wait()
         self.ordinary_wait(cancel=True)
         self.ordinary_wait(timeout=True)
         self.soft_cycle()
-        self.transfers()
-        self.transfers(mixed=True)
+        self.transfers(workers=16, iters=100, rows=8)
+        self.transfers(mixed=True, workers=16, iters=100, rows=8)
+        self.transfers(workers=64, iters=25, rows=32)
 
 
 if __name__ == '__main__':

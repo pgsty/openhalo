@@ -40,6 +40,9 @@
 #include "catalog/pg_class.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
+#include "storage/proc.h"
+#include "utils/timestamp.h"
+#include "utils/timeout.h"
 
 #include "halo_mysql.h"
 #include "mys_parsenodes.h"
@@ -53,6 +56,8 @@ bool		halo_mysql_statement_rollback = true;
 
 /* nest level of the hidden savepoint of the running statement, 0 if none */
 static int	stmt_savepoint_level = 0;
+static bool stmt_savepoint_txn_timeout_active = false;
+static TimestampTz stmt_savepoint_txn_timeout_fin = 0;
 static bool abort_transaction = false;
 
 /* value of a SET autocommit = <expr>, or -1 if it is not a constant */
@@ -429,9 +434,18 @@ void
 mys_txn_stmt_done(MysStmtInfo *info)
 {
 	if (info->txn_op == MYS_TXNOP_SAVEPOINT)
+	{
 		stmt_savepoint_level = GetCurrentTransactionNestLevel();
+		stmt_savepoint_txn_timeout_active = get_timeout_active(TRANSACTION_TIMEOUT);
+		stmt_savepoint_txn_timeout_fin = stmt_savepoint_txn_timeout_active ?
+			get_timeout_finish_time(TRANSACTION_TIMEOUT) : 0;
+	}
 	else if (info->txn_op == MYS_TXNOP_RELEASE)
+	{
 		stmt_savepoint_level = 0;
+		stmt_savepoint_txn_timeout_active = false;
+		stmt_savepoint_txn_timeout_fin = 0;
+	}
 }
 
 /* Only errors sent to the client count; a caught server-side error does not. */
@@ -460,6 +474,8 @@ mys_txn_recover(void)
 	{
 		abort_transaction = false;
 		stmt_savepoint_level = 0;
+		stmt_savepoint_txn_timeout_active = false;
+		stmt_savepoint_txn_timeout_fin = 0;
 		oldcxt = CurrentMemoryContext;
 		AbortOutOfAnyTransaction();
 		MemoryContextSwitchTo(oldcxt);
@@ -474,8 +490,29 @@ mys_txn_recover(void)
 		oldcxt = CurrentMemoryContext;
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcxt);
+
+		/*
+		 * PostgresMain's error handler called disable_all_timeouts(false),
+		 * which disarmed TRANSACTION_TIMEOUT.  Because the outer transaction
+		 * survived via our hidden savepoint, restore the outer deadline
+		 * captured when the savepoint was established (or arm from the
+		 * transaction start if SIGHUP enabled TransactionTimeout mid-run).
+		 */
+		if (TransactionTimeout > 0 && IsTransactionState() &&
+			!IsAbortedTransactionBlockState() &&
+			!get_timeout_active(TRANSACTION_TIMEOUT))
+		{
+			TimestampTz fin_time = stmt_savepoint_txn_timeout_active ?
+				stmt_savepoint_txn_timeout_fin :
+				TimestampTzPlusMilliseconds(GetCurrentTransactionStartTimestamp(),
+											TransactionTimeout);
+
+			enable_timeout_at(TRANSACTION_TIMEOUT, fin_time);
+		}
 	}
 	stmt_savepoint_level = 0;
+	stmt_savepoint_txn_timeout_active = false;
+	stmt_savepoint_txn_timeout_fin = 0;
 }
 
 /*

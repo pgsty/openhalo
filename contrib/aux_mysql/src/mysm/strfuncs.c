@@ -435,6 +435,14 @@ convertTextToDouble(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(ret);
 }
 
+/* Retain legacy 1.x C symbol for binary-upgrade and historical script compatibility. */
+PG_FUNCTION_INFO_V1(mys_convertTextToFloat8);
+Datum
+mys_convertTextToFloat8(PG_FUNCTION_ARGS)
+{
+	return convertTextToDouble(fcinfo);
+}
+
 PG_FUNCTION_INFO_V1(convertTextToInt8);
 Datum
 convertTextToInt8(PG_FUNCTION_ARGS)

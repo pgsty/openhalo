@@ -1787,10 +1787,11 @@ set_variable:
                 { $$ = $1; }
         ;
 
-/* VERSION is a keyword, but also a valid system variable in SET. */
+/* Unreserved and column-name keywords can also be MySQL system variables in SET. */
 mysql_set_variable_name:
 			IDENT                   { $$ = $1; }
-			| VERSION_P             { $$ = pstrdup("version"); }
+			| unreserved_keyword    { $$ = pstrdup($1); }
+			| col_name_keyword      { $$ = pstrdup($1); }
 		;
 
 mysql_system_variable:
@@ -1836,155 +1837,110 @@ mysql_system_variable:
                     $$ = (Node *) result;
                 }
 			| LOCAL mysql_set_variable_name plassign_equals on_a_expr
-                {
-                    if (isSystemVariable($2))
-                    {
-                        ResTarget *result;
-                        List *funcName;
-                        List *argList;
-                        Node *funcCall;
-                        result = makeNode(ResTarget);
-                        funcName = list_make2(makeString(pstrdup("mysql")),
-                                              makeString(pstrdup("set_system_session_variable")));
-                        argList = NIL;
-                        if (IsA($4, ColumnRef))
-                        {
-                            ListCell   *lc;
-                            ColumnRef *c = castNode(ColumnRef, $4);
-                            foreach(lc, c->fields)
-                            {
-								Node *v = (Node *) lfirst(lc);
-								if (strncasecmp(strVal(v), "off", 3) != 0)
-                                {
-									argList = list_make2(makeStringConst($2, @2), makeStringConst(strVal(v), -1));
-                                }
-                                else
-                                {
-                                    argList = list_make2(makeStringConst($2, @2), 
-                                                         makeIntConst(0, -1));
-                                }
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            argList = list_make2(makeStringConst($2, @2), $4);
-                        }
-                        funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
-                        result->name = NULL;
-                        result->indirection = NIL;
-                        result->val = funcCall;
-                        result->location = @1;
-                        $$ = (Node *) result;
-                    }
-                    else
-                    {
-                        ereport(ERROR,
-                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                                 errmsg("Unknown system variable '%s'", $1),
-                                 parser_errposition(@2)));
-                    }
-                }
+				{
+					ResTarget  *result = makeNode(ResTarget);
+					List	   *funcName = list_make2(makeString(pstrdup("mysql")),
+													  makeString(pstrdup("set_system_session_variable")));
+					List	   *argList = NIL;
+					Node	   *funcCall;
+
+					if (IsA($4, ColumnRef))
+					{
+						ListCell   *lc;
+						ColumnRef  *c = castNode(ColumnRef, $4);
+
+						foreach(lc, c->fields)
+						{
+							Node	   *v = (Node *) lfirst(lc);
+
+							if (strncasecmp(strVal(v), "off", 3) != 0)
+								argList = list_make2(makeStringConst($2, @2),
+													 makeStringConst(strVal(v), -1));
+							else
+								argList = list_make2(makeStringConst($2, @2),
+													 makeIntConst(0, -1));
+							break;
+						}
+					}
+					else
+						argList = list_make2(makeStringConst($2, @2), $4);
+					funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
+					result->name = NULL;
+					result->indirection = NIL;
+					result->val = funcCall;
+					result->location = @1;
+					$$ = (Node *) result;
+				}
 			| SESSION mysql_set_variable_name plassign_equals on_a_expr
-                {
-                    if (isSystemVariable($2))
-                    {
-                        ResTarget *result;
-                        List *funcName;
-                        List *argList;
-                        Node *funcCall;
-                        result = makeNode(ResTarget);
-                        funcName = list_make2(makeString(pstrdup("mysql")),
-                                              makeString(pstrdup("set_system_session_variable")));
-                        argList = NIL;
-                        if (IsA($4, ColumnRef))
-                        {
-                            ListCell   *lc;
-                            ColumnRef *c = castNode(ColumnRef, $4);
-                            foreach(lc, c->fields)
-                            {
-								Node *v = (Node *) lfirst(lc);
-								if (strncasecmp(strVal(v), "off", 3) != 0)
-                                {
-									argList = list_make2(makeStringConst($2, @2), makeStringConst(strVal(v), -1));
-                                }
-                                else
-                                {
-                                    argList = list_make2(makeStringConst($2, @2), 
-                                                         makeIntConst(0, -1));
-                                }
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            argList = list_make2(makeStringConst($2, @2), $4);
-                        }
-                        funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
-                        result->name = NULL;
-                        result->indirection = NIL;
-                        result->val = funcCall;
-                        result->location = @1;
-                        $$ = (Node *) result;
-                    }
-                    else
-                    {
-                        ereport(ERROR,
-                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                                 errmsg("Unknown system variable '%s'", $1),
-                                 parser_errposition(@2)));
-                    }
-                }
+				{
+					ResTarget  *result = makeNode(ResTarget);
+					List	   *funcName = list_make2(makeString(pstrdup("mysql")),
+													  makeString(pstrdup("set_system_session_variable")));
+					List	   *argList = NIL;
+					Node	   *funcCall;
+
+					if (IsA($4, ColumnRef))
+					{
+						ListCell   *lc;
+						ColumnRef  *c = castNode(ColumnRef, $4);
+
+						foreach(lc, c->fields)
+						{
+							Node	   *v = (Node *) lfirst(lc);
+
+							if (strncasecmp(strVal(v), "off", 3) != 0)
+								argList = list_make2(makeStringConst($2, @2),
+													 makeStringConst(strVal(v), -1));
+							else
+								argList = list_make2(makeStringConst($2, @2),
+													 makeIntConst(0, -1));
+							break;
+						}
+					}
+					else
+						argList = list_make2(makeStringConst($2, @2), $4);
+					funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
+					result->name = NULL;
+					result->indirection = NIL;
+					result->val = funcCall;
+					result->location = @1;
+					$$ = (Node *) result;
+				}
 			| GLOBAL mysql_set_variable_name plassign_equals on_a_expr
-                {
-                    if (isSystemVariable($2))
-                    {
-                        ResTarget *result;
-                        List *funcName;
-                        List *argList;
-                        Node *funcCall;
-                        result = makeNode(ResTarget);
-                        funcName = list_make2(makeString(pstrdup("mysql")),
-                                              makeString(pstrdup("set_system_global_variable")));
-                        argList = NIL;
-                        if (IsA($4, ColumnRef))
-                        {
-                            ListCell   *lc;
-                            ColumnRef *c = castNode(ColumnRef, $4);
-                            foreach(lc, c->fields)
-                            {
-								Node *v = (Node *) lfirst(lc);
-								if (strncasecmp(strVal(v), "off", 3) != 0)
-                                {
-									argList = list_make2(makeStringConst($2, @2), makeStringConst(strVal(v), -1));
-                                }
-                                else
-                                {
-                                    argList = list_make2(makeStringConst($2, @2), 
-                                                         makeIntConst(0, -1));
-                                }
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            argList = list_make2(makeStringConst($2, @2), $4);
-                        }
-                        funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
-                        result->name = NULL;
-                        result->indirection = NIL;
-                        result->val = funcCall;
-                        result->location = @1;
-                        $$ = (Node *) result;
-                    }
-                    else
-                    {
-                        ereport(ERROR,
-                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                                 errmsg("Unknown system variable '%s'", $1),
-                                 parser_errposition(@2)));
-                    }
-                }
+				{
+					ResTarget  *result = makeNode(ResTarget);
+					List	   *funcName = list_make2(makeString(pstrdup("mysql")),
+													  makeString(pstrdup("set_system_global_variable")));
+					List	   *argList = NIL;
+					Node	   *funcCall;
+
+					if (IsA($4, ColumnRef))
+					{
+						ListCell   *lc;
+						ColumnRef  *c = castNode(ColumnRef, $4);
+
+						foreach(lc, c->fields)
+						{
+							Node	   *v = (Node *) lfirst(lc);
+
+							if (strncasecmp(strVal(v), "off", 3) != 0)
+								argList = list_make2(makeStringConst($2, @2),
+													 makeStringConst(strVal(v), -1));
+							else
+								argList = list_make2(makeStringConst($2, @2),
+													 makeIntConst(0, -1));
+							break;
+						}
+					}
+					else
+						argList = list_make2(makeStringConst($2, @2), $4);
+					funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
+					result->name = NULL;
+					result->indirection = NIL;
+					result->val = funcCall;
+					result->location = @1;
+					$$ = (Node *) result;
+				}
             | MysSysVarName plassign_equals on_a_expr
                 {
                     ResTarget *result;

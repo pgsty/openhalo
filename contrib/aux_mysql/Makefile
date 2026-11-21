@@ -48,7 +48,7 @@ OBJS = \
 	src/mysm/uuid_short_core.o
 
 EXTENSION = aux_mysql
-DATA = sql/aux_mysql--2.0.sql
+DATA = sql/aux_mysql--2.0.sql sql/aux_mysql--1.9--2.0.sql
 PGFILEDESC = "aux_mysql - MySQL compatibility (openHalo)"
 
 # generated grammar / keyword headers live in the build directory
@@ -96,3 +96,4 @@ $(OBJS): src/halo_mysql.h src/mys_proto.h src/mys_binary.h src/parser/mys_grampa
 src/mys_prefix.o src/mys_rewrite.o src/mys_binary.o src/halo_mysql.o: src/mys_prefix.h
 src/mys_prefix.o: src/mys_general_ci_weights.h
 src/mys_fk.o src/mys_utility.o: src/mys_fk.h
+src/mys_current_read.o src/mys_utility.o: src/mys_current_read.h

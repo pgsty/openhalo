@@ -322,7 +322,9 @@ general_strnxfrm_prefix(char *dest, size_t size, const char *src, size_t len,
 	return n;
 }
 
-/* pg_strnxfrm's result is binary and length-delimited (embedded NUL is OK). */
+/* pg_strnxfrm's result is binary and length-delimited (embedded NUL is OK).
+ * Keep this BE16 format unchanged so persistent hash indexes and hash
+ * partitions retain identical hash values across major-version upgrades. */
 static size_t
 general_strnxfrm(char *dest, size_t size, const char *src, size_t len,
 				pg_locale_t locale)
@@ -346,10 +348,73 @@ general_strcoll(const char *a, const char *b, pg_locale_t locale)
 	return general_strncoll(a, strlen(a), b, strlen(b), locale);
 }
 
+/*
+ * Planner scalar estimation (selfuncs.c:convert_string_datum) calls
+ * pg_strxfrm() and treats the result as a NUL-terminated C string via strlen().
+ * Encode PAD SPACE-trimmed weights monotonically without any 0x00 byte:
+ *   0x0000..0x0001 -> 0x01, (0x01 + w)      (2 bytes)
+ *   0x0002..0x007f -> w                     (1 byte; ASCII folds directly)
+ *   0x0080..0xffff -> 0x80|(w>>12), 0x80|((w>>6)&0x3f), 0x80|(w&0x3f)
+ * Append 12 trailing SPACE weights (convert_one_string_to_scalar's horizon)
+ * after the trimmed prefix so PAD SPACE ordering holds for weights < 0x20 too
+ * (e.g. "A\x01" < "A" == "A   " < "A!").
+ */
 static size_t
 general_strxfrm(char *dest, size_t size, const char *src, pg_locale_t locale)
 {
-	return general_strnxfrm(dest, size, src, strlen(src), locale);
+	const unsigned char *p = (const unsigned char *) src;
+	const unsigned char *end = p + strlen(src);
+	unsigned char *out = (unsigned char *) dest;
+	size_t		pos = 0;
+	size_t		trimmed = 0;
+	size_t		pad_end;
+
+	while (p < end)
+	{
+		uint32		w = general_next(&p, end);
+		unsigned char b[3];
+		int			nb;
+
+		if (w <= 0x01)
+		{
+			b[0] = 0x01;
+			b[1] = (unsigned char) (0x01 + w);
+			nb = 2;
+		}
+		else if (w <= 0x7f)
+		{
+			b[0] = (unsigned char) w;
+			nb = 1;
+		}
+		else
+		{
+			b[0] = (unsigned char) (0x80 | ((w >> 12) & 0x0f));
+			b[1] = (unsigned char) (0x80 | ((w >> 6) & 0x3f));
+			b[2] = (unsigned char) (0x80 | (w & 0x3f));
+			nb = 3;
+		}
+
+		for (int i = 0; i < nb; i++)
+		{
+			if (size > 0 && pos < size - 1)
+				out[pos] = b[i];
+			pos++;
+		}
+		if (w != ' ')
+			trimmed = pos;
+	}
+
+	pad_end = trimmed + 12;
+	if (size > 0)
+	{
+		size_t		fill_from = Min(trimmed, size - 1);
+		size_t		fill_to = Min(pad_end, size - 1);
+
+		while (fill_from < fill_to)
+			out[fill_from++] = ' ';
+		out[fill_to] = '\0';
+	}
+	return pad_end;
 }
 
 static size_t
@@ -449,10 +514,15 @@ static size_t
 binary_strnxfrm_prefix(char *dest, size_t size, const char *src, size_t len,
 					   pg_locale_t locale)
 {
-	size_t n = Min(size, (size_t) len);
+	size_t n;
 
-	memcpy(dest, src, n);
-	memset(dest + n, ' ', size - n);
+	if (size == 0)
+		return 0;
+	n = Min(size, (size_t) len);
+	if (n > 0)
+		memcpy(dest, src, n);
+	if (size > n)
+		memset(dest + n, ' ', size - n);
 	return size;
 }
 

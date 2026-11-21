@@ -2511,14 +2511,17 @@ mys_planner(Query *query, const char *queryString, int cursorOptions,
 			ParamListInfo params, ExplainState *es)
 {
 	PlannedStmt *stmt;
+	bool		mysql = mys_is_mysql_session();
 	bool		has_row_security = query->hasRowSecurity;
 
 	mys_assign_bool_as_int(query);
+	if (mysql)
+		mys_current_read_rewrite_limit(query);
 	if (prev_planner)
 		stmt = prev_planner(query, queryString, cursorOptions, params, es);
 	else
 		stmt = standard_planner(query, queryString, cursorOptions, params, es);
-	if (mys_is_mysql_session())
+	if (mysql)
 		mys_current_read_plan(stmt, has_row_security);
 	return stmt;
 }
@@ -2538,6 +2541,7 @@ mys_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
 	if (mysql)
 	{
+		mys_sync_deadlock_timeout();
 		mys_sync_foreign_key_checks();
 		if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
 			check_server_read_only_dml(queryDesc->plannedstmt);
@@ -2960,6 +2964,8 @@ mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 {
 	List	   *generators = NIL;
 
+	if (mys_is_mysql_session())
+		mys_sync_deadlock_timeout();
 	if (mys_is_mysql_session() && !IsAbortedTransactionBlockState())
 	{
 		if (server_read_only_utility(pstmt->utilityStmt, context))

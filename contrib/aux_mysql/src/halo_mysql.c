@@ -29,10 +29,12 @@
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 
 #include "halo_mysql.h"
 #include "mys_prefix.h"
@@ -49,8 +51,8 @@ char	   *halo_mysql_database = NULL;
 int			halo_mysql_parser = MYS_PARSER_MYSQL;
 int			halo_mysql_protocol_id = 0;
 int			halo_mysql_auth_plugin = MYS_AUTH_CACHING_SHA2;
+int			halo_mysql_deadlock_timeout = 50;
 static bool halo_mysql_auto_create_extension = true;
-static bool halo_mysql_early_deadlock_check = true;
 static char *openhalo_version = NULL;
 
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -163,13 +165,35 @@ current_insert_ignore(void)
 	return info != NULL && info->ignore;
 }
 
-/* Row contention needs prompt detection, without changing DDL/advisory waits. */
-bool
-mys_early_deadlock_check(const LOCKTAG *locktag)
+/*
+ * Reconcile the per-protocol dynamic default for deadlock_timeout in MySQL
+ * sessions without touching native PostgreSQL sessions or higher-priority GUC
+ * sources (postgresql.conf, ALTER SYSTEM/DATABASE/ROLE, client, SET/SET LOCAL).
+ * Setting mysql.deadlock_timeout = 0 restores PostgreSQL's 1000ms boot default.
+ */
+void
+mys_sync_deadlock_timeout(void)
 {
-	return halo_mysql_early_deadlock_check &&
-		(locktag->locktag_type == LOCKTAG_TUPLE ||
-		 locktag->locktag_type == LOCKTAG_TRANSACTION);
+	static int	last_applied_cfg = -1;
+	static int	last_seen_pg_timeout = -1;
+	static TimestampTz last_reload_time = 0;
+	int			target_ms;
+	char		buf[32];
+
+	if (!mys_is_mysql_session())
+		return;
+	if (last_applied_cfg == halo_mysql_deadlock_timeout &&
+		last_seen_pg_timeout == DeadlockTimeout &&
+		last_reload_time == PgReloadTime)
+		return;
+
+	target_ms = halo_mysql_deadlock_timeout > 0 ?
+		halo_mysql_deadlock_timeout : 1000;
+	snprintf(buf, sizeof(buf), "%dms", target_ms);
+	SetConfigOption("deadlock_timeout", buf, PGC_SUSET, PGC_S_DYNAMIC_DEFAULT);
+	last_applied_cfg = halo_mysql_deadlock_timeout;
+	last_seen_pg_timeout = DeadlockTimeout;
+	last_reload_time = PgReloadTime;
 }
 
 void
@@ -282,14 +306,15 @@ _PG_init(void)
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("mysql.early_deadlock_check",
-							 "Check for deadlocks before MySQL row/transaction lock waits.",
-							 "The normal deadlock_timeout remains a fallback and the "
-							 "threshold for lock-wait logging. Off restores timed checks only.",
-							 &halo_mysql_early_deadlock_check,
-							 true,
-							 PGC_SUSET, 0,
-							 NULL, NULL, NULL);
+	DefineCustomIntVariable("mysql.deadlock_timeout",
+							"Default deadlock_timeout applied to MySQL protocol sessions.",
+							"0 inherits PostgreSQL's deadlock_timeout unchanged. Explicit "
+							"deadlock_timeout settings in postgresql.conf, roles, databases, "
+							"or SET commands always take precedence.",
+							&halo_mysql_deadlock_timeout,
+							50, 0, INT_MAX,
+							PGC_SIGHUP, GUC_UNIT_MS,
+							NULL, NULL, NULL);
 
 	DefineCustomStringVariable("mysql.default_collation",
 							   "Collation (in schema mysql) of string columns created without COLLATE.",

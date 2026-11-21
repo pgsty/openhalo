@@ -957,6 +957,8 @@ shared_preload_libraries = 'aux_mysql'  # OpenHalo: MySQL compatibility
                                         # generated in the data directory if missing
                                         # (change requires restart)
 #mysql.statement_rollback = on          # roll back only the failing statement
+#mysql.deadlock_timeout = 50ms          # deadlock_timeout default for MySQL sessions
+                                        # (0 inherits PostgreSQL's deadlock_timeout)
 #mysql.default_collation = 'case_insensitive'
                                         # collation of string columns without COLLATE
 #mysql.parser = 'mysql'                 # dialect of the MySQL protocol: mysql, postgres

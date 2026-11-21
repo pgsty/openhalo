@@ -28,8 +28,15 @@ static const ProtocolExtensionConfig *ProtocolExtensions[MAX_PROTOCOL_EXTENSIONS
 static int	num_protocol_extensions = 0;
 
 int
-RegisterProtocolExtension(const ProtocolExtensionConfig *config)
+RegisterProtocolExtensionSized(const ProtocolExtensionConfig *config, size_t size)
 {
+	if (config == NULL || size != sizeof(ProtocolExtensionConfig))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("incompatible protocol extension ABI (got %zu bytes, expected %zu bytes)",
+						size, sizeof(ProtocolExtensionConfig)),
+				 errhint("Rebuild the protocol extension against the installed OpenHalo server headers.")));
+
 	if (!process_shared_preload_libraries_in_progress)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

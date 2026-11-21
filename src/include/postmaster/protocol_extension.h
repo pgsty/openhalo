@@ -34,7 +34,6 @@ struct Port;
 struct ErrorData;
 struct TupleTableSlot;
 struct RelationData;
-struct LOCKTAG;
 
 /* Maximum number of protocol extensions that can be registered */
 #define MAX_PROTOCOL_EXTENSIONS 8
@@ -116,9 +115,6 @@ typedef struct ProtocolExtensionConfig
 
 	/* Recover protocol transaction state before idle status/timeouts are set. */
 	void		(*prepare_for_query) (void);
-
-	/* Request one deadlock check before sleeping on a heavyweight lock. */
-	bool		(*early_deadlock_check) (const struct LOCKTAG *locktag);
 } ProtocolExtensionConfig;
 
 /*
@@ -131,7 +127,10 @@ extern PGDLLIMPORT const ProtocolExtensionConfig *MyProtocolExtension;
  * library listed in shared_preload_libraries.  Returns the protocol id to
  * pass to ListenServerPortForProtocol().
  */
-extern int	RegisterProtocolExtension(const ProtocolExtensionConfig *config);
+extern int	RegisterProtocolExtensionSized(const ProtocolExtensionConfig *config,
+										   size_t size);
+#define RegisterProtocolExtension(config) \
+	RegisterProtocolExtensionSized((config), sizeof(ProtocolExtensionConfig))
 extern const ProtocolExtensionConfig *GetProtocolExtension(int protocol_id);
 extern int	NumProtocolExtensions(void);
 

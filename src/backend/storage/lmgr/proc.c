@@ -40,7 +40,6 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
-#include "postmaster/protocol_extension.h"
 #include "replication/slotsync.h"
 #include "replication/syncrep.h"
 #include "storage/condition_variable.h"
@@ -1374,28 +1373,6 @@ ProcSleep(LOCALLOCK *locallock)
 	got_deadlock_timeout = false;
 
 	/*
-	 * A protocol with frequent short write transactions can request an eager
-	 * check after joining the queue.  The lock partition has been released and
-	 * error cleanup is armed, so use the regular detector, including its soft
-	 * deadlock queue reordering.  No timer or wait statistics have started yet.
-	 *
-	 * Keep the normal timeout as a fallback: a later waiter (possibly using a
-	 * different protocol) can close a cycle after this check.  Do not let an
-	 * early check cancel autovacuum, change log_lock_waits' threshold, or run
-	 * recovery conflict handling early.
-	 */
-	if (!InHotStandby && MyProtocolExtension &&
-		MyProtocolExtension->early_deadlock_check &&
-		MyProtocolExtension->early_deadlock_check(&locallock->tag.lock))
-	{
-		CHECK_FOR_INTERRUPTS();
-		if (CheckDeadLock() == DS_HARD_DEADLOCK)
-			return PROC_WAIT_STATUS_ERROR;
-		if (*((volatile ProcWaitStatus *) &MyProc->waitStatus) == PROC_WAIT_STATUS_OK)
-			return PROC_WAIT_STATUS_OK;
-	}
-
-	/*
 	 * Set timer so we can wake up after awhile and check for a deadlock. If a
 	 * deadlock is detected, the handler sets MyProc->waitStatus =
 	 * PROC_WAIT_STATUS_ERROR, allowing us to know that we must report failure
@@ -1874,8 +1851,8 @@ ProcLockWakeup(LockMethod lockMethodTable, LOCK *lock)
 /*
  * CheckDeadLock
  *
- * Called after DEADLOCK_TIMEOUT fires, or for an optional early check before
- * sleeping on a lock. Check if there's a deadlock; if
+ * We only get to this routine, if DEADLOCK_TIMEOUT fired while waiting for a
+ * lock to be released by some other process.  Check if there's a deadlock; if
  * not, just return.  If we have a real deadlock, remove ourselves from the
  * lock's wait queue.
  */
