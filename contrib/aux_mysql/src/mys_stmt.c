@@ -44,26 +44,39 @@
 
 #include <math.h>
 
+#include "access/printtup.h"
 #include "access/xact.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/params.h"
 #include "parser/analyze.h"
 #include "parser/parse_collate.h"
 #include "parser/parse_expr.h"
 #include "parser/parser.h"
 #include "pgstat.h"
+#include "rewrite/rewriteHandler.h"
+#include "storage/lmgr.h"
+#include "storage/proc.h"
+#include "tcop/dest.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/plancache.h"
+#include "utils/portal.h"
+#include "utils/ps_status.h"
+#include "utils/rls.h"
 #include "utils/snapmgr.h"
+#include "utils/timeout.h"
 #include "utils/timestamp.h"
 
 #include "halo_mysql.h"
@@ -72,6 +85,9 @@
 #include "mys_parsenodes.h"
 #include "adapter/mysql/systemVar.h"
 #include "commands/mysql/mys_uservar.h"
+
+extern int	autoCommit;
+extern uint64 mys_sqlMode;
 
 /* MySQL's default max_prepared_stmt_count, applied per session here */
 #define MYS_MAX_PREPARED_STMTS	16382
@@ -88,6 +104,20 @@ typedef struct MysPrepStmt
 	StringInfo *long_data;		/* COM_STMT_SEND_LONG_DATA, per parameter */
 	Size		long_data_bytes;
 	bool		long_data_error;
+
+	/* Native CachedPlan fast path state */
+	CachedPlanSource *plansource;
+	Oid		   *cached_sig_oids;
+	Oid		   *cached_deduced_oids;
+	uint64		cached_sql_mode;
+	char	   *cached_db;
+	Oid			cached_role;
+	bool		cached_row_security;
+	bool		cached_hexlit;
+	MysStmtInfo	cached_info;
+	CommandTag	cached_tag;
+	int8		fastpath_state;	/* 0 = eligible/unprobed, -1 = syntactically ineligible */
+	bool		revalidated_stale;
 } MysPrepStmt;
 
 static HTAB *stmt_hash = NULL;
@@ -149,11 +179,33 @@ clear_stmt_long_data(MysPrepStmt *stmt)
 }
 
 static void
+drop_stmt_cached_plan(MysPrepStmt *stmt)
+{
+	if (stmt->plansource != NULL)
+	{
+		DropCachedPlan(stmt->plansource);
+		stmt->plansource = NULL;
+	}
+	if (stmt->cached_db != NULL)
+	{
+		pfree(stmt->cached_db);
+		stmt->cached_db = NULL;
+	}
+	if (stmt->cached_info.update_cols != NIL)
+	{
+		list_free_deep(stmt->cached_info.update_cols);
+		stmt->cached_info.update_cols = NIL;
+	}
+	stmt->revalidated_stale = false;
+}
+
+static void
 drop_stmt(MysPrepStmt *stmt)
 {
 	MemoryContext cxt = stmt->cxt;
 	uint32		id = stmt->id;
 
+	drop_stmt_cached_plan(stmt);
 	hash_search(stmt_hash, &id, HASH_REMOVE, NULL);
 	MemoryContextDelete(cxt);
 }
@@ -182,6 +234,7 @@ mys_stmt_close_all(void)
 		MemoryContext cxt = stmt->cxt;
 		uint32		id = stmt->id;
 
+		drop_stmt_cached_plan(stmt);
 		hash_search(stmt_hash, &id, HASH_REMOVE, NULL);
 		MemoryContextDelete(cxt);
 	}
@@ -399,111 +452,6 @@ append_float_literal(StringInfo buf, double v, int digits)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("Incorrect DOUBLE value: '%g'", v)));
 	appendStringInfo(buf, "(%.*g)", digits, v);
-}
-
-/* Decode one binary-protocol parameter value and append it as a literal */
-static void
-append_param(StringInfo buf, StringInfo pkt, uint16 ptype)
-{
-	uint8		type = ptype & 0xff;
-	bool		is_unsigned = (ptype & 0x8000) != 0;
-	uint64		v;
-	const char *s;
-	int			slen;
-
-	switch (type)
-	{
-		case MYSQL_TYPE_NULL:
-			appendStringInfoString(buf, "NULL");
-			break;
-		case MYSQL_TYPE_TINY:
-			v = need_uint(pkt, 1);
-			appendStringInfo(buf, "(%d)", is_unsigned ? (int) (uint8) v : (int) (int8) v);
-			break;
-		case MYSQL_TYPE_SHORT:
-		case MYSQL_TYPE_YEAR:
-			v = need_uint(pkt, 2);
-			appendStringInfo(buf, "(%d)", is_unsigned ? (int) (uint16) v : (int) (int16) v);
-			break;
-		case MYSQL_TYPE_LONG:
-		case MYSQL_TYPE_INT24:
-			v = need_uint(pkt, 4);
-			if (is_unsigned)
-				appendStringInfo(buf, "(%u)", (uint32) v);
-			else
-				appendStringInfo(buf, "(%d)", (int32) v);
-			break;
-		case MYSQL_TYPE_LONGLONG:
-			v = need_uint(pkt, 8);
-			if (is_unsigned)
-				appendStringInfo(buf, "(" UINT64_FORMAT ")", v);
-			else
-				appendStringInfo(buf, "(" INT64_FORMAT ")", (int64) v);
-			break;
-		case MYSQL_TYPE_FLOAT:
-			{
-				uint32		u = (uint32) need_uint(pkt, 4);
-				float		f;
-
-				memcpy(&f, &u, sizeof(f));
-				append_float_literal(buf, f, 9);
-				break;
-			}
-		case MYSQL_TYPE_DOUBLE:
-			{
-				double		d;
-
-				v = need_uint(pkt, 8);
-				memcpy(&d, &v, sizeof(d));
-				append_float_literal(buf, d, 17);
-				break;
-			}
-		case MYSQL_TYPE_DATE:
-		case MYSQL_TYPE_NEWDATE:
-		case MYSQL_TYPE_DATETIME:
-		case MYSQL_TYPE_TIMESTAMP:
-		case MYSQL_TYPE_TIME:
-			append_temporal(buf, pkt, type);
-			break;
-		case MYSQL_TYPE_DECIMAL:
-		case MYSQL_TYPE_NEWDECIMAL:
-			if (!get_lenenc_bytes(pkt, &s, &slen))
-				malformed();
-			if (is_decimal_text(s, slen))
-			{
-				appendStringInfoChar(buf, '(');
-				appendBinaryStringInfo(buf, s, slen);
-				appendStringInfoChar(buf, ')');
-			}
-			else
-				append_string_literal(buf, s, slen, false);
-			break;
-		case MYSQL_TYPE_VARCHAR:
-		case MYSQL_TYPE_VAR_STRING:
-		case MYSQL_TYPE_STRING:
-		case MYSQL_TYPE_ENUM:
-		case MYSQL_TYPE_SET:
-		case MYSQL_TYPE_JSON:
-			if (!get_lenenc_bytes(pkt, &s, &slen))
-				malformed();
-			append_string_literal(buf, s, slen, false);
-			break;
-		case MYSQL_TYPE_TINY_BLOB:
-		case MYSQL_TYPE_MEDIUM_BLOB:
-		case MYSQL_TYPE_LONG_BLOB:
-		case MYSQL_TYPE_BLOB:
-		case MYSQL_TYPE_BIT:
-		case MYSQL_TYPE_GEOMETRY:
-			/* binary character set, as in MySQL */
-			if (!get_lenenc_bytes(pkt, &s, &slen))
-				malformed();
-			append_string_literal(buf, s, slen, true);
-			break;
-		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("unsupported parameter type %u", type)));
-	}
 }
 
 static bool
@@ -859,6 +807,7 @@ mys_stmt_prepare(StringInfo pkt)
 	cxt = AllocSetContextCreate(TopMemoryContext, "aux_mysql prepared statement",
 								ALLOCSET_SMALL_SIZES);
 	stmt = hash_search(stmt_hash, &id, HASH_ENTER, &found);
+	memset(((char *) stmt) + sizeof(uint32), 0, sizeof(MysPrepStmt) - sizeof(uint32));
 	stmt->id = id;
 	stmt->cxt = cxt;
 	stmt->query = MemoryContextStrdup(cxt, query);
@@ -870,6 +819,8 @@ mys_stmt_prepare(StringInfo pkt)
 	stmt->long_data = MemoryContextAllocZero(cxt, sizeof(StringInfo) * Max(nparams, 1));
 	stmt->long_data_bytes = 0;
 	stmt->long_data_error = false;
+	stmt->cached_sig_oids = MemoryContextAllocZero(cxt, sizeof(Oid) * Max(nparams, 1));
+	stmt->cached_deduced_oids = MemoryContextAllocZero(cxt, sizeof(Oid) * Max(nparams, 1));
 
 	/* COM_STMT_PREPARE_OK */
 	initStringInfo(&b);
@@ -914,19 +865,27 @@ mys_stmt_prepare(StringInfo pkt)
 }
 
 /* ----------------------------------------------------------------
- * COM_STMT_EXECUTE: rewrite the packet into the query to run
+ * COM_STMT_EXECUTE: native CachedPlan fast path with seamless fallback
  * ----------------------------------------------------------------
  */
-void
-mys_stmt_execute(StringInfo inBuf)
+typedef struct MysDecodedParam
+{
+	bool		is_null;
+	bool		has_long_data;
+	uint16		ptype;
+	uint64		uval;
+	double		dval;
+	const char *bytes;
+	int			len;
+} MysDecodedParam;
+
+static void
+decode_execute_packet(StringInfo inBuf, MysPrepStmt **stmt_out,
+					  MysDecodedParam **dparams_out)
 {
 	MysPrepStmt *stmt;
+	MysDecodedParam *dparams;
 	const char *nullmap = NULL;
-	StringInfoData q;
-	MysTextMap *map;
-	int		   *new_loc;
-	int		   *new_len;
-	int			prev = 0;
 	uint32		id;
 
 	inBuf->cursor = 1;			/* command byte */
@@ -935,9 +894,10 @@ mys_stmt_execute(StringInfo inBuf)
 	if (stmt->long_data_error)
 		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						errmsg("long data exceeds mysql.max_allowed_packet; reset the statement")));
-	(void) need_uint(inBuf, 1); /* flags: cursors are not supported, the
-								 * whole result is sent */
+	(void) need_uint(inBuf, 1); /* flags: cursors are not supported */
 	(void) need_uint(inBuf, 4); /* iteration count, always 1 */
+
+	dparams = palloc0(sizeof(MysDecodedParam) * Max(stmt->nparams, 1));
 
 	PG_TRY();
 	{
@@ -955,24 +915,112 @@ mys_stmt_execute(StringInfo inBuf)
 				malformed();
 		}
 
-		new_loc = palloc(sizeof(int) * Max(stmt->nparams, 1));
-		new_len = palloc(sizeof(int) * Max(stmt->nparams, 1));
-		initStringInfo(&q);
 		for (int i = 0; i < stmt->nparams; i++)
 		{
-			appendBinaryStringInfo(&q, stmt->query + prev, stmt->param_loc[i] - prev);
-			new_loc[i] = q.len;
-			if (stmt->long_data[i])
-				append_string_literal(&q, stmt->long_data[i]->data, stmt->long_data[i]->len,
-									  param_type_is_binary(stmt->param_types[i]));
+			uint16		ptype = stmt->param_types[i];
+			uint8		type = ptype & 0xff;
+
+			dparams[i].ptype = ptype;
+			if (stmt->long_data[i] != NULL)
+			{
+				int			llen = stmt->long_data[i]->len;
+				char	   *copy = palloc(Max(llen, 1));
+
+				if (llen > 0)
+					memcpy(copy, stmt->long_data[i]->data, llen);
+				dparams[i].has_long_data = true;
+				dparams[i].bytes = copy;
+				dparams[i].len = llen;
+			}
 			else if (nullmap[i / 8] & (1 << (i % 8)))
-				appendStringInfoString(&q, "NULL");
+			{
+				dparams[i].is_null = true;
+			}
 			else
-				append_param(&q, inBuf, stmt->param_types[i]);
-			new_len[i] = q.len - new_loc[i];
-			prev = stmt->param_loc[i] + 1;
+			{
+				switch (type)
+				{
+					case MYSQL_TYPE_NULL:
+						dparams[i].is_null = true;
+						break;
+					case MYSQL_TYPE_TINY:
+						dparams[i].uval = need_uint(inBuf, 1);
+						break;
+					case MYSQL_TYPE_SHORT:
+					case MYSQL_TYPE_YEAR:
+						dparams[i].uval = need_uint(inBuf, 2);
+						break;
+					case MYSQL_TYPE_LONG:
+					case MYSQL_TYPE_INT24:
+						dparams[i].uval = need_uint(inBuf, 4);
+						break;
+					case MYSQL_TYPE_LONGLONG:
+						dparams[i].uval = need_uint(inBuf, 8);
+						break;
+					case MYSQL_TYPE_FLOAT:
+						{
+							uint32		u = (uint32) need_uint(inBuf, 4);
+							float		f;
+
+							memcpy(&f, &u, sizeof(f));
+							if (!isfinite(f))
+								ereport(ERROR,
+										(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+										 errmsg("Incorrect DOUBLE value: '%g'", (double) f)));
+							dparams[i].dval = f;
+							break;
+						}
+					case MYSQL_TYPE_DOUBLE:
+						{
+							uint64		u = need_uint(inBuf, 8);
+							double		d;
+
+							memcpy(&d, &u, sizeof(d));
+							if (!isfinite(d))
+								ereport(ERROR,
+										(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+										 errmsg("Incorrect DOUBLE value: '%g'", d)));
+							dparams[i].dval = d;
+							break;
+						}
+					case MYSQL_TYPE_DATE:
+					case MYSQL_TYPE_NEWDATE:
+					case MYSQL_TYPE_DATETIME:
+					case MYSQL_TYPE_TIMESTAMP:
+					case MYSQL_TYPE_TIME:
+						{
+							StringInfoData tbuf;
+
+							initStringInfo(&tbuf);
+							append_temporal(&tbuf, inBuf, type);
+							dparams[i].bytes = tbuf.data;
+							dparams[i].len = tbuf.len;
+							break;
+						}
+					case MYSQL_TYPE_DECIMAL:
+					case MYSQL_TYPE_NEWDECIMAL:
+					case MYSQL_TYPE_VARCHAR:
+					case MYSQL_TYPE_VAR_STRING:
+					case MYSQL_TYPE_STRING:
+					case MYSQL_TYPE_ENUM:
+					case MYSQL_TYPE_SET:
+					case MYSQL_TYPE_JSON:
+					case MYSQL_TYPE_TINY_BLOB:
+					case MYSQL_TYPE_MEDIUM_BLOB:
+					case MYSQL_TYPE_LONG_BLOB:
+					case MYSQL_TYPE_BLOB:
+					case MYSQL_TYPE_BIT:
+					case MYSQL_TYPE_GEOMETRY:
+						if (!get_lenenc_bytes(inBuf, &dparams[i].bytes, &dparams[i].len))
+							malformed();
+						break;
+					default:
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("unsupported parameter type %u", type)));
+				}
+			}
 		}
-		appendStringInfoString(&q, stmt->query + prev);
 	}
 	PG_FINALLY();
 	{
@@ -981,7 +1029,117 @@ mys_stmt_execute(StringInfo inBuf)
 	}
 	PG_END_TRY();
 
-	/* result columns are named after the text with '?' (MySQL's naming) */
+	*stmt_out = stmt;
+	*dparams_out = dparams;
+}
+
+static void
+append_decoded_param(StringInfo buf, const MysDecodedParam *dp)
+{
+	uint8		type = dp->ptype & 0xff;
+	bool		is_unsigned = (dp->ptype & 0x8000) != 0;
+
+	if (dp->has_long_data)
+	{
+		append_string_literal(buf, dp->bytes, dp->len, param_type_is_binary(dp->ptype));
+		return;
+	}
+	if (dp->is_null)
+	{
+		appendStringInfoString(buf, "NULL");
+		return;
+	}
+
+	switch (type)
+	{
+		case MYSQL_TYPE_TINY:
+			appendStringInfo(buf, "(%d)",
+							 is_unsigned ? (int) (uint8) dp->uval : (int) (int8) dp->uval);
+			break;
+		case MYSQL_TYPE_SHORT:
+		case MYSQL_TYPE_YEAR:
+			appendStringInfo(buf, "(%d)",
+							 is_unsigned ? (int) (uint16) dp->uval : (int) (int16) dp->uval);
+			break;
+		case MYSQL_TYPE_LONG:
+		case MYSQL_TYPE_INT24:
+			if (is_unsigned)
+				appendStringInfo(buf, "(%u)", (uint32) dp->uval);
+			else
+				appendStringInfo(buf, "(%d)", (int32) dp->uval);
+			break;
+		case MYSQL_TYPE_LONGLONG:
+			if (is_unsigned)
+				appendStringInfo(buf, "(" UINT64_FORMAT ")", dp->uval);
+			else
+				appendStringInfo(buf, "(" INT64_FORMAT ")", (int64) dp->uval);
+			break;
+		case MYSQL_TYPE_FLOAT:
+			append_float_literal(buf, dp->dval, 9);
+			break;
+		case MYSQL_TYPE_DOUBLE:
+			append_float_literal(buf, dp->dval, 17);
+			break;
+		case MYSQL_TYPE_DATE:
+		case MYSQL_TYPE_NEWDATE:
+		case MYSQL_TYPE_DATETIME:
+		case MYSQL_TYPE_TIMESTAMP:
+		case MYSQL_TYPE_TIME:
+			appendBinaryStringInfo(buf, dp->bytes, dp->len);
+			break;
+		case MYSQL_TYPE_DECIMAL:
+		case MYSQL_TYPE_NEWDECIMAL:
+			if (is_decimal_text(dp->bytes, dp->len))
+			{
+				appendStringInfoChar(buf, '(');
+				appendBinaryStringInfo(buf, dp->bytes, dp->len);
+				appendStringInfoChar(buf, ')');
+			}
+			else
+				append_string_literal(buf, dp->bytes, dp->len, false);
+			break;
+		case MYSQL_TYPE_VARCHAR:
+		case MYSQL_TYPE_VAR_STRING:
+		case MYSQL_TYPE_STRING:
+		case MYSQL_TYPE_ENUM:
+		case MYSQL_TYPE_SET:
+		case MYSQL_TYPE_JSON:
+			append_string_literal(buf, dp->bytes, dp->len, false);
+			break;
+		case MYSQL_TYPE_TINY_BLOB:
+		case MYSQL_TYPE_MEDIUM_BLOB:
+		case MYSQL_TYPE_LONG_BLOB:
+		case MYSQL_TYPE_BLOB:
+		case MYSQL_TYPE_BIT:
+		case MYSQL_TYPE_GEOMETRY:
+			append_string_literal(buf, dp->bytes, dp->len, true);
+			break;
+		default:
+			elog(ERROR, "unexpected parameter type %u", type);
+	}
+}
+
+static void
+render_decoded_execute_query(StringInfo inBuf, MysPrepStmt *stmt,
+							 const MysDecodedParam *dparams)
+{
+	StringInfoData q;
+	MysTextMap *map;
+	int		   *new_loc = palloc(sizeof(int) * Max(stmt->nparams, 1));
+	int		   *new_len = palloc(sizeof(int) * Max(stmt->nparams, 1));
+	int			prev = 0;
+
+	initStringInfo(&q);
+	for (int i = 0; i < stmt->nparams; i++)
+	{
+		appendBinaryStringInfo(&q, stmt->query + prev, stmt->param_loc[i] - prev);
+		new_loc[i] = q.len;
+		append_decoded_param(&q, &dparams[i]);
+		new_len[i] = q.len - new_loc[i];
+		prev = stmt->param_loc[i] + 1;
+	}
+	appendStringInfoString(&q, stmt->query + prev);
+
 	map = palloc(sizeof(MysTextMap));
 	map->orig = stmt->query;
 	map->nparams = stmt->nparams;
@@ -989,14 +1147,883 @@ mys_stmt_execute(StringInfo inBuf)
 	map->new_loc = new_loc;
 	map->new_len = new_len;
 
-	/* hand the query to the regular simple-query path */
 	resetStringInfo(inBuf);
-	appendBinaryStringInfo(inBuf, q.data, q.len + 1);	/* with the NUL */
+	appendBinaryStringInfo(inBuf, q.data, q.len + 1);
 	inBuf->cursor = 0;
 	pfree(q.data);
 
 	mys_text_map = map;
 	mys_binary_resultset = true;
+}
+
+/*
+ * Compute a per-parameter signature OID faithful to literal execution:
+ *   - InvalidOid: NULL (context-resolved via parse_analyze_varparams)
+ *   - INT4OID / INT8OID: integer values matching PG's ICONST range threshold
+ *   - UNKNOWNOID: valid UTF-8 non-NUL string (must resolve to VARCHAR/TEXT/BPCHAR)
+ */
+static bool
+compute_fastpath_sig(const MysPrepStmt *stmt, const MysDecodedParam *dparams,
+					 Oid *sig_oids)
+{
+	int			db_enc = GetDatabaseEncoding();
+
+	if (pg_get_client_encoding() != db_enc)
+		return false;
+
+	for (int i = 0; i < stmt->nparams; i++)
+	{
+		const MysDecodedParam *dp = &dparams[i];
+		uint8		type = dp->ptype & 0xff;
+		bool		is_unsigned = (dp->ptype & 0x8000) != 0;
+
+		if (dp->has_long_data)
+			return false;
+		if (dp->is_null)
+		{
+			sig_oids[i] = InvalidOid;
+			continue;
+		}
+		switch (type)
+		{
+			case MYSQL_TYPE_TINY:
+			case MYSQL_TYPE_SHORT:
+			case MYSQL_TYPE_YEAR:
+				sig_oids[i] = INT4OID;
+				break;
+			case MYSQL_TYPE_LONG:
+			case MYSQL_TYPE_INT24:
+				if (is_unsigned)
+				{
+					uint32		uv = (uint32) dp->uval;
+
+					if (uv == (uint32) PG_INT32_MAX + 1U)
+						return false;
+					sig_oids[i] = (uv > (uint32) PG_INT32_MAX) ? INT8OID : INT4OID;
+				}
+				else
+				{
+					int32		sv = (int32) dp->uval;
+
+					if (sv == PG_INT32_MIN)
+						return false;
+					sig_oids[i] = INT4OID;
+				}
+				break;
+			case MYSQL_TYPE_LONGLONG:
+				if (is_unsigned)
+				{
+					if (dp->uval == (uint64) PG_INT32_MAX + 1ULL)
+						return false;
+					if (dp->uval <= (uint64) PG_INT32_MAX)
+						sig_oids[i] = INT4OID;
+					else if (dp->uval <= (uint64) PG_INT64_MAX)
+						sig_oids[i] = INT8OID;
+					else
+						return false;
+				}
+				else
+				{
+					int64		sval = (int64) dp->uval;
+
+					if (sval == PG_INT64_MIN ||
+						sval == (int64) PG_INT32_MIN ||
+						sval == (int64) PG_INT32_MAX + 1LL)
+						return false;
+					sig_oids[i] = (sval > PG_INT32_MIN && sval <= PG_INT32_MAX) ?
+						INT4OID : INT8OID;
+				}
+				break;
+			case MYSQL_TYPE_VARCHAR:
+			case MYSQL_TYPE_VAR_STRING:
+			case MYSQL_TYPE_STRING:
+				if (memchr(dp->bytes, '\0', dp->len) != NULL ||
+					!pg_verify_mbstr(db_enc, dp->bytes, dp->len, true))
+					return false;
+				sig_oids[i] = UNKNOWNOID;
+				break;
+			default:
+				return false;
+		}
+	}
+	return true;
+}
+
+static bool
+raw_has_paramref_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, ParamRef))
+		return true;
+	return raw_expression_tree_walker(node, raw_has_paramref_walker, context);
+}
+
+/*
+ * SQL92 ordinal clauses (ORDER BY, GROUP BY, DISTINCT ON) and FETCH ... WITH
+ * TIES inspect raw A_Const nodes before general expression analysis.  For
+ * example, "ORDER BY -?" bound to -1 folds to A_Const(1) (sort by column 1) on
+ * the literal path, whereas a ParamRef stays an expression.  Decline the fast
+ * path whenever any such clause contains a parameter marker.
+ */
+static bool
+raw_has_positional_param_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, SelectStmt))
+	{
+		SelectStmt *sel = (SelectStmt *) node;
+
+		if (raw_has_paramref_walker((Node *) sel->sortClause, NULL) ||
+			raw_has_paramref_walker((Node *) sel->groupClause, NULL) ||
+			raw_has_paramref_walker((Node *) sel->distinctClause, NULL) ||
+			(sel->limitOption == LIMIT_OPTION_WITH_TIES &&
+			 raw_has_paramref_walker(sel->limitCount, NULL)))
+			return true;
+	}
+	return raw_expression_tree_walker(node, raw_has_positional_param_walker, context);
+}
+
+static bool
+query_has_user_vars_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, FuncExpr))
+	{
+		char	   *fname = get_func_name(((FuncExpr *) node)->funcid);
+
+		if (fname != NULL)
+		{
+			bool		is_uvar = (strcmp(fname, "get_user_var") == 0 ||
+								   strcmp(fname, "set_user_var") == 0 ||
+								   strcmp(fname, "set_user_var_in_expr") == 0);
+
+			pfree(fname);
+			if (is_uvar)
+				return true;
+		}
+	}
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, query_has_user_vars_walker,
+								 context, 0);
+	return expression_tree_walker(node, query_has_user_vars_walker, context);
+}
+
+static void
+fastpath_post_rewrite(List *querytree_list, void *arg)
+{
+	MysPrepStmt *stmt = (MysPrepStmt *) arg;
+
+	stmt->revalidated_stale = true;
+}
+
+static void scan_query_for_locks(Query *parsetree, bool acquire);
+
+static bool
+scan_sublink_for_locks_walker(Node *node, bool *acquire)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubLink))
+		scan_query_for_locks(castNode(Query, ((SubLink *) node)->subselect), *acquire);
+	return expression_tree_walker(node, scan_sublink_for_locks_walker, acquire);
+}
+
+static void
+scan_query_for_locks(Query *parsetree, bool acquire)
+{
+	if (parsetree == NULL || parsetree->commandType == CMD_UTILITY)
+		return;
+	foreach_node(RangeTblEntry, rte, parsetree->rtable)
+	{
+		if (rte->rtekind == RTE_RELATION)
+		{
+			if (acquire)
+				LockRelationOid(rte->relid, rte->rellockmode);
+			else
+				UnlockRelationOid(rte->relid, rte->rellockmode);
+		}
+		else if (rte->rtekind == RTE_SUBQUERY)
+		{
+			if (OidIsValid(rte->relid))
+			{
+				if (acquire)
+					LockRelationOid(rte->relid, rte->rellockmode);
+				else
+					UnlockRelationOid(rte->relid, rte->rellockmode);
+			}
+			scan_query_for_locks(rte->subquery, acquire);
+		}
+	}
+	foreach_node(CommonTableExpr, cte, parsetree->cteList)
+		scan_query_for_locks(castNode(Query, cte->ctequery), acquire);
+	if (parsetree->hasSubLinks)
+		query_tree_walker(parsetree, scan_sublink_for_locks_walker, &acquire,
+						  QTW_IGNORE_RC_SUBQUERIES);
+}
+
+static void
+lock_cached_query_rels(List *query_list, bool acquire)
+{
+	foreach_node(Query, q, query_list)
+		scan_query_for_locks(q, acquire);
+}
+
+static bool
+fastpath_env_matches(const MysPrepStmt *stmt, const Oid *sig_oids)
+{
+	const char *cur_db = mys_selected_database();
+
+	if (stmt->plansource == NULL || !CachedPlanIsValid(stmt->plansource))
+		return false;
+	if (stmt->nparams > 0 &&
+		memcmp(stmt->cached_sig_oids, sig_oids, sizeof(Oid) * stmt->nparams) != 0)
+		return false;
+	if (stmt->cached_sql_mode != mys_sqlMode ||
+		stmt->cached_role != GetUserId() ||
+		stmt->cached_row_security != row_security)
+		return false;
+	if ((stmt->cached_db == NULL) != (cur_db == NULL) ||
+		(cur_db != NULL && strcmp(stmt->cached_db, cur_db) != 0))
+		return false;
+	if (stmt->plansource->search_path != NULL &&
+		!SearchPathMatchesCurrentEnvironment(stmt->plansource->search_path))
+		return false;
+	return true;
+}
+
+static bool
+should_rethrow_probe_error(const ErrorData *edata)
+{
+	if (QueryCancelPending || ProcDiePending)
+		return true;
+	switch (edata->sqlerrcode)
+	{
+		case ERRCODE_QUERY_CANCELED:
+		case ERRCODE_LOCK_NOT_AVAILABLE:
+		case ERRCODE_T_R_DEADLOCK_DETECTED:
+		case ERRCODE_T_R_SERIALIZATION_FAILURE:
+		case ERRCODE_TRANSACTION_TIMEOUT:
+		case ERRCODE_IDLE_IN_TRANSACTION_SESSION_TIMEOUT:
+		case ERRCODE_IDLE_SESSION_TIMEOUT:
+		case ERRCODE_OUT_OF_MEMORY:
+		case ERRCODE_CONFIGURATION_LIMIT_EXCEEDED:
+		case ERRCODE_ADMIN_SHUTDOWN:
+		case ERRCODE_CRASH_SHUTDOWN:
+		case ERRCODE_CANNOT_CONNECT_NOW:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * Parse, rewrite, analyze, and save a CachedPlanSource inside an internal
+ * subtransaction so any unsupported construct or analysis error rolls back
+ * cleanly before falling back to exec_simple_query().  Must be called inside
+ * an active transaction command.
+ */
+static bool
+build_fastpath_plansource(MysPrepStmt *stmt, const Oid *sig_oids)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+	MysTextMap *saved_map = mys_text_map;
+	volatile bool ok = false;
+
+	drop_stmt_cached_plan(stmt);
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(oldcxt);
+	PG_TRY();
+	{
+		List	   *raw;
+		RawStmt    *orig_rs;
+
+		mys_text_map = NULL;
+		mys_binary_session_init();
+		raw = mysql_raw_parser(stmt->query);
+		if (list_length(raw) != 1)
+		{
+			stmt->fastpath_state = -1;
+		}
+		else
+		{
+			orig_rs = linitial_node(RawStmt, raw);
+			if (!(IsA(orig_rs->stmt, SelectStmt) ||
+				  IsA(orig_rs->stmt, InsertStmt) ||
+				  IsA(orig_rs->stmt, UpdateStmt) ||
+				  IsA(orig_rs->stmt, DeleteStmt)) ||
+				ps_marker_name(orig_rs->stmt) != NULL ||
+				raw_has_positional_param_walker(orig_rs->stmt, NULL))
+			{
+				stmt->fastpath_state = -1;
+			}
+			else
+			{
+				List	   *infos = NIL;
+				List	   *rewritten = mys_rewrite_raw_stmts(raw, stmt->query, &infos);
+
+				mys_discard_rewrite_warnings();
+				if (list_length(rewritten) == 1 && list_length(infos) == 1)
+				{
+					RawStmt    *rs = linitial_node(RawStmt, rewritten);
+					MysStmtInfo *info = linitial(infos);
+
+					if (raw_has_positional_param_walker(rs->stmt, NULL))
+					{
+						stmt->fastpath_state = -1;
+					}
+					else if (info->rewrite_warnings == NIL &&
+						!info->silent && !info->suppress_response &&
+						!info->continued && !info->diagnostic &&
+						!info->txn_control &&
+						info->txn_kind == MYS_TXN_REGULAR &&
+						(IsA(rs->stmt, SelectStmt) ||
+						 IsA(rs->stmt, InsertStmt) ||
+						 IsA(rs->stmt, UpdateStmt) ||
+						 IsA(rs->stmt, DeleteStmt)) &&
+						ps_marker_name(rs->stmt) == NULL)
+					{
+						Oid		   *deduced = palloc0(sizeof(Oid) * Max(stmt->nparams, 1));
+						int			num_params = stmt->nparams;
+						Query	   *query;
+						bool		types_ok = true;
+
+						for (int i = 0; i < stmt->nparams; i++)
+							deduced[i] = (sig_oids[i] == UNKNOWNOID) ? InvalidOid : sig_oids[i];
+
+						query = parse_analyze_varparams(copyObject(rs), stmt->query,
+														&deduced, &num_params, NULL);
+						if (num_params != stmt->nparams ||
+							query_tree_walker(query, query_has_user_vars_walker, NULL, 0))
+							types_ok = false;
+
+						for (int i = 0; i < stmt->nparams && types_ok; i++)
+						{
+							if (sig_oids[i] == UNKNOWNOID)
+							{
+								if (deduced[i] != VARCHAROID &&
+									deduced[i] != TEXTOID &&
+									deduced[i] != BPCHAROID)
+									types_ok = false;
+							}
+							else if (sig_oids[i] == InvalidOid)
+							{
+								if (!OidIsValid(deduced[i]) ||
+									deduced[i] == UNKNOWNOID ||
+									get_typtype(deduced[i]) == TYPTYPE_DOMAIN)
+									types_ok = false;
+							}
+							else if (deduced[i] != sig_oids[i])
+							{
+								types_ok = false;
+							}
+						}
+
+						if (types_ok)
+						{
+							List	   *qlist = pg_rewrite_query(query);
+
+							if (list_length(qlist) == 1)
+							{
+								Query	   *q = linitial_node(Query, qlist);
+								PortalStrategy strat = ChoosePortalStrategy(qlist);
+
+								if (q->canSetTag && q->utilityStmt == NULL &&
+									(q->commandType == CMD_SELECT ||
+									 q->commandType == CMD_INSERT ||
+									 q->commandType == CMD_UPDATE ||
+									 q->commandType == CMD_DELETE) &&
+									(strat == PORTAL_ONE_SELECT ||
+									 strat == PORTAL_ONE_RETURNING ||
+									 strat == PORTAL_MULTI_QUERY))
+								{
+									CommandTag	tag = CreateCommandTag(rs->stmt);
+									CachedPlanSource *psrc;
+									const char *cur_db = mys_selected_database();
+									MemoryContext cxt_save;
+
+									psrc = CreateCachedPlan(rs, stmt->query, tag);
+									CompleteCachedPlan(psrc, qlist, NULL,
+													   stmt->nparams > 0 ? deduced : NULL,
+													   stmt->nparams, NULL, NULL,
+													   CURSOR_OPT_PARALLEL_OK, false);
+									SetPostRewriteHook(psrc, fastpath_post_rewrite, stmt);
+									SaveCachedPlan(psrc);
+
+									cxt_save = MemoryContextSwitchTo(stmt->cxt);
+									stmt->plansource = psrc;
+									if (stmt->nparams > 0)
+									{
+										memcpy(stmt->cached_sig_oids, sig_oids,
+											   sizeof(Oid) * stmt->nparams);
+										memcpy(stmt->cached_deduced_oids, deduced,
+											   sizeof(Oid) * stmt->nparams);
+									}
+									stmt->cached_sql_mode = mys_sqlMode;
+									stmt->cached_hexlit = mys_hexlit_available;
+									stmt->cached_role = GetUserId();
+									stmt->cached_row_security = row_security;
+									stmt->cached_db = cur_db ? pstrdup(cur_db) : NULL;
+									stmt->cached_info = *info;
+									stmt->cached_info.rewrite_warnings = NIL;
+									stmt->cached_info.update_cols = NIL;
+									foreach_ptr(char, col, info->update_cols)
+										stmt->cached_info.update_cols =
+											lappend(stmt->cached_info.update_cols, pstrdup(col));
+									stmt->cached_tag = tag;
+									stmt->revalidated_stale = false;
+									MemoryContextSwitchTo(cxt_save);
+									ok = true;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		mys_text_map = saved_map;
+		if (ok)
+			ReleaseCurrentSubTransaction();
+		else
+			RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		mys_text_map = saved_map;
+		mys_discard_rewrite_warnings();
+		MemoryContextSwitchTo(oldcxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+		if (should_rethrow_probe_error(edata))
+			ReThrowError(edata);
+		FreeErrorData(edata);
+		ok = false;
+	}
+	PG_END_TRY();
+
+	return ok;
+}
+
+static ParamListInfo
+build_fastpath_param_list(const MysPrepStmt *stmt, const MysDecodedParam *dparams)
+{
+	ParamListInfo params;
+
+	if (stmt->nparams == 0)
+		return NULL;
+	params = makeParamList(stmt->nparams);
+	for (int i = 0; i < stmt->nparams; i++)
+	{
+		const MysDecodedParam *dp = &dparams[i];
+		ParamExternData *prm = &params->params[i];
+		Oid			ptype = stmt->cached_deduced_oids[i];
+		uint8		wtype = dp->ptype & 0xff;
+		bool		is_unsigned = (dp->ptype & 0x8000) != 0;
+
+		prm->ptype = ptype;
+		prm->pflags = PARAM_FLAG_CONST;
+		if (dp->is_null)
+		{
+			prm->isnull = true;
+			prm->value = (Datum) 0;
+			continue;
+		}
+		prm->isnull = false;
+		if (ptype == INT4OID)
+		{
+			int32		ival;
+
+			if (wtype == MYSQL_TYPE_TINY)
+				ival = is_unsigned ? (int32) (uint8) dp->uval : (int32) (int8) dp->uval;
+			else if (wtype == MYSQL_TYPE_SHORT || wtype == MYSQL_TYPE_YEAR)
+				ival = is_unsigned ? (int32) (uint16) dp->uval : (int32) (int16) dp->uval;
+			else
+				ival = (int32) dp->uval;
+			prm->value = Int32GetDatum(ival);
+		}
+		else if (ptype == INT8OID)
+		{
+			prm->value = Int64GetDatum((int64) dp->uval);
+		}
+		else if (ptype == VARCHAROID || ptype == TEXTOID)
+		{
+			prm->value = PointerGetDatum(cstring_to_text_with_len(dp->bytes, dp->len));
+		}
+		else
+		{
+			char	   *cstr = pnstrdup(dp->bytes, dp->len);
+
+			Assert(ptype == BPCHAROID);
+			prm->value = DirectFunctionCall3(bpcharin,
+											 CStringGetDatum(cstr),
+											 ObjectIdGetDatum(InvalidOid),
+											 Int32GetDatum(-1));
+			pfree(cstr);
+		}
+	}
+	return params;
+}
+
+/*
+ * Format fast-path parameters for statement, duration, or error logging via
+ * knownTextValues so BuildParamLogString() never touches syscache (safe even
+ * after CommitTransactionCommand() has ended an autocommit transaction).
+ */
+static char *
+fastpath_format_param_log(ParamListInfo params, int maxlen)
+{
+	char	  **known;
+	char	   *res;
+
+	if (params == NULL || params->numParams <= 0 || maxlen == 0)
+		return NULL;
+
+	known = palloc0(sizeof(char *) * params->numParams);
+	for (int i = 0; i < params->numParams; i++)
+	{
+		ParamExternData *prm = &params->params[i];
+
+		if (prm->isnull || !OidIsValid(prm->ptype))
+			continue;
+		if (prm->ptype == INT4OID)
+			known[i] = psprintf("%d", DatumGetInt32(prm->value));
+		else if (prm->ptype == INT8OID)
+			known[i] = psprintf(INT64_FORMAT, DatumGetInt64(prm->value));
+		else
+			known[i] = TextDatumGetCString(prm->value);
+	}
+	res = BuildParamLogString(params, known, maxlen);
+	for (int i = 0; i < params->numParams; i++)
+	{
+		if (known[i] != NULL)
+			pfree(known[i]);
+	}
+	pfree(known);
+	return res;
+}
+
+static bool
+fastpath_check_log_statement(List *stmt_list)
+{
+	if (log_statement == LOGSTMT_NONE)
+		return false;
+	if (log_statement == LOGSTMT_ALL)
+		return true;
+	foreach_ptr(Node, s, stmt_list)
+	{
+		if (GetCommandLogLevel(s) <= log_statement)
+			return true;
+	}
+	return false;
+}
+
+static int
+fastpath_errdetail_params(ParamListInfo params)
+{
+	char	   *str = fastpath_format_param_log(params, log_parameter_max_length);
+
+	if (str && str[0] != '\0')
+		errdetail("Parameters: %s", str);
+	return 0;
+}
+
+static void
+enable_fast_stmt_timeout(void)
+{
+	if (StatementTimeout > 0 &&
+		(StatementTimeout < TransactionTimeout || TransactionTimeout == 0))
+	{
+		if (!get_timeout_active(STATEMENT_TIMEOUT))
+			enable_timeout_after(STATEMENT_TIMEOUT, StatementTimeout);
+	}
+	else if (get_timeout_active(STATEMENT_TIMEOUT))
+		disable_timeout(STATEMENT_TIMEOUT, false);
+}
+
+static void
+disable_fast_stmt_timeout(void)
+{
+	if (get_timeout_active(STATEMENT_TIMEOUT))
+		disable_timeout(STATEMENT_TIMEOUT, false);
+}
+
+bool
+mys_stmt_try_execute(StringInfo inBuf)
+{
+	MysPrepStmt *stmt = NULL;
+	MysDecodedParam *dparams = NULL;
+	Oid		   *sig_oids;
+	MemoryContext msg_cxt = CurrentMemoryContext;
+	ErrorData  *decode_err = NULL;
+	bool		wrap_savepoint;
+	Portal		portal;
+	ParamListInfo params;
+	CachedPlan *cplan;
+	DestReceiver *receiver;
+	QueryCompletion qc;
+	MemoryContext oldcxt;
+	const char *cmdtagname;
+	size_t		cmdtaglen;
+	bool		save_log_statement_stats = log_statement_stats;
+	bool		was_logged = false;
+	char		msec_str[32];
+	ParamsErrorCbData params_data;
+	ErrorContextCallback params_errcxt;
+
+	PG_TRY();
+	{
+		decode_execute_packet(inBuf, &stmt, &dparams);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(msg_cxt);
+		decode_err = CopyErrorData();
+		FlushErrorState();
+		mys_stmt_query_done();
+	}
+	PG_END_TRY();
+
+	if (decode_err != NULL)
+	{
+		mys_send_error(decode_err->sqlerrcode, decode_err->message);
+		FreeErrorData(decode_err);
+		return true;
+	}
+
+	sig_oids = palloc0(sizeof(Oid) * Max(stmt->nparams, 1));
+	if (halo_mysql_parser != MYS_PARSER_MYSQL ||
+		stmt->fastpath_state < 0 ||
+		(mys_sqlMode & MYS_MODE_STRICT_TRANS_TABLES) == 0 ||
+		IsAbortedTransactionBlockState() ||
+		(IsTransactionBlock() && !mys_transaction_active()) ||
+		(autoCommit == 0 && !mys_transaction_active()) ||
+		!compute_fastpath_sig(stmt, dparams, sig_oids))
+	{
+		render_decoded_execute_query(inBuf, stmt, dparams);
+		return false;
+	}
+
+	SetCurrentStatementStartTimestamp();
+	if (save_log_statement_stats)
+		ResetUsage();
+	mys_sync_session_state();
+	mys_sync_selected_database();
+
+	wrap_savepoint = mys_transaction_active() && halo_mysql_statement_rollback;
+	if (wrap_savepoint)
+		mys_txn_enter_stmt_savepoint();
+
+	debug_query_string = stmt->query;
+	pgstat_report_activity(STATE_RUNNING, stmt->query);
+
+	StartTransactionCommand();
+	enable_fast_stmt_timeout();
+	if (!IsTransactionBlock())
+		mys_start_implicit_transaction(false);
+	oldcxt = MemoryContextSwitchTo(msg_cxt);
+	mys_binary_session_init();
+
+	/*
+	 * Validate environment (including SearchPathMatchesCurrentEnvironment,
+	 * which requires an active transaction if the path cache needs refresh),
+	 * acquire planner locks, and rebuild inside an internal subtransaction on
+	 * first execution or invalidation.  Keep STATEMENT_TIMEOUT armed if we
+	 * fall back so exec_simple_query() inherits the remaining deadline.
+	 */
+	if (fastpath_env_matches(stmt, sig_oids) &&
+		stmt->cached_hexlit == mys_hexlit_available)
+	{
+		lock_cached_query_rels(stmt->plansource->query_list, true);
+		if (!CachedPlanIsValid(stmt->plansource) ||
+			stmt->cached_hexlit != mys_hexlit_available)
+		{
+			lock_cached_query_rels(stmt->plansource->query_list, false);
+			drop_stmt_cached_plan(stmt);
+		}
+	}
+	else if (stmt->plansource != NULL)
+	{
+		drop_stmt_cached_plan(stmt);
+	}
+
+	if (stmt->plansource == NULL)
+	{
+		bool		built;
+
+		PushActiveSnapshot(GetTransactionSnapshot());
+		built = build_fastpath_plansource(stmt, sig_oids);
+		PopActiveSnapshot();
+		if (!built)
+		{
+			MemoryContextSwitchTo(oldcxt);
+			CommitTransactionCommand();
+			if (wrap_savepoint)
+				mys_txn_leave_stmt_savepoint();
+			mys_txn_arm_fallback_stmt_timeout();
+			debug_query_string = NULL;
+			MemoryContextSwitchTo(msg_cxt);
+			render_decoded_execute_query(inBuf, stmt, dparams);
+			return false;
+		}
+	}
+
+	mys_proto_prepare_fast_exec(&stmt->cached_info);
+
+	portal = CreatePortal("", true, true);
+	portal->visible = false;
+
+	MemoryContextSwitchTo(msg_cxt);
+	params = build_fastpath_param_list(stmt, dparams);
+	if (params && log_parameter_max_length_on_error != 0)
+		params->paramValuesStr =
+			fastpath_format_param_log(params, log_parameter_max_length_on_error);
+
+	params_data.portalName = "";
+	params_data.params = params;
+	params_errcxt.previous = error_context_stack;
+	params_errcxt.callback = ParamsErrorCallback;
+	params_errcxt.arg = &params_data;
+	error_context_stack = &params_errcxt;
+
+	stmt->revalidated_stale = false;
+	cplan = GetCachedPlan(stmt->plansource, params, NULL, NULL);
+	if (stmt->revalidated_stale)
+	{
+		bool		rebuilt;
+
+		/*
+		 * ResetPlanCache / debug_discard_caches invalidated inside GetCachedPlan.
+		 * Rebuild once from stmt->query with locks already held so dialect
+		 * raw-tree rewrites match the current catalog.
+		 */
+		ReleaseCachedPlan(cplan, NULL);
+		PushActiveSnapshot(GetTransactionSnapshot());
+		rebuilt = build_fastpath_plansource(stmt, sig_oids);
+		PopActiveSnapshot();
+		if (!rebuilt)
+		{
+			error_context_stack = error_context_stack->previous;
+			MarkPortalFailed(portal);
+			PortalDrop(portal, false);
+			MemoryContextSwitchTo(oldcxt);
+			CommitTransactionCommand();
+			if (wrap_savepoint)
+				mys_txn_leave_stmt_savepoint();
+			mys_txn_arm_fallback_stmt_timeout();
+			debug_query_string = NULL;
+			mys_stmt_query_done();
+			MemoryContextSwitchTo(msg_cxt);
+			render_decoded_execute_query(inBuf, stmt, dparams);
+			return false;
+		}
+		mys_proto_prepare_fast_exec(&stmt->cached_info);
+		MemoryContextSwitchTo(msg_cxt);
+		params = build_fastpath_param_list(stmt, dparams);
+		if (params && log_parameter_max_length_on_error != 0)
+			params->paramValuesStr =
+				fastpath_format_param_log(params, log_parameter_max_length_on_error);
+		params_data.params = params;
+		stmt->revalidated_stale = false;
+		cplan = GetCachedPlan(stmt->plansource, params, NULL, NULL);
+	}
+
+	/* Hand off cplan's single reference to portal immediately. */
+	PortalDefineQuery(portal, NULL, stmt->query, stmt->cached_tag,
+					  cplan->stmt_list, cplan);
+
+	foreach_node(PlannedStmt, pstmt, portal->stmts)
+	{
+		if (pstmt->queryId != INT64CONST(0))
+		{
+			pgstat_report_query_id(pstmt->queryId, false);
+			break;
+		}
+	}
+	foreach_node(PlannedStmt, pstmt, portal->stmts)
+	{
+		if (pstmt->planId != INT64CONST(0))
+		{
+			pgstat_report_plan_id(pstmt->planId, false);
+			break;
+		}
+	}
+
+	cmdtagname = GetCommandTagNameAndLen(portal->commandTag, &cmdtaglen);
+	set_ps_display_with_len(cmdtagname, cmdtaglen);
+
+	if (fastpath_check_log_statement(portal->stmts))
+	{
+		ereport(LOG,
+				(errmsg("statement: %s", stmt->query),
+				 errhidestmt(true),
+				 fastpath_errdetail_params(params)));
+		was_logged = true;
+	}
+
+	PortalStart(portal, params, 0, InvalidSnapshot);
+
+	receiver = CreateDestReceiver(DestRemote);
+	SetRemoteDestReceiverParams(receiver, portal);
+
+	MemoryContextSwitchTo(oldcxt);
+
+	(void) PortalRun(portal, FETCH_ALL, true, receiver, receiver, &qc);
+
+	error_context_stack = error_context_stack->previous;
+
+	receiver->rDestroy(receiver);
+	PortalDrop(portal, false);
+
+	disable_fast_stmt_timeout();
+	CommitTransactionCommand();
+
+	EndCommand(&qc, DestRemote, false);
+
+	if (wrap_savepoint)
+		mys_txn_leave_stmt_savepoint();
+
+	switch (check_log_duration(msec_str, was_logged))
+	{
+		case 1:
+			ereport(LOG,
+					(errmsg("duration: %s ms", msec_str),
+					 errhidestmt(true)));
+			break;
+		case 2:
+			ereport(LOG,
+					(errmsg("duration: %s ms  statement: %s",
+							msec_str, stmt->query),
+					 errhidestmt(true),
+					 fastpath_errdetail_params(params)));
+			break;
+	}
+	if (save_log_statement_stats)
+		ShowUsage("QUERY STATISTICS");
+
+	debug_query_string = NULL;
+	return true;
+}
+
+void
+mys_stmt_execute(StringInfo inBuf)
+{
+	MysPrepStmt *stmt = NULL;
+	MysDecodedParam *dparams = NULL;
+
+	decode_execute_packet(inBuf, &stmt, &dparams);
+	render_decoded_execute_query(inBuf, stmt, dparams);
 }
 
 /* ----------------------------------------------------------------

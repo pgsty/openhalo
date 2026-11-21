@@ -38,6 +38,7 @@
 
 #include "access/xact.h"
 #include "catalog/pg_class.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "storage/proc.h"
@@ -58,6 +59,8 @@ bool		halo_mysql_statement_rollback = true;
 static int	stmt_savepoint_level = 0;
 static bool stmt_savepoint_txn_timeout_active = false;
 static TimestampTz stmt_savepoint_txn_timeout_fin = 0;
+static bool fallback_stmt_timeout_active = false;
+static TimestampTz fallback_stmt_timeout_fin = 0;
 static bool abort_transaction = false;
 
 /* value of a SET autocommit = <expr>, or -1 if it is not a constant */
@@ -429,9 +432,31 @@ mys_txn_skip_control(MysStmtInfo *info)
 	return false;
 }
 
-/* end_command of every statement: track the hidden savepoint */
 void
-mys_txn_stmt_done(MysStmtInfo *info)
+mys_txn_arm_fallback_stmt_timeout(void)
+{
+	if (get_timeout_active(STATEMENT_TIMEOUT))
+	{
+		fallback_stmt_timeout_active = true;
+		fallback_stmt_timeout_fin = get_timeout_finish_time(STATEMENT_TIMEOUT);
+	}
+	else
+	{
+		fallback_stmt_timeout_active = false;
+		fallback_stmt_timeout_fin = 0;
+	}
+}
+
+void
+mys_txn_clear_fallback_stmt_timeout(void)
+{
+	fallback_stmt_timeout_active = false;
+	fallback_stmt_timeout_fin = 0;
+}
+
+/* end_command of every statement: track the hidden savepoint and fallback timer */
+void
+mys_txn_stmt_done(MysStmtInfo *info, const MysStmtInfo *following)
 {
 	if (info->txn_op == MYS_TXNOP_SAVEPOINT)
 	{
@@ -446,6 +471,58 @@ mys_txn_stmt_done(MysStmtInfo *info)
 		stmt_savepoint_txn_timeout_active = false;
 		stmt_savepoint_txn_timeout_fin = 0;
 	}
+
+	if (fallback_stmt_timeout_active)
+	{
+		bool		more_before_or_in_user_stmt =
+			following != NULL &&
+			((info->txn_control && info->txn_op != MYS_TXNOP_RELEASE) ||
+			 !following->txn_control);
+
+		if (more_before_or_in_user_stmt)
+		{
+			if (!get_timeout_active(STATEMENT_TIMEOUT) &&
+				StatementTimeout > 0 &&
+				(StatementTimeout < TransactionTimeout || TransactionTimeout == 0))
+				enable_timeout_at(STATEMENT_TIMEOUT, fallback_stmt_timeout_fin);
+		}
+		else
+		{
+			mys_txn_clear_fallback_stmt_timeout();
+		}
+	}
+}
+
+void
+mys_txn_enter_stmt_savepoint(void)
+{
+	MysStmtInfo info = {0};
+
+	StartTransactionCommand();
+	DefineSavepoint(MYS_SAVEPOINT_NAME);
+	CommitTransactionCommand();
+	info.suppress_response = true;
+	info.txn_control = true;
+	info.txn_op = MYS_TXNOP_SAVEPOINT;
+	info.set_autocommit = -1;
+	mys_txn_stmt_done(&info, NULL);
+	mys_statement_done(false, false);
+}
+
+void
+mys_txn_leave_stmt_savepoint(void)
+{
+	MysStmtInfo info = {0};
+
+	StartTransactionCommand();
+	ReleaseSavepoint(MYS_SAVEPOINT_NAME);
+	CommitTransactionCommand();
+	info.suppress_response = true;
+	info.txn_control = true;
+	info.txn_op = MYS_TXNOP_RELEASE;
+	info.set_autocommit = -1;
+	mys_txn_stmt_done(&info, NULL);
+	mys_statement_done(false, false);
 }
 
 /* Only errors sent to the client count; a caught server-side error does not. */
@@ -469,6 +546,8 @@ void
 mys_txn_recover(void)
 {
 	MemoryContext oldcxt;
+
+	mys_txn_clear_fallback_stmt_timeout();
 
 	if (abort_transaction)
 	{

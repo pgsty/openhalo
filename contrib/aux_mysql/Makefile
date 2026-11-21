@@ -97,3 +97,4 @@ src/mys_prefix.o src/mys_rewrite.o src/mys_binary.o src/halo_mysql.o: src/mys_pr
 src/mys_prefix.o: src/mys_general_ci_weights.h
 src/mys_fk.o src/mys_utility.o: src/mys_fk.h
 src/mys_current_read.o src/mys_utility.o: src/mys_current_read.h
+src/halo_mysql.o src/mysm/sysvar_core.o src/halo_mysql.bc src/mysm/sysvar_core.bc: src/openhalo_version.h

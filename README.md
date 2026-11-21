@@ -14,7 +14,7 @@
 The software version is available through PostgreSQL `SHOW openhalo.version`
 and MySQL `SELECT @@version_comment`. PostgreSQL's `server_version` remains
 `19.0`, and the MySQL handshake/`@@version` retains its configured compatibility
-version. The source of the software version is [`openhalo_version.h`](src/include/openhalo_version.h).
+version. The source of the software version is [`openhalo_version.h`](contrib/aux_mysql/src/openhalo_version.h).
 
 [PGSTY](https://pgsty.com) | [Pigsty](https://pigsty.io) | [`aux_mysql` Docs](contrib/aux_mysql/README.md) | [Migration Guide](contrib/aux_mysql/MIGRATION.md) | [Testing Guide](contrib/aux_mysql/TESTING.md) | [Upstream Port Log](contrib/aux_mysql/UPSTREAM.md) | [Changelog](CHANGELOG.md) | [Releases](https://github.com/pgsty/openHalo/releases) | [Issues](https://github.com/pgsty/openHalo/issues) | [Upstream](https://github.com/HaloTech-Co-Ltd/openHalo)
 

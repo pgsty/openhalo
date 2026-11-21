@@ -1127,6 +1127,23 @@ retry:
 	return false;
 }
 
+static void
+ensure_prefix_rd_options(Relation index)
+{
+	PrefixIndexOptions *opts;
+
+	if (index->rd_options != NULL)
+		return;
+	opts = (PrefixIndexOptions *) MemoryContextAllocZero(CacheMemoryContext,
+														 sizeof(PrefixIndexOptions));
+	SET_VARSIZE(opts, sizeof(PrefixIndexOptions));
+	opts->btree.fillfactor = BTREE_DEFAULT_FILLFACTOR;
+	opts->btree.vacuum_cleanup_index_scale_factor = -1.0;
+	opts->btree.deduplicate_items = false;
+	opts->lengths_offset = 0;
+	index->rd_options = (bytea *) opts;
+}
+
 static bool
 prefix_insert(Relation index, Datum *values, bool *nulls, ItemPointer tid,
 			  Relation heap, IndexUniqueCheck check, bool unchanged, IndexInfo *info)
@@ -1135,8 +1152,12 @@ prefix_insert(Relation index, Datum *values, bool *nulls, ItemPointer tid,
 	bool unique = true;
 	bool locked = false;
 	LOCKTAG tag;
-	MemoryContext temp = AllocSetContextCreate(CurrentMemoryContext, "MySQL prefix insert", ALLOCSET_SMALL_SIZES);
-	MemoryContext old = MemoryContextSwitchTo(temp);
+	MemoryContext temp;
+	MemoryContext old;
+
+	ensure_prefix_rd_options(index);
+	temp = AllocSetContextCreate(CurrentMemoryContext, "MySQL prefix insert", ALLOCSET_SMALL_SIZES);
+	old = MemoryContextSwitchTo(temp);
 	if (check != UNIQUE_CHECK_NO)
 		unique = prefix_unique(index, heap, values, nulls, tid, check, &tag, &locked);
 	if (check != UNIQUE_CHECK_EXISTING)
@@ -1164,18 +1185,33 @@ prefix_build_callback(Relation index, ItemPointer tid, Datum *values, bool *null
 	state->tuples++;
 }
 
+static void
+prefix_write_empty_metapage(Relation index, ForkNumber forknum)
+{
+	BulkWriteState *writer = smgr_bulk_start_rel(index, forknum);
+	BulkWriteBuffer meta = smgr_bulk_get_buf(writer);
+
+	/* Deduplication/equalimage is always disabled on mysql_prefix indexes. */
+	_bt_initmetapage((Page) meta, P_NONE, 0, false);
+	smgr_bulk_write(writer, BTREE_METAPAGE, meta, true);
+	smgr_bulk_finish(writer);
+}
+
+static void
+prefix_buildempty(Relation index)
+{
+	ensure_prefix_rd_options(index);
+	prefix_write_empty_metapage(index, INIT_FORKNUM);
+}
+
 static IndexBuildResult *
 prefix_build(Relation heap, Relation index, IndexInfo *info)
 {
 	IndexBuildResult *result = palloc0(sizeof(*result));
 	PrefixBuild state = { heap, info, 0 };
-	BulkWriteState *writer = smgr_bulk_start_rel(index, MAIN_FORKNUM);
-	BulkWriteBuffer meta = smgr_bulk_get_buf(writer);
 
-	/* Same empty metapage as btbuildempty(), in the main fork. */
-	_bt_initmetapage((Page) meta, P_NONE, 0, false);
-	smgr_bulk_write(writer, BTREE_METAPAGE, meta, true);
-	smgr_bulk_finish(writer);
+	ensure_prefix_rd_options(index);
+	prefix_write_empty_metapage(index, MAIN_FORKNUM);
 	result->heap_tuples = table_index_build_scan(heap, index, info, false, true,
 												prefix_build_callback, &state, NULL);
 	result->index_tuples = state.tuples;
@@ -1229,6 +1265,7 @@ mys_prefix_handler(PG_FUNCTION_ARGS)
 	am->amproperty = NULL;
 	am->amoptions = prefix_reloptions;
 	am->ambuild = prefix_build;
+	am->ambuildempty = prefix_buildempty;
 	am->aminsert = prefix_insert;
 	am->amcostestimate = prefix_cost;
 	am->amvalidate = prefix_validate;

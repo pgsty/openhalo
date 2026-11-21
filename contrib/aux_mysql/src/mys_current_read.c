@@ -17,10 +17,11 @@
  * key).
  *
  * This deliberately covers single-table point writes on ordinary heap tables
- * with a complete, immediate, non-partial B-tree unique key. It does not add
- * InnoDB gap/range locking. RLS plans retain their original execution order.
- * Transaction-snapshot isolation and native sessions retain PG semantics,
- * including when a cached plan is executed under a different isolation level.
+ * and partitioned heap tables with a complete, immediate, non-partial B-tree
+ * unique key. It does not add InnoDB gap/range locking. RLS plans retain
+ * their original execution order. Transaction-snapshot isolation and native
+ * sessions retain PG semantics, including when a cached plan is executed
+ * under a different isolation level.
  *
  * Copyright (c) 2026, PGSTY PTE. LTD.
  *-------------------------------------------------------------------------
@@ -35,6 +36,7 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/partition.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
@@ -54,6 +56,7 @@
 #include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/bufmgr.h"
+#include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -171,6 +174,38 @@ key_qual(List *quals, Relation index, int key, Index rti)
 	return NULL;
 }
 
+static bool
+is_valid_unique_btree_index(Relation index, char expected_relkind)
+{
+	return index->rd_rel->relkind == expected_relkind &&
+		index->rd_rel->relam == BTREE_AM_OID &&
+		index->rd_index->indisunique && index->rd_index->indimmediate &&
+		index->rd_index->indisvalid && !index->rd_index->indcheckxmin &&
+		index->rd_index->indnkeyatts > 0 &&
+		RelationGetIndexPredicate(index) == NIL &&
+		RelationGetIndexExpressions(index) == NIL;
+}
+
+static List *
+match_all_index_key_quals(Relation index, Index rti, List *quals)
+{
+	List	   *keys = NIL;
+	int			nkeys = index->rd_index->indnkeyatts;
+
+	for (int i = 0; i < nkeys; i++)
+	{
+		OpExpr	   *qual = key_qual(quals, index, i, rti);
+
+		if (qual == NULL)
+		{
+			list_free_deep(keys);
+			return NIL;
+		}
+		keys = lappend(keys, qual);
+	}
+	return keys;
+}
+
 /*
  * Find a valid, immediate, ordinary B-tree unique index on relid whose key
  * columns all have equality quals in quals.  If keep_index_lock is true, the
@@ -185,7 +220,9 @@ find_unique_key_match(Oid relid, Index rti, List *quals, bool keep_index_lock,
 	bool		found = false;
 
 	table = table_open(relid, AccessShareLock);
-	if (table->rd_rel->relam != HEAP_TABLE_AM_OID)
+	if (table->rd_rel->relkind != RELKIND_RELATION ||
+		table->rd_rel->relam != HEAP_TABLE_AM_OID ||
+		table->rd_rel->relrowsecurity)
 	{
 		table_close(table, AccessShareLock);
 		return false;
@@ -195,28 +232,10 @@ find_unique_key_match(Oid relid, Index rti, List *quals, bool keep_index_lock,
 	{
 		Relation	index = index_open(indexid, AccessShareLock);
 		List	   *keys = NIL;
-		int			nkeys = index->rd_index->indnkeyatts;
 
-		if (index->rd_rel->relam == BTREE_AM_OID &&
-			index->rd_index->indisunique && index->rd_index->indimmediate &&
-			index->rd_index->indisvalid && !index->rd_index->indcheckxmin &&
-			RelationGetIndexPredicate(index) == NIL &&
-			RelationGetIndexExpressions(index) == NIL)
-		{
-			for (int i = 0; i < nkeys; i++)
-			{
-				OpExpr	   *qual = key_qual(quals, index, i, rti);
-
-				if (qual == NULL)
-				{
-					list_free_deep(keys);
-					keys = NIL;
-					break;
-				}
-				keys = lappend(keys, qual);
-			}
-		}
-		if (list_length(keys) == nkeys && nkeys > 0)
+		if (is_valid_unique_btree_index(index, RELKIND_INDEX))
+			keys = match_all_index_key_quals(index, rti, quals);
+		if (keys != NIL)
 		{
 			if (chosen_indexid)
 				*chosen_indexid = indexid;
@@ -225,6 +244,174 @@ find_unique_key_match(Oid relid, Index rti, List *quals, bool keep_index_lock,
 			else
 				list_free_deep(keys);
 			index_close(index, keep_index_lock ? NoLock : AccessShareLock);
+			found = true;
+			break;
+		}
+		index_close(index, AccessShareLock);
+	}
+	list_free(indexes);
+	table_close(table, AccessShareLock);
+	return found;
+}
+
+/*
+ * Verify every member of a partitioned hierarchy is either a partitioned
+ * table or an attached ordinary heap partition without row-level security.
+ */
+static bool
+partition_hierarchy_all_safe_heap(Oid root_relid)
+{
+	List	   *inhoids = find_all_inheritors(root_relid, AccessShareLock, NULL);
+	bool		ok = true;
+
+	foreach_oid(oid, inhoids)
+	{
+		Relation	rel = table_open(oid, NoLock);
+		char		kind = rel->rd_rel->relkind;
+
+		if (rel->rd_rel->relrowsecurity ||
+			!(kind == RELKIND_PARTITIONED_TABLE ||
+			  (kind == RELKIND_RELATION &&
+			   (oid == root_relid || rel->rd_rel->relispartition) &&
+			   rel->rd_rel->relam == HEAP_TABLE_AM_OID)))
+			ok = false;
+		table_close(rel, NoLock);
+		if (!ok)
+			break;
+	}
+	list_free(inhoids);
+	return ok;
+}
+
+/*
+ * Prove global uniqueness on a partitioned table from root-level quals: all
+ * partitions must be safe heap partitions and quals must match every key
+ * column of a valid, immediate RELKIND_PARTITIONED_INDEX B-tree unique index.
+ */
+static bool
+find_root_partitioned_unique_key_match(Oid root_relid, Index rti, List *quals)
+{
+	Relation	table;
+	List	   *indexes;
+	bool		found = false;
+
+	if (!partition_hierarchy_all_safe_heap(root_relid))
+		return false;
+
+	table = table_open(root_relid, AccessShareLock);
+	if (table->rd_rel->relkind != RELKIND_PARTITIONED_TABLE ||
+		table->rd_rel->relrowsecurity)
+	{
+		table_close(table, AccessShareLock);
+		return false;
+	}
+	indexes = RelationGetIndexList(table);
+	foreach_oid(indexid, indexes)
+	{
+		Relation	index = index_open(indexid, AccessShareLock);
+		List	   *keys = NIL;
+
+		if (is_valid_unique_btree_index(index, RELKIND_PARTITIONED_INDEX))
+			keys = match_all_index_key_quals(index, rti, quals);
+		if (keys != NIL)
+		{
+			list_free_deep(keys);
+			index_close(index, AccessShareLock);
+			found = true;
+			break;
+		}
+		index_close(index, AccessShareLock);
+	}
+	list_free(indexes);
+	table_close(table, AccessShareLock);
+	return found;
+}
+
+typedef struct RootUniqueIndexInfo
+{
+	Oid			indexid;
+	int			nkeys;
+} RootUniqueIndexInfo;
+
+static List *
+collect_valid_root_unique_indexes(Oid root_relid)
+{
+	Relation	table;
+	List	   *indexes;
+	List	   *result = NIL;
+
+	table = table_open(root_relid, AccessShareLock);
+	if (table->rd_rel->relkind != RELKIND_PARTITIONED_TABLE ||
+		table->rd_rel->relrowsecurity)
+	{
+		table_close(table, AccessShareLock);
+		return NIL;
+	}
+	indexes = RelationGetIndexList(table);
+	foreach_oid(indexid, indexes)
+	{
+		Relation	index = index_open(indexid, AccessShareLock);
+
+		if (is_valid_unique_btree_index(index, RELKIND_PARTITIONED_INDEX))
+		{
+			RootUniqueIndexInfo *info = palloc(sizeof(RootUniqueIndexInfo));
+
+			info->indexid = indexid;
+			info->nkeys = index->rd_index->indnkeyatts;
+			result = lappend(result, info);
+		}
+		index_close(index, AccessShareLock);
+	}
+	list_free(indexes);
+	table_close(table, AccessShareLock);
+	return result;
+}
+
+/*
+ * Match a leaf partition's translated Scan quals against a valid attached
+ * partition unique index that descends from required_root_indexid.
+ */
+static bool
+find_leaf_partition_unique_key_match(Oid leaf_relid, Index rti, List *quals,
+									 Oid required_root_indexid,
+									 int required_nkeys,
+									 Oid *chosen_leaf_indexid,
+									 List **chosen_keys)
+{
+	Relation	table;
+	List	   *indexes;
+	bool		found = false;
+
+	table = table_open(leaf_relid, AccessShareLock);
+	if (table->rd_rel->relkind != RELKIND_RELATION ||
+		!table->rd_rel->relispartition ||
+		table->rd_rel->relam != HEAP_TABLE_AM_OID ||
+		table->rd_rel->relrowsecurity)
+	{
+		table_close(table, AccessShareLock);
+		return false;
+	}
+	indexes = RelationGetIndexList(table);
+	foreach_oid(indexid, indexes)
+	{
+		Relation	index = index_open(indexid, AccessShareLock);
+		List	   *keys = NIL;
+
+		if (index->rd_rel->relispartition &&
+			is_valid_unique_btree_index(index, RELKIND_INDEX) &&
+			index->rd_index->indnkeyatts == required_nkeys)
+		{
+			List	   *ancestors = get_partition_ancestors(indexid);
+
+			if (list_member_oid(ancestors, required_root_indexid))
+				keys = match_all_index_key_quals(index, rti, quals);
+			list_free(ancestors);
+		}
+		if (keys != NIL)
+		{
+			*chosen_leaf_indexid = indexid;
+			*chosen_keys = keys;
+			index_close(index, AccessShareLock);
 			found = true;
 			break;
 		}
@@ -340,9 +527,15 @@ mys_current_read_rewrite_limit(Query *query)
 		return;
 
 	rte = rt_fetch(query->resultRelation, query->rtable);
-	if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_RELATION ||
-		rte->tablesample != NULL || rte->securityQuals != NIL ||
-		has_subclass(rte->relid))
+	if (rte->rtekind != RTE_RELATION ||
+		rte->tablesample != NULL || rte->securityQuals != NIL)
+		return;
+	if (rte->relkind == RELKIND_RELATION)
+	{
+		if (has_subclass(rte->relid))
+			return;
+	}
+	else if (rte->relkind != RELKIND_PARTITIONED_TABLE)
 		return;
 
 	if (query->jointree->quals == NULL || !IsA(query->jointree->quals, SubLink))
@@ -401,13 +594,16 @@ mys_current_read_rewrite_limit(Query *query)
 		DatumGetInt64(((Const *) folded_limit)->constvalue) < 1)
 		return;
 
-	sub_quals = make_ands_implicit((Expr *) sub->jointree->quals);
-	if (!find_unique_key_match(rte->relid, 1, sub_quals, false, NULL, NULL))
-	{
-		list_free(sub_quals);
+	/*
+	 * Note: make_ands_implicit() returns ((BoolExpr *) qual)->args directly
+	 * without copying when the top-level qual is an AND_EXPR, so never pass
+	 * the returned List to list_free() on the live sub->jointree->quals tree.
+	 */
+	sub_quals = make_ands_implicit((Expr *) copyObject(sub->jointree->quals));
+	if (rte->relkind == RELKIND_PARTITIONED_TABLE ?
+		!find_root_partitioned_unique_key_match(rte->relid, 1, sub_quals) :
+		!find_unique_key_match(rte->relid, 1, sub_quals, false, NULL, NULL))
 		return;
-	}
-	list_free(sub_quals);
 
 	lifted = copyObject(sub->jointree->quals);
 	if (query->resultRelation != 1)
@@ -449,6 +645,190 @@ mys_current_read_rewrite_limit(Query *query)
 	query->hasSubLinks = checkExprHasSubLink((Node *) query);
 }
 
+static bool
+is_supported_leaf_scan(Plan *plan)
+{
+	return plan != NULL && !plan->parallel_aware &&
+		(IsA(plan, IndexScan) || IsA(plan, SeqScan) || IsA(plan, BitmapHeapScan));
+}
+
+static List *
+extract_leaf_scan_quals(Scan *scan)
+{
+	List	   *quals = list_copy(scan->plan.qual);
+
+	if (IsA(scan, IndexScan))
+		quals = list_concat(quals, list_copy(((IndexScan *) scan)->indexqualorig));
+	else if (IsA(scan, BitmapHeapScan))
+		quals = list_concat(quals, list_copy(((BitmapHeapScan *) scan)->bitmapqualorig));
+	return quals;
+}
+
+static CustomScan *
+make_current_read_custom_scan(Scan *scan, List *quals, Oid indexid,
+							  List *keys, bool allow_defer)
+{
+	CustomScan *current = makeNode(CustomScan);
+
+	current->scan = *scan;
+	NodeSetTag(current, T_CustomScan);
+	current->scan.plan.qual = quals;
+	/* The unique-key lookup replaces the bitmap producer as well. */
+	outerPlan(current) = NULL;
+	innerPlan(current) = NULL;
+	current->custom_private = list_make2(makeInteger((int) indexid),
+										 makeBoolean(allow_defer));
+	current->custom_exprs = keys;
+	current->custom_relids = bms_make_singleton(scan->scanrelid);
+	current->methods = &scan_methods;
+	return current;
+}
+
+static void
+plan_partitioned_current_read(PlannedStmt *stmt, ModifyTable *modify)
+{
+	RangeTblEntry *root_rte;
+	List	   *root_uqs;
+	Plan	   *subplan = outerPlan(modify);
+
+	root_rte = list_nth_node(RangeTblEntry, stmt->rtable, modify->rootRelation - 1);
+	if (root_rte->rtekind != RTE_RELATION ||
+		root_rte->relkind != RELKIND_PARTITIONED_TABLE ||
+		!partition_hierarchy_all_safe_heap(root_rte->relid))
+		return;
+
+	root_uqs = collect_valid_root_unique_indexes(root_rte->relid);
+	if (root_uqs == NIL)
+		return;
+
+	/*
+	 * Partitioned writes always pre-lock in MysCurrentRead (allow_defer = false)
+	 * so root statement triggers, row-movement DELETE/INSERT triggers, and
+	 * concurrent cross-partition updates never enter deferred retry or EPQ races.
+	 */
+	if (list_length(modify->resultRelations) == 1 && is_supported_leaf_scan(subplan))
+	{
+		Scan	   *scan = (Scan *) subplan;
+		RangeTblEntry *rte;
+
+		if (scan->scanrelid != linitial_int(modify->resultRelations))
+			return;
+		rte = list_nth_node(RangeTblEntry, stmt->rtable, scan->scanrelid - 1);
+		if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_RELATION)
+			return;
+
+		foreach_ptr(RootUniqueIndexInfo, ruq, root_uqs)
+		{
+			List	   *quals = extract_leaf_scan_quals(scan);
+			Oid			leaf_indexid = InvalidOid;
+			List	   *keys = NIL;
+
+			if (find_leaf_partition_unique_key_match(rte->relid, scan->scanrelid,
+													 quals, ruq->indexid,
+													 ruq->nkeys,
+													 &leaf_indexid, &keys))
+			{
+				LockRelationOid(ruq->indexid, AccessShareLock);
+				LockRelationOid(leaf_indexid, AccessShareLock);
+				stmt->relationOids = list_append_unique_oid(stmt->relationOids,
+															ruq->indexid);
+				stmt->relationOids = list_append_unique_oid(stmt->relationOids,
+															leaf_indexid);
+				outerPlan(modify) = (Plan *)
+					make_current_read_custom_scan(scan, quals, leaf_indexid,
+												  keys, false);
+				return;
+			}
+			list_free(quals);
+		}
+		return;
+	}
+
+	if (IsA(subplan, Append))
+	{
+		Append	   *aplan = (Append *) subplan;
+		int			nleaves = list_length(aplan->appendplans);
+		Bitmapset  *seen_rtis = NULL;
+
+		if (nleaves <= 0 ||
+			nleaves != list_length(modify->resultRelations) ||
+			aplan->plan.parallel_aware ||
+			aplan->nasyncplans != 0 ||
+			aplan->first_partial_plan != nleaves)
+			return;
+
+		foreach_ptr(Plan, child, aplan->appendplans)
+		{
+			Scan	   *scan;
+			RangeTblEntry *rte;
+
+			if (!is_supported_leaf_scan(child))
+				return;
+			scan = (Scan *) child;
+			if (!list_member_int(modify->resultRelations, scan->scanrelid) ||
+				bms_is_member(scan->scanrelid, seen_rtis))
+				return;
+			seen_rtis = bms_add_member(seen_rtis, scan->scanrelid);
+			rte = list_nth_node(RangeTblEntry, stmt->rtable, scan->scanrelid - 1);
+			if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_RELATION)
+				return;
+		}
+
+		foreach_ptr(RootUniqueIndexInfo, ruq, root_uqs)
+		{
+			CustomScan **replacements = palloc0(sizeof(CustomScan *) * nleaves);
+			Oid		   *leaf_indexids = palloc0(sizeof(Oid) * nleaves);
+			bool		all_matched = true;
+			int			idx = 0;
+
+			foreach_ptr(Plan, child, aplan->appendplans)
+			{
+				Scan	   *scan = (Scan *) child;
+				RangeTblEntry *rte = list_nth_node(RangeTblEntry, stmt->rtable,
+												   scan->scanrelid - 1);
+				List	   *quals = extract_leaf_scan_quals(scan);
+				Oid			leaf_indexid = InvalidOid;
+				List	   *keys = NIL;
+
+				if (!find_leaf_partition_unique_key_match(rte->relid,
+														  scan->scanrelid,
+														  quals, ruq->indexid,
+														  ruq->nkeys,
+														  &leaf_indexid, &keys))
+				{
+					list_free(quals);
+					all_matched = false;
+					break;
+				}
+				leaf_indexids[idx] = leaf_indexid;
+				replacements[idx] = make_current_read_custom_scan(scan, quals,
+																  leaf_indexid,
+																  keys, false);
+				idx++;
+			}
+
+			if (all_matched)
+			{
+				ListCell   *lc;
+
+				LockRelationOid(ruq->indexid, AccessShareLock);
+				stmt->relationOids = list_append_unique_oid(stmt->relationOids,
+															ruq->indexid);
+				idx = 0;
+				foreach(lc, aplan->appendplans)
+				{
+					LockRelationOid(leaf_indexids[idx], AccessShareLock);
+					stmt->relationOids = list_append_unique_oid(stmt->relationOids,
+																leaf_indexids[idx]);
+					lfirst(lc) = replacements[idx];
+					idx++;
+				}
+				return;
+			}
+		}
+	}
+}
+
 void
 mys_current_read_plan(PlannedStmt *stmt, bool has_row_security)
 {
@@ -463,43 +843,39 @@ mys_current_read_plan(PlannedStmt *stmt, bool has_row_security)
 		!(stmt->commandType == CMD_UPDATE || stmt->commandType == CMD_DELETE) ||
 		!IsA(stmt->planTree, ModifyTable))
 		return;
+	foreach_node(RangeTblEntry, r, stmt->rtable)
+	{
+		if (r->securityQuals != NIL)
+			return;
+	}
 	modify = (ModifyTable *) stmt->planTree;
+	if (modify->rootRelation > 0)
+	{
+		plan_partitioned_current_read(stmt, modify);
+		return;
+	}
 	if (list_length(modify->resultRelations) != 1 ||
-		!(IsA(outerPlan(modify), IndexScan) || IsA(outerPlan(modify), SeqScan) ||
-		  IsA(outerPlan(modify), BitmapHeapScan)))
+		!is_supported_leaf_scan(outerPlan(modify)))
 		return;
 	scan = (Scan *) outerPlan(modify);
 	if (scan->scanrelid != linitial_int(modify->resultRelations))
 		return;
-	quals = list_copy(scan->plan.qual);
-	if (IsA(scan, IndexScan))
-		quals = list_concat(quals, list_copy(((IndexScan *) scan)->indexqualorig));
-	else if (IsA(scan, BitmapHeapScan))
-		quals = list_concat(quals, list_copy(((BitmapHeapScan *) scan)->bitmapqualorig));
 	rte = list_nth_node(RangeTblEntry, stmt->rtable, scan->scanrelid - 1);
-	if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_RELATION)
+	if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_RELATION ||
+		has_subclass(rte->relid))
 		return;
+	quals = extract_leaf_scan_quals(scan);
 
 	if (find_unique_key_match(rte->relid, scan->scanrelid, quals, true,
 							  &indexid, &keys))
 	{
-		CustomScan *current = makeNode(CustomScan);
 		bool		allow_defer = !modify->onConflictIgnore && modify->canSetTag &&
 			!contain_volatile_functions((Node *) scan->plan.targetlist) &&
 			!contain_volatile_functions((Node *) quals);
 
-		current->scan = *scan;
-		NodeSetTag(current, T_CustomScan);
-		current->scan.plan.qual = quals;
-		/* The unique-key lookup replaces the bitmap producer as well. */
-		outerPlan(current) = NULL;
-		innerPlan(current) = NULL;
-		current->custom_private = list_make2(makeInteger(indexid),
-											 makeBoolean(allow_defer));
-		current->custom_exprs = keys;
-		current->custom_relids = bms_make_singleton(scan->scanrelid);
-		current->methods = &scan_methods;
-		outerPlan(modify) = (Plan *) current;
+		stmt->relationOids = list_append_unique_oid(stmt->relationOids, indexid);
+		outerPlan(modify) = (Plan *)
+			make_current_read_custom_scan(scan, quals, indexid, keys, allow_defer);
 	}
 }
 
@@ -587,7 +963,7 @@ current_read_begin(CustomScanState *css, EState *estate, int eflags)
 	rri = estate->es_result_relations[rti - 1];
 	node->lockmode = estate->es_plannedstmt->commandType == CMD_UPDATE ?
 		ExecUpdateLockMode(estate, rri) : LockTupleExclusive;
-	node->index = index_open(intVal(linitial(plan->custom_private)),
+	node->index = index_open((Oid) intVal(linitial(plan->custom_private)),
 							 exec_rt_fetch(rti, estate)->rellockmode);
 	node->current_read = mys_is_mysql_session() && !IsolationUsesXactSnapshot();
 	node->can_defer_lock = node->current_read &&

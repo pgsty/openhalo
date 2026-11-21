@@ -92,6 +92,7 @@ python3 tests/release_review.py
 python3 tests/point_write_concurrency.py
 python3 tests/hotspot_deadlocks.py
 python3 tests/adversarial_fixes.py
+python3 tests/tier1_optimizations.py
 python3 tests/pg19_upgrade.py --old-prefix /path/to/openhalo18-aux2 \
   --new-prefix /path/to/openhalo19 --work-dir /tmp/openhalo-major-upgrade
 python3 tests/release_roundtrip.py
@@ -136,6 +137,14 @@ queue reordering, plus 16-thread and 64-thread transfer runs against a commit le
 (including retries without an explicit MySQL ROLLBACK). It requires administrative
 PG/MySQL connections; `MYSQL_ADMIN_USER`/`MYSQL_ADMIN_PASSWORD` default to
 `PGUSER`/`PGPASSWORD`.
+
+`tier1_optimizations.py` covers `openhalo_version.h` relocation, stored
+`INSERT IGNORE` catalog serialization in rules and `BEGIN ATOMIC` functions,
+column ACL enforcement on spoofed `RETURNING` aliases, dynamic `log_lock_waits`
+suppression and override precedence, unlogged `mysql_prefix` `INIT_FORKNUM`
+metapages, binary `COM_STMT_EXECUTE` `CachedPlanSource` fast-path parity and
+loopback QPS speedup, and concurrent `MysCurrentRead` point writes across `HASH`
+and multilevel dropped/reordered partitioned tables.
 
 For repeated sysbench hotspot stress, use a disposable fixture and an output
 directory outside the source tree:

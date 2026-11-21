@@ -278,10 +278,12 @@ extern uint16 mys_errno(int sqlerrcode);
 extern void mys_type_info(Oid typid, int32 typmod, uint8 *mtype, uint32 *len,
 						  uint16 *flags, uint8 *decimals, uint16 *charset);
 extern void mys_send_coldef(Form_pg_attribute attr, TargetEntry *tle);
+extern void mys_proto_prepare_fast_exec(const struct MysStmtInfo *cached_info);
 
 /* mys_stmt.c: prepared statements */
 extern bool mys_binary_resultset;
 extern void mys_stmt_prepare(StringInfo pkt);
+extern bool mys_stmt_try_execute(StringInfo inBuf);
 extern void mys_stmt_execute(StringInfo inBuf);
 extern void mys_stmt_close(StringInfo pkt);
 extern void mys_stmt_reset(StringInfo pkt);

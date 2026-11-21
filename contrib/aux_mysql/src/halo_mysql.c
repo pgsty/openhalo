@@ -166,16 +166,21 @@ current_insert_ignore(void)
 }
 
 /*
- * Reconcile the per-protocol dynamic default for deadlock_timeout in MySQL
- * sessions without touching native PostgreSQL sessions or higher-priority GUC
- * sources (postgresql.conf, ALTER SYSTEM/DATABASE/ROLE, client, SET/SET LOCAL).
- * Setting mysql.deadlock_timeout = 0 restores PostgreSQL's 1000ms boot default.
+ * Reconcile the per-protocol dynamic defaults for deadlock_timeout and
+ * log_lock_waits in MySQL sessions without touching native PostgreSQL sessions
+ * or higher-priority GUC sources (postgresql.conf, ALTER SYSTEM/DATABASE/ROLE,
+ * client, SET/SET LOCAL).  When mysql.deadlock_timeout > 0 (default 50ms),
+ * log_lock_waits dynamically defaults to off so ordinary 50ms waits do not
+ * flood the server log while real deadlocks still log ERROR + DETAIL.  Setting
+ * mysql.deadlock_timeout = 0 restores PostgreSQL's 1000ms / on boot defaults
+ * wherever stronger settings do not override them.
  */
 void
 mys_sync_deadlock_timeout(void)
 {
 	static int	last_applied_cfg = -1;
 	static int	last_seen_pg_timeout = -1;
+	static int	last_seen_log_lock_waits = -1;
 	static TimestampTz last_reload_time = 0;
 	int			target_ms;
 	char		buf[32];
@@ -184,6 +189,7 @@ mys_sync_deadlock_timeout(void)
 		return;
 	if (last_applied_cfg == halo_mysql_deadlock_timeout &&
 		last_seen_pg_timeout == DeadlockTimeout &&
+		last_seen_log_lock_waits == (int) log_lock_waits &&
 		last_reload_time == PgReloadTime)
 		return;
 
@@ -191,8 +197,12 @@ mys_sync_deadlock_timeout(void)
 		halo_mysql_deadlock_timeout : 1000;
 	snprintf(buf, sizeof(buf), "%dms", target_ms);
 	SetConfigOption("deadlock_timeout", buf, PGC_SUSET, PGC_S_DYNAMIC_DEFAULT);
+	SetConfigOption("log_lock_waits",
+					halo_mysql_deadlock_timeout > 0 ? "off" : "on",
+					PGC_SUSET, PGC_S_DYNAMIC_DEFAULT);
 	last_applied_cfg = halo_mysql_deadlock_timeout;
 	last_seen_pg_timeout = DeadlockTimeout;
+	last_seen_log_lock_waits = (int) log_lock_waits;
 	last_reload_time = PgReloadTime;
 }
 
@@ -308,9 +318,9 @@ _PG_init(void)
 
 	DefineCustomIntVariable("mysql.deadlock_timeout",
 							"Default deadlock_timeout applied to MySQL protocol sessions.",
-							"0 inherits PostgreSQL's deadlock_timeout unchanged. Explicit "
-							"deadlock_timeout settings in postgresql.conf, roles, databases, "
-							"or SET commands always take precedence.",
+							"When positive, also sets log_lock_waits dynamically to off in MySQL "
+							"sessions. 0 inherits PostgreSQL's defaults. Explicit settings in "
+							"postgresql.conf, roles, databases, or SET commands always take precedence.",
 							&halo_mysql_deadlock_timeout,
 							50, 0, INT_MAX,
 							PGC_SIGHUP, GUC_UNIT_MS,

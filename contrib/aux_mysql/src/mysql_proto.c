@@ -1518,12 +1518,15 @@ mys_send_ready_for_query(CommandDest dest)
  */
 #define MYS_DEFERRED_ERROR		0xff
 static ErrorData *deferred_error = NULL;
+static bool pending_stmt_execute = false;
 
 static int
 mys_read_command(StringInfo inBuf)
 {
 	uint8		cmd;
 
+	pending_stmt_execute = false;
+	mys_txn_clear_fallback_stmt_timeout();
 	if (deferred_error != NULL)
 	{
 		FreeErrorData(deferred_error);
@@ -1569,25 +1572,27 @@ mys_read_command(StringInfo inBuf)
 		case COM_QUIT:
 			return PqMsg_Terminate;
 
-		case COM_QUERY:
 		case COM_STMT_EXECUTE:
+			/*
+			 * Decoded in mys_process_command (after DoingCommandRead is false):
+			 * either runs the native CachedPlan fast path and returns true, or
+			 * renders literals into inBuf and returns false to run PqMsg_Query.
+			 */
+			pending_stmt_execute = true;
+			return PqMsg_Query;
+
+		case COM_QUERY:
 			{
-				/* becomes a regular query with the parameters rendered in */
 				MemoryContext cxt = CurrentMemoryContext;
 				volatile bool ok = true;
 
 				PG_TRY();
 				{
-					if (cmd == COM_STMT_EXECUTE)
-						mys_stmt_execute(inBuf);
-					else
-					{
-						char	   *query = mys_normalize_query(inBuf->data + 1, inBuf->len - 1);
+					char	   *query = mys_normalize_query(inBuf->data + 1, inBuf->len - 1);
 
-						resetStringInfo(inBuf);
-						appendBinaryStringInfo(inBuf, query, strlen(query) + 1);
-						pfree(query);
-					}
+					resetStringInfo(inBuf);
+					appendBinaryStringInfo(inBuf, query, strlen(query) + 1);
+					pfree(query);
 				}
 				PG_CATCH();
 				{
@@ -1606,11 +1611,39 @@ mys_read_command(StringInfo inBuf)
 	}
 }
 
+void
+mys_proto_prepare_fast_exec(const MysStmtInfo *cached_info)
+{
+	MysStmtInfo *exec_info = palloc(sizeof(MysStmtInfo));
+
+	*exec_info = *cached_info;
+	exec_info->update_cols = list_copy(cached_info->update_cols);
+	exec_info->rewrite_warnings = NIL;
+	stmt_infos = list_make1(exec_info);
+	stmt_index = 0;
+	cur_insert_id = 0;
+	memset(upsert_rows, 0, sizeof(upsert_rows));
+	upsert_deleted = 0;
+	trailing_comment_ok = false;
+	if (!exec_info->diagnostic)
+		mys_clear_diagnostics();
+	else
+		diagnostics_pending = false;
+	mys_binary_resultset = true;
+	mys_text_map = NULL;
+}
+
 static bool
 mys_process_command(int firstchar, StringInfo inBuf)
 {
 	uint8		cmd;
 
+	if (firstchar == PqMsg_Query && pending_stmt_execute)
+	{
+		pending_stmt_execute = false;
+	mys_txn_clear_fallback_stmt_timeout();
+		return mys_stmt_try_execute(inBuf);
+	}
 	if (firstchar < MYS_MSG_BASE)
 		return false;
 	cmd = (uint8) (firstchar - MYS_MSG_BASE);
@@ -1910,7 +1943,7 @@ end_statement(const QueryCompletion *qc)
 	stmt_index++;
 	following = stmt_index < list_length(stmt_infos) ?
 		(MysStmtInfo *) list_nth(stmt_infos, stmt_index) : NULL;
-	mys_txn_stmt_done(info);
+	mys_txn_stmt_done(info, following);
 	/* SET TRANSACTION's one-shot values; the next transaction's defaults */
 	mys_statement_done(info->txn_kind == MYS_TXN_END && !info->txn_control,
 					   following != NULL && following->txn_kind == MYS_TXN_IMPLICIT_COMMIT);
@@ -2006,6 +2039,7 @@ mys_end_command(const QueryCompletion *qc, CommandDest dest)
 static void
 mys_null_command(CommandDest dest)
 {
+	mys_txn_clear_fallback_stmt_timeout();
 	mys_send_ok(0, 0, false, false);
 }
 
@@ -2101,10 +2135,13 @@ static void
 mys_comm_reset(void)
 {
 	clear_pending_err();
+	pending_stmt_execute = false;
+	mys_txn_clear_fallback_stmt_timeout();
 	memset(upsert_rows, 0, sizeof(upsert_rows));
 	upsert_deleted = 0;
 	resultset_active = false;
 	discard_queued_queries();
+	mys_stmt_query_done();
 	mys_txn_reset_deferred_error();
 }
 

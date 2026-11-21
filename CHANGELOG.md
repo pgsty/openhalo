@@ -17,6 +17,19 @@ version is `19.0.0`, reported by `SHOW openhalo.version` and MySQL
 
 ## 19.0.0 (unreleased)
 
+- Add a native `CachedPlanSource` fast path for binary `COM_STMT_PREPARE` /
+  `COM_STMT_EXECUTE` on single-statement strict-mode DML (`SELECT`, `INSERT`,
+  `ON DUPLICATE KEY UPDATE`, `REPLACE`, `UPDATE`, `DELETE`) with literal-equivalent
+  integer, `VARCHAR`/`TEXT`/`CHAR`, and `NULL` parameter signatures, pre-locked
+  invalidation refresh, and seamless fallback to literal execution.
+- Extend `MysCurrentRead` unique-key current reads (including `LIMIT N` wrappers
+  and runtime-pruned `Append` plans) to single- and multi-level partitioned heap
+  tables (`RELKIND_PARTITIONED_TABLE`) with global B-tree unique keys.
+- Dynamically default `log_lock_waits = off` in MySQL sessions when
+  `mysql.deadlock_timeout > 0` (respecting explicit configuration/session
+  overrides), initialize `mysql_prefix` unlogged `INIT_FORKNUM` metapages and
+  default `rd_options` with deduplication disabled, and relocate
+  `openhalo_version.h` into `contrib/aux_mysql/src/`.
 - Apply a reloadable dynamic-default `mysql.deadlock_timeout` (`50ms` default,
   `0` inherits PostgreSQL's `deadlock_timeout`) to MySQL protocol sessions so
   multi-row hotspot deadlocks resolve promptly without invoking eager lock-table
