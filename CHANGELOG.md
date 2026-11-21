@@ -17,6 +17,20 @@ version is `19.0.0`, reported by `SHOW openhalo.version` and MySQL
 
 ## 19.0.0 (unreleased)
 
+- Harden `aux_mysql 2.0` and minimal PG19 conflict/partition paths after
+  adversarial review: switch the MySQL Flex scanner to `-Cfe` (eliminating
+  `_binary` high-byte/NUL `yy_transition` tail overreads under ASan), pad
+  `utf8mb4_bin` `pg_strxfrm` trailing `PAD SPACE` bytes for accurate PG19
+  range selectivity, bound multibyte scans and per-tuple memory in
+  `mysql_prefix`/`mys_binary`/`mys_lock`, release statement savepoints before
+  sending `COM_STMT_EXECUTE` wire completions, clear/preserve wire diagnostics
+  per MySQL command rules without `TopMemoryContext` leaks, honor
+  `SET autocommit = DEFAULT` and dynamic `SET autocommit = <expr>` transaction
+  rules, isolate generated-column helper functions per owner, prevent
+  unprivileged pending-FK lock contention and temporary-table pending FKs,
+  enforce auto-updatable view `WCO_VIEW_CONFLICT_CHECK` predicates on
+  `REPLACE INTO`, and precheck cross-partition `UPDATE IGNORE` destination
+  unique/FK constraints before deleting the source tuple.
 - Add a native `CachedPlanSource` fast path for binary `COM_STMT_PREPARE` /
   `COM_STMT_EXECUTE` on single-statement strict-mode DML (`SELECT`, `INSERT`,
   `ON DUPLICATE KEY UPDATE`, `REPLACE`, `UPDATE`, `DELETE`) with literal-equivalent

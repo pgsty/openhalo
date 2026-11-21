@@ -93,6 +93,7 @@ python3 tests/point_write_concurrency.py
 python3 tests/hotspot_deadlocks.py
 python3 tests/adversarial_fixes.py
 python3 tests/tier1_optimizations.py
+python3 tests/adversarial_acceptance.py
 python3 tests/pg19_upgrade.py --old-prefix /path/to/openhalo18-aux2 \
   --new-prefix /path/to/openhalo19 --work-dir /tmp/openhalo-major-upgrade
 python3 tests/release_roundtrip.py
@@ -145,6 +146,18 @@ suppression and override precedence, unlogged `mysql_prefix` `INIT_FORKNUM`
 metapages, binary `COM_STMT_EXECUTE` `CachedPlanSource` fast-path parity and
 loopback QPS speedup, and concurrent `MysCurrentRead` point writes across `HASH`
 and multilevel dropped/reordered partitioned tables.
+
+`adversarial_acceptance.py` covers Flex `-Cfe` scanner safety on `_binary`
+high-byte and embedded-NUL normalization, `utf8mb4_bin` `PAD SPACE` `pg_strxfrm`
+planner range selectivity, multibyte `prefix_like` / `mysql_prefix` conflict-probe
+memory bounds, `TopMemoryContext` warning-queue leak freedom, wire diagnostic
+clearing/preservation across `COM_STMT_PREPARE`/`COM_PING`/`COM_STMT_RESET`/`COM_STMT_CLOSE`,
+prepared warning parity across custom and generic plans, `transform_null_equals`,
+`BIGINT UNSIGNED`/`DECIMAL` `UPDATE ... LIMIT ?` current reads, `SET autocommit = DEFAULT`
+and dynamic `SET autocommit = <expr>` transaction boundaries, per-owner generator
+isolation, temporary-table and cross-schema pending-FK protections, `REPLACE INTO`
+auto-updatable view conflict checks, cross-partition `UPDATE IGNORE` row
+preservation, and physical streaming replication Hot Standby + promotion.
 
 For repeated sysbench hotspot stress, use a disposable fixture and an output
 directory outside the source tree:
