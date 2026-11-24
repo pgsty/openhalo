@@ -192,7 +192,9 @@ installation; preserve the Makefile's exported test environment when rerunning.
 
 Historical 1.5 → 1.9 extension upgrade suites and PG14 import generators were
 removed by the 2.0 source cleanup; they belong to the PG18 release checkout.
-`tests/adversarial_fixes.py` covers `1.9 → 2.0` catalog/ACL parity, fast-path
+The major-upgrade rehearsal and the `1.9 → 2.0` catalog/ACL comparison are
+development checks. Release acceptance for 19.0.0 covers fresh installations.
+`tests/adversarial_fixes.py` also covers fast-path
 WAL/lock invariants, `LIMIT 1` / `VARCHAR` parameter current reads, deferred
 wire errors, `transaction_timeout` recovery, `mysql.deadlock_timeout` reload
 precedence, handshake `program_name` sanitization, `utf8mb4_general_ci`

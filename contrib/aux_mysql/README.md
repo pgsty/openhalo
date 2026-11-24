@@ -237,9 +237,8 @@ explicit product choice.
   is held and no implicit commit is triggered) to avoid breaking dump scripts and legacy tools.
 - Plain `UPDATE` reports matched-row counts (`CLIENT_FOUND_ROWS` style) rather than changed-row
   counts to avoid the extra full-row comparison overhead on OLTP updates.
-- When upgrading via `pg_upgrade` across PostgreSQL major versions, run
-  `ALTER EXTENSION aux_mysql UPDATE TO '2.0'` (or reapply the extension `pg_cast` updates)
-  so MySQL's `int4`/`bool` cast contexts are restored in the new cluster.
+- OpenHalo 19.0.0 supports a fresh `aux_mysql 2.0` installation in a new cluster.
+  See the [migration guide](MIGRATION.md) for the scope and for moving application data.
 - Accepted 1.9 differences: with PAD_CHAR_TO_FULL_LENGTH, some search/string-function inputs
   still lose CHAR padding, although stored bytes are unchanged; binary numeric CAST may reject
   extreme exponents such as `1e1000000`/`1e-1000000` and negative SIGNED overflow; empty-needle
@@ -296,8 +295,8 @@ explicit product choice.
 
 ## openHalo upstream
 
-The grammar (`src/parser/mys_gram.y`), the SQL layer (`sql/aux_mysql--2.0.sql`, with upgrade
-path `sql/aux_mysql--1.9--2.0.sql`), and the C helpers in `src/mysm` were originally ported
+The grammar (`src/parser/mys_gram.y`), the SQL layer (`sql/aux_mysql--2.0.sql`),
+and the C helpers in `src/mysm` were originally ported
 from openHalo's PostgreSQL 14 sources (branch `pg14` of this repository) and are now
 maintained directly on the PostgreSQL 19 tree with their original copyright headers preserved.
 `UPSTREAM.md` records how each upstream commit up to `90fc8d7` was ported.

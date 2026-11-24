@@ -9,13 +9,28 @@ version is `19.0.0`, reported by `SHOW openhalo.version` and MySQL
 
 | Release | PostgreSQL | `aux_mysql` | Date |
 | :--- | :--- | :--- | :--- |
-| [19.0.0](#1900-unreleased) | 19.0 | 2.0 | Unreleased |
+| [`v19.0.0`](#v1900) | 19.0 | 2.0 | 2026-11-24 |
 | [`v18.6.1`](#v1861) | 18.6 | 1.9 | 2026-11-10 |
 | [`v18.6`](#v186) | 18.6 | 1.5 | 2026-11-07 |
 
 ---
 
-## 19.0.0 (unreleased)
+## v19.0.0
+
+OpenHalo 19.0.0 ships PostgreSQL 19.0 and `aux_mysql 2.0` for fresh installations.
+Build both components from the same source tree and initialize a new cluster.
+Physical upgrades from previous releases and in-place extension updates from
+`1.x` are outside the scope of this release. See the [migration guide](contrib/aux_mysql/MIGRATION.md).
+
+- Preserve session and global variable values when a multi-assignment MySQL
+  `SET` fails, including changes to `autocommit`.
+- Preserve binary literals across client encodings in direct and prepared
+  statements and reclaim buffered long data on statement execution or reset.
+- Correct fresh `CHAR` prefix index lookups, stabilize supported LIST COLUMNS
+  partition keys across sessions, and handle self-referencing foreign keys on
+  ordinary and partitioned tables.
+- Make typed `TIMEDIFF`, `ADDTIME`, and `SUBTIME` arithmetic independent of
+  PostgreSQL `DateStyle`.
 
 - Harden `aux_mysql 2.0` and minimal PG19 conflict/partition paths after
   adversarial review: switch the MySQL Flex scanner to `-Cfe` (eliminating
@@ -64,9 +79,6 @@ version is `19.0.0`, reported by `SHOW openhalo.version` and MySQL
   `ProtocolExtensionConfig` size at registration (`RegisterProtocolExtensionSized`),
   and fix `utf8mb4_general_ci` `pg_strxfrm` NUL-free encoding for PG19 planner
   range selectivity while keeping persistent hash values unchanged.
-- Add the `aux_mysql` `1.9 → 2.0` extension upgrade script
-  (`ALTER EXTENSION aux_mysql UPDATE TO '2.0'`) with full catalog and ACL parity
-  for `pg_upgrade` migrations from `v18.6.1`.
 - Add a single product version definition and read-only `openhalo.version` /
   MySQL `version_comment` identifiers, separate from the kernel and SQL versions.
 - Accept unreserved and column-name keywords in scoped/unscoped MySQL `SET`

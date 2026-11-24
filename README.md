@@ -2,14 +2,14 @@
 
 [![PGSTY: pgsty.com](https://img.shields.io/badge/PGSTY-pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://pgsty.com/)
 [![Pigsty: pigsty.io](https://img.shields.io/badge/Pigsty-pigsty.io-slategray?style=flat)](https://pigsty.io/)
-[![Version: 19.0.0](https://img.shields.io/badge/Version-19.0.0-slategray?style=flat)](https://github.com/pgsty/openHalo/releases)
+[![Version: 19.0.0](https://img.shields.io/badge/Version-19.0.0-slategray?style=flat)](https://github.com/pgsty/openhalo/releases/tag/v19.0.0)
 [![Extension: aux_mysql 2.0](https://img.shields.io/badge/aux__mysql-2.0-slategray?style=flat)](contrib/aux_mysql/README.md)
 [![License: PostgreSQL / GPL-3.0](https://img.shields.io/badge/License-PostgreSQL%20%2F%20GPL--3.0-slategray?style=flat&logo=gnu&logoColor=white)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/openHalo?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/openHalo&Date)
 [![PostgreSQL: 19.0](https://img.shields.io/badge/PostgreSQL-19.0-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](README.postgresql.md)
 [![MySQL: 5.7 / 8.0](https://img.shields.io/badge/MySQL-5.7%20%2F%208.0-%234479A1?style=flat&logo=mysql&logoColor=white&labelColor=4479A1)](contrib/aux_mysql/README.md)
 
-**OpenHalo 19.0.0** (unreleased, based on **PostgreSQL 19.0**) is a PostgreSQL 19.0 kernel and `aux_mysql` (`2.0`) extension that speaks the MySQL wire protocol and SQL dialect natively—allowing MySQL clients, drivers, and applications on port `3306` and PostgreSQL clients on port `5432` to query the same data concurrently.
+**OpenHalo 19.0.0** combines the **PostgreSQL 19.0** kernel with the `aux_mysql 2.0` extension. MySQL clients on port `3306` and PostgreSQL clients on port `5432` can query the same data concurrently. This release supports fresh installations.
 
 The software version is available through PostgreSQL `SHOW openhalo.version`
 and MySQL `SELECT @@version_comment`. PostgreSQL's `server_version` remains
@@ -76,6 +76,8 @@ For full compatibility details and known boundaries, see [`contrib/aux_mysql/REA
 ## Quick Start
 
 ### 1. Build from Source
+
+Download and unpack the [19.0.0 source archive](https://github.com/pgsty/openhalo/archive/refs/tags/v19.0.0.tar.gz). Run the build commands from the extracted directory.
 
 - Build with GNU Make (Meson is not supported and fails at configuration).
 - Build dependencies (EL 9):
@@ -187,9 +189,7 @@ All parameters are defined by `aux_mysql` under the `mysql.*` prefix:
 
 ## Upgrading & Migration
 
-- **PostgreSQL 18 → 19** is a major upgrade: build and install the kernel and extension together into a separate prefix, initialize a new cluster, and rehearse the migration on a copy. The on-disk catalogs, WAL and C extension ABI changed. Follow the [migration guide](contrib/aux_mysql/MIGRATION.md).
-- **`v18.6.1` (`aux_mysql 1.9`) → `19.0.0` (`aux_mysql 2.0`)**: after running PG19 `pg_upgrade` from an OpenHalo `18.6.1` (`aux_mysql 1.9`) cluster, execute `ALTER EXTENSION aux_mysql UPDATE TO '2.0';` over a PostgreSQL connection in `mysql.database`. For older `v18.6` (`aux_mysql 1.5`) clusters, update to `1.9` on `v18.6.1` first or perform a reviewed logical migration.
-- **openHalo 1.0 (PG14)** still requires reviewed logical migration; its catalogs cannot be upgraded with `pg_upgrade`.
+Install 19.0.0 in a new cluster with a fresh `aux_mysql 2.0`. Physical upgrades from older OpenHalo clusters and in-place updates from `aux_mysql 1.x` are unsupported in this release. To bring existing application data across, rehearse a logical export and import on a separate cluster and validate it before cutover. See the [migration guide](contrib/aux_mysql/MIGRATION.md).
 
 ---
 
