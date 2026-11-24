@@ -5036,7 +5036,8 @@ fi
   { $as_echo "$as_me:${as_lineno-$LINENO}: using llvm $pgac_llvm_version" >&5
 $as_echo "$as_me: using llvm $pgac_llvm_version" >&6;}
 
-  # need clang to create some bitcode files
+  # Prefer the clang shipped with the JIT's LLVM when emitting bitcode.
+  LLVM_BINPATH=`$LLVM_CONFIG --bindir`
 
   if test -z "$CLANG"; then
   for ac_prog in clang
@@ -5054,7 +5055,7 @@ else
   ;;
   *)
   as_save_IFS=$IFS; IFS=$PATH_SEPARATOR
-for as_dir in $PATH
+for as_dir in $LLVM_BINPATH$PATH_SEPARATOR$PATH
 do
   IFS=$as_save_IFS
   test -z "$as_dir" && as_dir=.
@@ -5149,8 +5150,6 @@ fi
       -l*) LLVM_LIBS="$LLVM_LIBS $pgac_option";;
     esac
   done
-
-  LLVM_BINPATH=`$LLVM_CONFIG --bindir`
 
 
 
@@ -8132,6 +8131,9 @@ fi
 $as_echo "$with_icu" >&6; }
 
 
+if test "$with_icu" != yes; then
+  as_fn_error $? "OpenHalo requires ICU support (--with-icu); do not pass --without-icu" "$LINENO" 5
+fi
 if test "$with_icu" = yes; then
 
 pkg_failed=no
@@ -13194,6 +13196,9 @@ $as_echo "#define USE_OPENSSL 1" >>confdefs.h
 
 elif test "$with_ssl" != no ; then
   as_fn_error $? "--with-ssl must specify openssl" "$LINENO" 5
+else
+  { $as_echo "$as_me:${as_lineno-$LINENO}: WARNING: building without OpenSSL disables TLS and RSA key exchange for MySQL caching_sha2_password" >&5
+$as_echo "$as_me: WARNING: building without OpenSSL disables TLS and RSA key exchange for MySQL caching_sha2_password" >&2;}
 fi
 
 

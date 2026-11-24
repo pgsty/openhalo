@@ -33,6 +33,7 @@
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "miscadmin.h"
 #include "catalog/dependency.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
@@ -221,6 +222,7 @@ fix_target_names(SelectStmt *sel, const char *query, int stmt_end)
 
 	if (sel == NULL || query == NULL)
 		return;
+	check_stack_depth();
 	if (sel->op != SETOP_NONE)
 	{
 		fix_target_names(sel->larg, query, stmt_end);
@@ -259,7 +261,8 @@ fix_target_names(SelectStmt *sel, const char *query, int stmt_end)
 		while (end > start && isspace((unsigned char) text[end - 1]))
 			end--;
 		if (end > start)
-			rt->name = pnstrdup(text + start, Min(end - start, NAMEDATALEN - 1));
+			rt->name = pnstrdup(text + start,
+								pg_mbcliplen(text + start, end - start, NAMEDATALEN - 1));
 	}
 }
 
@@ -1558,21 +1561,23 @@ rewrite_create_stmt(CreateStmt *stmt)
 	KeyNamer	kn;
 	RangeVar   *like = NULL;
 
-	if (stmt->if_not_exists && OidIsValid(RangeVarGetRelid(stmt->relation, NoLock, true)))
-		return NIL;
 	init_key_namer(&kn, stmt->relation, false, false);	/* a new table */
 	/* LIKE copies the saved table default, independently of column overrides. */
 	foreach_ptr(Node, elt, stmt->tableElts)
 		if (IsA(elt, TableLikeClause))
 		{
 			Oid source = RangeVarGetRelid(((TableLikeClause *) elt)->relation,
-										 AccessShareLock, false);
-			table_collation = mys_table_default_collation(source);
-			like = ((TableLikeClause *) elt)->relation;
-			/* and the declared kind of the generated columns it copies */
-			generated = lappend(generated,
-								makeDefElem("generated_like",
-											(Node *) copyObject(((TableLikeClause *) elt)->relation), -1));
+										 AccessShareLock, stmt->if_not_exists);
+
+			if (OidIsValid(source))
+			{
+				table_collation = mys_table_default_collation(source);
+				like = ((TableLikeClause *) elt)->relation;
+				/* and the declared kind of the generated columns it copies */
+				generated = lappend(generated,
+									makeDefElem("generated_like",
+												(Node *) copyObject(((TableLikeClause *) elt)->relation), -1));
+			}
 		}
 	if (table_collation == NULL)
 		table_collation = table_collation_name(stmt->options);
@@ -2391,6 +2396,7 @@ check_dml_db_walker(Node *node, void *context)
 
 	if (node == NULL || nodeTag(node) >= T_MysNodeBase)
 		return false;
+	check_stack_depth();
 	if (IsA(node, RangeVar))
 	{
 		check_dml_rv_db_selected((RangeVar *) node, ctes);

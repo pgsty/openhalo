@@ -36,7 +36,6 @@ report it to OpenHalo and we will route it appropriately.
 
 ## Supported Releases
 
-Security fixes are tracked on the release branch and ship in the latest stable OpenHalo
-18 release. Upgrade to the latest release to receive them; older release lines
-are supported only when an advisory says otherwise.
-The PostgreSQL 19 port is a development branch, not a published stable release.
+Security fixes are tracked on `main` and ship in the latest OpenHalo 19 release
+(and maintained OpenHalo 18 releases where applicable). Upgrade to the latest release
+to receive them; older release lines are supported only when an advisory says otherwise.

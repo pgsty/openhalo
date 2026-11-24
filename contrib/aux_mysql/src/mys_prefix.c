@@ -94,6 +94,7 @@ typedef struct PrefixScan
 	MemoryContext context;
 	ScanKey original;
 	int nkeys;
+	int cap;
 	IndexInfo *info;
 	EState *estate;
 	TupleTableSlot *slot;
@@ -199,11 +200,19 @@ general_next(const unsigned char **p, const unsigned char *end)
 static bytea *
 general_key(const char *s, int len, int characters, bool pad)
 {
-	bytea *out = palloc(VARHDRSZ + 2 * len);
-	unsigned char *dst = (unsigned char *) VARDATA(out);
+	int max_chars = (characters > 0 && characters < len) ? characters : len;
+	bytea *out;
+	unsigned char *dst;
 	const unsigned char *p = (const unsigned char *) s;
 	const unsigned char *end = p + len;
 	int n = 0;
+
+	if (max_chars < 0 || (Size) max_chars > (MaxAllocSize - VARHDRSZ) / 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("index prefix key too large")));
+	out = palloc(VARHDRSZ + 2 * max_chars);
+	dst = (unsigned char *) VARDATA(out);
 
 	while (p < end && (characters <= 0 || n < characters))
 	{
@@ -738,11 +747,13 @@ string_key(Relation index, int col, Datum value, bool physical, bool pattern)
 	{
 		pg_locale_t locale = pg_newlocale_from_collation(collid);
 		size_t needed;
-		if (n > 0)
-			len = prefix_charcliplen(data, len, n);
+		/* Trim logical BPCHAR trailing spaces BEFORE prefix truncation so
+		 * interior spaces within the prefix are preserved in B-tree order. */
 		if (!pattern && getBaseType(index->rd_opcintype[col]) == BPCHAROID)
 			while (len > 0 && data[len - 1] == ' ')
 				len--;
+		if (n > 0)
+			len = prefix_charcliplen(data, len, n);
 		if (locale->collate_is_c || locale->deterministic)
 		{
 			key = palloc(VARHDRSZ + len);
@@ -857,6 +868,7 @@ prefix_beginscan(Relation index, int nkeys, int norderbys)
 	state->context = AllocSetContextCreate(CurrentMemoryContext, "MySQL prefix scan", ALLOCSET_DEFAULT_SIZES);
 	state->original = palloc0(sizeof(ScanKeyData) * Max(nkeys, 1));
 	state->nkeys = nkeys;
+	state->cap = Max(nkeys, 1);
 	state->tree = btbeginscan(index, 2 * nkeys, 0);
 	state->tree->parallel_scan = NULL;
 	state->tree->xs_temp_snap = false;
@@ -878,7 +890,20 @@ prefix_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int
 	btrescan(state->tree, NULL, 0, NULL, 0);
 	MemoryContextReset(state->context);
 	old = MemoryContextSwitchTo(state->context);
-	if (keys) memcpy(state->original, keys, sizeof(ScanKeyData) * nkeys);
+	if (keys)
+	{
+		if (nkeys > state->cap)
+		{
+			MemoryContext prev = MemoryContextSwitchTo(GetMemoryChunkContext(state->original));
+
+			state->original = repalloc(state->original, sizeof(ScanKeyData) * nkeys);
+			state->cap = nkeys;
+			MemoryContextSwitchTo(prev);
+		}
+		if (nkeys > 0)
+			memcpy(state->original, keys, sizeof(ScanKeyData) * nkeys);
+		state->nkeys = nkeys;
+	}
 	keys = state->original;
 	nkeys = state->nkeys;
 	converted = palloc0(sizeof(ScanKeyData) * Max(2 * nkeys, 1));
@@ -905,6 +930,19 @@ prefix_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int
 				continue;
 			}
 			upper = string_key(scan->indexRelation, col, PointerGetDatum(prefix), true, true);
+			/*
+			 * PostgreSQL bpchar LIKE sees the stored padding. The equality
+			 * key can omit it, so weaken a space-terminated literal prefix
+			 * for the lower bound and recheck LIKE on the heap.
+			 */
+			if (getBaseType(scan->indexRelation->rd_opcintype[col]) == BPCHAROID)
+			{
+				int			plen = VARSIZE(prefix) - VARHDRSZ;
+
+				while (plen > 0 && VARDATA(prefix)[plen - 1] == ' ')
+					plen--;
+				SET_VARSIZE(prefix, VARHDRSZ + plen);
+			}
 			lower = string_key(scan->indexRelation, col, PointerGetDatum(prefix), true, true);
 			/* All continuations, including NULs smaller than the PAD SPACE
 			 * terminator, belong in a LIKE prefix range. The unpadded key is
@@ -1157,6 +1195,10 @@ retry:
 		else XactLockTableWait(wait, heap, self, XLTW_InsertIndex);
 		goto retry;
 	}
+	/* During CREATE/REINDEX UNIQUE INDEX CONCURRENTLY, skip dead self tuples. */
+	if (check == UNIQUE_CHECK_EXISTING && self != NULL &&
+		!table_index_fetch_tuple_check(heap, self, SnapshotSelf, NULL))
+		return true;
 	ereport(ERROR, (errcode(ERRCODE_UNIQUE_VIOLATION),
 				   errmsg("duplicate key value violates unique constraint \"%s\"",
 						  RelationGetRelationName(index)),

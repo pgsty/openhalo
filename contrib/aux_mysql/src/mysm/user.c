@@ -22,12 +22,15 @@ PG_FUNCTION_INFO_V1(getCurrentUser);
 Datum
 getCurrentUser(PG_FUNCTION_ARGS)
 {
-	if (MyProcPort != NULL && MyProcPort->user_name != NULL)
+	char	   *rolname = GetUserNameFromId(GetUserId(), true);
+
+	if (rolname != NULL)
 	{
-		char	   *userInfo = psprintf("%s@%%", MyProcPort->user_name);
+		char	   *userInfo = psprintf("%s@%%", rolname);
 		text	   *res = cstring_to_text(userInfo);
 
 		pfree(userInfo);
+		pfree(rolname);
 		PG_RETURN_TEXT_P(res);
 	}
 
@@ -38,16 +41,17 @@ PG_FUNCTION_INFO_V1(getSessionUser);
 Datum
 getSessionUser(PG_FUNCTION_ARGS)
 {
-	if (MyProcPort != NULL &&
-		MyProcPort->user_name != NULL &&
-		MyProcPort->remote_host != NULL)
+	char	   *rolname = GetUserNameFromId(GetSessionUserId(), true);
+
+	if (rolname != NULL)
 	{
-		char	   *userInfo = psprintf("%s@%s",
-										MyProcPort->user_name,
-										MyProcPort->remote_host);
+		const char *host = (MyProcPort != NULL && MyProcPort->remote_host != NULL) ?
+			MyProcPort->remote_host : "localhost";
+		char	   *userInfo = psprintf("%s@%s", rolname, host);
 		text	   *res = cstring_to_text(userInfo);
 
 		pfree(userInfo);
+		pfree(rolname);
 		PG_RETURN_TEXT_P(res);
 	}
 

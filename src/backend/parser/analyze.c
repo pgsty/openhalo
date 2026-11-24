@@ -1062,17 +1062,6 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 		qry->onConflict = transformOnConflictClause(pstate,
 													stmt->onConflictClause);
 
-	/* MySQL requires SELECT only for read columns that are not updated.
-	 * EXCLUDED contains proposed values and does not read the target table.
-	 * Do this before RETURNING, whose explicit column reads still need ACLs. */
-	if (qry->onConflict && qry->onConflict->allIndexes)
-	{
-		perminfo->selectedCols = bms_difference(perminfo->selectedCols,
-												perminfo->updatedCols);
-		if (bms_is_empty(perminfo->selectedCols))
-			perminfo->requiredPerms &= ~ACL_SELECT;
-	}
-
 	/* Process RETURNING, if any. */
 	if (stmt->returningClause)
 	{

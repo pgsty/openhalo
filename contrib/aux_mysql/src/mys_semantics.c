@@ -410,6 +410,17 @@ mys_sequence_write(Relation sequence)
 				 errmsg("The MySQL server is running with the --read-only option so it cannot execute this statement")));
 }
 
+/* Called by PreventCommandIfReadOnly() for non-DML / non-utility writes (such
+ * as large object mutations lo_create/lo_from_bytea/lo_put/lo_unlink). */
+void
+mys_check_read_only(const char *cmdname)
+{
+	if (mys_is_mysql_session() && mys_server_read_only_applies())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("The MySQL server is running with the --read-only option so it cannot execute this statement")));
+}
+
 /* Atomic with nextval; uses the core sequence page lock, ACLs and WAL. */
 static void
 sequence_advance(Oid seqoid, int64 value, bool is_called)
@@ -1399,7 +1410,10 @@ generated_helper(Node *node, const char *name, int nargs)
 static bool
 generated_concat_args(Node *node, List **args)
 {
-	FuncExpr *f = generated_helper(node, "concat_one", 1);
+	FuncExpr *f;
+
+	check_stack_depth();
+	f = generated_helper(node, "concat_one", 1);
 
 	if (f)
 	{
@@ -1463,6 +1477,7 @@ generated_display_calls(Node *node, void *context)
 	FuncExpr *f;
 
 	if (node == NULL) return NULL;
+	check_stack_depth();
 	if (generated_concat_args(node, &args))
 		name = "CONCAT";
 	else if ((f = generated_helper(node, "string_result", 2)) != NULL)
@@ -1731,12 +1746,14 @@ mys_show_create_view(PG_FUNCTION_ARGS)
 	char *definition;
 	StringInfoData buf;
 	bool save_quote = quote_all_identifiers;
+	bool security_invoker;
 
 
 	if (cl->relkind != RELKIND_VIEW)
 		ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("%s is not a view", name)));
 	ReleaseSysCache(tuple);
 	view = relation_open(relid, AccessShareLock);
+	security_invoker = RelationHasSecurityInvoker(view);
 	query = (Query *) view_display_casts((Node *) get_view_query(view), NULL);
 	/* ALTER VIEW RENAME COLUMN changes the descriptor, not the stored target
 	 * aliases. pg_get_querydef has no result-descriptor argument. */
@@ -1765,7 +1782,9 @@ mys_show_create_view(PG_FUNCTION_ARGS)
 		if (*p == '`') appendStringInfoChar(&buf, '`');
 		appendStringInfoChar(&buf, *p);
 	}
-	appendStringInfoString(&buf, "`@`%` SQL SECURITY DEFINER VIEW `");
+	appendStringInfoString(&buf, security_invoker ?
+						   "`@`%` SQL SECURITY INVOKER VIEW `" :
+						   "`@`%` SQL SECURITY DEFINER VIEW `");
 	for (char *p = name; *p; p++)
 	{
 		if (*p == '`') appendStringInfoChar(&buf, '`');

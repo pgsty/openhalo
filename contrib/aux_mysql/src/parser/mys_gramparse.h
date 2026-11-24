@@ -56,6 +56,8 @@ typedef struct mys_yy_extra_type
 	 */
 	bool		saw_underscore_binary;	/* saw a _binary introducer */
 	int			binary_token_end;	/* end of a decoded binary string, or 0 */
+	int			literal_encoding;	/* encoding of literals during normalization */
+	const char *wire_source;	/* original bytes when masking multibyte trail bytes */
 	bool		normalizing;	/* scanning for mys_normalize_query */
 	bool		in_exec_comment;	/* inside a MySQL executable comment */
 	bool		xc_version_skip;	/* skipping a newer-version executable comment */

@@ -7,6 +7,8 @@
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, PGSTY PTE. LTD.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
  *
  *
  * IDENTIFICATION
@@ -60,6 +62,7 @@
 #include "miscadmin.h"
 #include "parser/parse_utilcmd.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/protocol_extension.h"
 #include "rewrite/rewriteDefine.h"
 #include "storage/fd.h"
 #include "tcop/utility.h"
@@ -411,6 +414,8 @@ PreventCommandIfReadOnly(const char *cmdname)
 		/* translator: %s is name of a SQL command, eg CREATE */
 				 errmsg("cannot execute %s in a read-only transaction",
 						cmdname)));
+	if (MyProtocolExtension && MyProtocolExtension->check_read_only)
+		MyProtocolExtension->check_read_only(cmdname);
 }
 
 /*

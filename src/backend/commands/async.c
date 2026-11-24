@@ -5,6 +5,8 @@
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, PGSTY PTE. LTD.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
  *
  * IDENTIFICATION
  *	  src/backend/commands/async.c
@@ -157,6 +159,7 @@
  */
 
 #include "postgres.h"
+#include "postmaster/protocol_extension.h"
 
 #include <limits.h>
 #include <unistd.h>
@@ -3095,6 +3098,9 @@ ProcessIncomingNotify(bool flush)
 void
 NotifyMyFrontEnd(const char *channel, const char *payload, int32 srcPid)
 {
+	if (MyProtocolExtension != NULL)
+		return;
+
 	if (whereToSendOutput == DestRemote)
 	{
 		StringInfoData buf;

@@ -36,6 +36,7 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
+#include "catalog/partition.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
@@ -204,7 +205,8 @@ typedef struct RI_QueryHashEntry
 typedef struct RI_CompareKey
 {
 	Oid			eq_opr;			/* the equality operator to apply */
-	Oid			typeid;			/* the data type to apply it to */
+	Oid			lhstype;		/* actual input types */
+	Oid			rhstype;
 } RI_CompareKey;
 
 /*
@@ -215,7 +217,8 @@ typedef struct RI_CompareHashEntry
 	RI_CompareKey key;
 	bool		valid;			/* successfully initialized? */
 	FmgrInfo	eq_opr_finfo;	/* call info for equality fn */
-	FmgrInfo	cast_func_finfo;	/* in case we must coerce input */
+	FmgrInfo	lcast_finfo;	/* optional coercions for each operand */
+	FmgrInfo	rcast_finfo;
 } RI_CompareHashEntry;
 
 /*
@@ -279,7 +282,7 @@ static void ri_BuildQueryKey(RI_QueryKey *key,
 							 int32 constr_queryno);
 static bool ri_KeysEqual(Relation rel, TupleTableSlot *oldslot, TupleTableSlot *newslot,
 						 const RI_ConstraintInfo *riinfo, bool rel_is_pk);
-static bool ri_CompareWithCast(Oid eq_opr, Oid typeid, Oid collid,
+static bool ri_CompareWithCast(Oid eq_opr, Oid lhstype, Oid rhstype, Oid collid,
 							   Datum lhs, Datum rhs);
 
 static void ri_InitHashTables(void);
@@ -290,7 +293,7 @@ static void ri_HashPreparedPlan(RI_QueryKey *key, SPIPlanPtr plan);
 static int	ri_PushExecutingPlan(SPIPlanPtr plan);
 static bool ri_PlanIsExecuting(SPIPlanPtr plan);
 static void ri_FreeDeadPlans(void);
-static RI_CompareHashEntry *ri_HashCompareOp(Oid eq_opr, Oid typeid);
+static RI_CompareHashEntry *ri_HashCompareOp(Oid eq_opr, Oid lhstype, Oid rhstype);
 
 static void ri_CheckTrigger(FunctionCallInfo fcinfo, const char *funcname,
 							int tgkind);
@@ -359,6 +362,36 @@ ri_trigger_enabled(Trigger *trigger)
 	if (SessionReplicationRole == SESSION_REPLICATION_ROLE_REPLICA)
 		return trigger->tgenabled != TRIGGER_FIRES_ON_ORIGIN;
 	return trigger->tgenabled != TRIGGER_FIRES_ON_REPLICA;
+}
+
+/* Both slots are in the leaf's layout, but either key may name root attributes. */
+static bool
+ri_SelfReferenceMatches(const RI_ConstraintInfo *riinfo, Relation leaf,
+						Relation pk_rel, TupleTableSlot *pk_slot,
+						Relation fk_rel, TupleTableSlot *fk_slot)
+{
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		AttrNumber	pkatt = riinfo->pk_attnums[i];
+		AttrNumber	fkatt = riinfo->fk_attnums[i];
+		Datum		pval, fval;
+		bool		pnull, fnull;
+
+		if (pk_rel != leaf)
+			pkatt = get_attnum(RelationGetRelid(leaf), RIAttName(pk_rel, pkatt));
+		if (fk_rel != leaf)
+			fkatt = get_attnum(RelationGetRelid(leaf), RIAttName(fk_rel, fkatt));
+		if (pkatt <= 0 || fkatt <= 0)
+			return false;
+		pval = slot_getattr(pk_slot, pkatt, &pnull);
+		fval = slot_getattr(fk_slot, fkatt, &fnull);
+		if (pnull || fnull ||
+			!ri_CompareWithCast(riinfo->pf_eq_oprs[i],
+								RIAttType(leaf, pkatt), RIAttType(leaf, fkatt),
+								RIAttCollation(leaf, pkatt), pval, fval))
+			return false;
+	}
+	return true;
 }
 
 /*
@@ -463,29 +496,29 @@ RI_FKey_check(TriggerData *trigdata, bool before_modify, bool warn_only)
 	}
 
 	/* A self-reference may be satisfied by the row about to be inserted/updated. */
-	if (before_modify && riinfo->pk_relid == riinfo->fk_relid && !riinfo->hasperiod)
+	if (before_modify && !riinfo->hasperiod)
 	{
-		bool self_match = true;
+		bool		is_part_self = false;
+		bool		is_self = (riinfo->pk_relid == RelationGetRelid(fk_rel));
 
-		for (int i = 0; i < riinfo->nkeys; i++)
+		if (!is_self && fk_rel->rd_rel->relispartition)
 		{
-			bool pnull, fnull;
-			Datum pval = slot_getattr(newslot, riinfo->pk_attnums[i], &pnull);
-			Datum fval = slot_getattr(newslot, riinfo->fk_attnums[i], &fnull);
-			Oid ptype = RIAttType(fk_rel, riinfo->pk_attnums[i]);
-			Oid ftype = RIAttType(fk_rel, riinfo->fk_attnums[i]);
+			List	   *ancestors = get_partition_ancestors(RelationGetRelid(fk_rel));
 
-			if (pnull || fnull || ptype != ftype ||
-				!ri_CompareWithCast(riinfo->pf_eq_oprs[i], ptype,
-								 RIAttCollation(fk_rel, riinfo->pk_attnums[i]), pval, fval))
-			{
-				self_match = false;
-				break;
-			}
+			is_part_self = list_member_oid(ancestors, riinfo->pk_relid);
+			list_free(ancestors);
+			is_self = is_part_self;
 		}
-		if (self_match)
+		if (is_self)
 		{
-			return true;
+			Relation	pk_meta = is_part_self ? table_open(riinfo->pk_relid, AccessShareLock) : fk_rel;
+			bool		self_match = ri_SelfReferenceMatches(riinfo, fk_rel, pk_meta, newslot,
+														 fk_rel, newslot);
+
+			if (is_part_self)
+				table_close(pk_meta, AccessShareLock);
+			if (self_match)
+				return true;
 		}
 	}
 
@@ -1049,88 +1082,127 @@ ri_restrict_ext(TriggerData *trigdata, bool is_no_action,
 
 	/*
 	 * Pre-modify self-referencing check: if oldslot's own FK columns match its
-	 * PK columns, exclude oldslot->tts_tid so a self-referencing row does not
-	 * block its own DELETE IGNORE / UPDATE IGNORE unless another row points to it.
+	 * PK columns, exclude oldslot's (tableoid, ctid) so a self-referencing row
+	 * does not block its own DELETE IGNORE / UPDATE IGNORE unless another row
+	 * points to it.
 	 */
-	if (before_modify && riinfo->pk_relid == riinfo->fk_relid &&
-		!riinfo->hasperiod && ItemPointerIsValid(&oldslot->tts_tid))
+	if (before_modify && !riinfo->hasperiod && ItemPointerIsValid(&oldslot->tts_tid))
 	{
-		bool		self_ref = true;
+		bool		is_part_self = false;
+		bool		is_self = (RelationGetRelid(pk_rel) == RelationGetRelid(fk_rel));
 
-		for (int i = 0; i < riinfo->nkeys; i++)
+		if (!is_self && pk_rel->rd_rel->relispartition)
 		{
-			bool		pnull,
-						fnull;
-			Datum		pval = slot_getattr(oldslot, riinfo->pk_attnums[i], &pnull);
-			Datum		fval = slot_getattr(oldslot, riinfo->fk_attnums[i], &fnull);
-			Oid			ptype = RIAttType(pk_rel, riinfo->pk_attnums[i]);
-			Oid			ftype = RIAttType(fk_rel, riinfo->fk_attnums[i]);
+			List	   *ancestors = get_partition_ancestors(RelationGetRelid(pk_rel));
 
-			if (pnull || fnull || ptype != ftype ||
-				!ri_CompareWithCast(riinfo->pf_eq_oprs[i], ptype,
-									RIAttCollation(pk_rel, riinfo->pk_attnums[i]), pval, fval))
-			{
-				self_ref = false;
-				break;
-			}
+			is_part_self = list_member_oid(ancestors, RelationGetRelid(fk_rel));
+			list_free(ancestors);
+			is_self = is_part_self;
 		}
-		if (self_ref)
+		if (is_self)
 		{
-			StringInfoData querybuf;
-			char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
-			char		attname[MAX_QUOTED_NAME_LEN];
-			char		paramname[16];
-			const char *querysep = "WHERE";
-			const char *fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ? "" : "ONLY ";
-			Oid			queryoids[RI_MAX_NUMKEYS + 1];
-			Datum		vals[RI_MAX_NUMKEYS + 1];
-			char		nulls[RI_MAX_NUMKEYS + 1];
-			Oid			save_userid;
-			int			save_sec_context;
-			int			spi_result;
-			bool		referenced;
+			TupleTableSlot *newslot = trigdata->tg_newslot;
 
-			SPI_connect();
-			initStringInfo(&querybuf);
-			quoteRelationName(fkrelname, fk_rel);
-			appendStringInfo(&querybuf, "SELECT 1 FROM %s%s x", fk_only, fkrelname);
-			for (int i = 0; i < riinfo->nkeys; i++)
+			/* An UPDATE can leave its own FK pointing at the obsolete PK. */
+			if (newslot &&
+				ri_SelfReferenceMatches(riinfo, pk_rel, pk_rel, oldslot, fk_rel, newslot) &&
+				!ri_SelfReferenceMatches(riinfo, pk_rel, pk_rel, newslot, fk_rel, newslot))
 			{
-				Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
-				Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
-
-				quoteOneName(attname, RIAttName(fk_rel, riinfo->fk_attnums[i]));
-				sprintf(paramname, "$%d", i + 1);
-				ri_GenerateQual(&querybuf, querysep, paramname, pk_type,
-								riinfo->pf_eq_oprs[i], attname, fk_type);
-				querysep = "AND";
-				queryoids[i] = pk_type;
-			}
-			appendStringInfo(&querybuf, " AND x.ctid OPERATOR(pg_catalog.<>) $%d FOR KEY SHARE OF x",
-							 riinfo->nkeys + 1);
-			queryoids[riinfo->nkeys] = TIDOID;
-			ri_ExtractValues(pk_rel, oldslot, riinfo, true, vals, nulls);
-			vals[riinfo->nkeys] = ItemPointerGetDatum(&oldslot->tts_tid);
-			nulls[riinfo->nkeys] = ' ';
-
-			GetUserIdAndSecContext(&save_userid, &save_sec_context);
-			SetUserIdAndSecContext(RelationGetForm(fk_rel)->relowner,
-								   save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
-								   SECURITY_NOFORCE_RLS);
-			spi_result = SPI_execute_with_args(querybuf.data, riinfo->nkeys + 1,
-											   queryoids, vals, nulls, false, 1);
-			SetUserIdAndSecContext(save_userid, save_sec_context);
-			if (spi_result != SPI_OK_SELECT)
-				elog(ERROR, "SPI_execute_with_args returned %s", SPI_result_code_string(spi_result));
-			referenced = (SPI_processed != 0);
-			if (referenced)
 				ri_ReportViolationExt(riinfo, pk_rel, fk_rel, oldslot, NULL,
 									  is_no_action ? RI_PLAN_NO_ACTION : RI_PLAN_RESTRICT,
 									  !is_no_action, false, warn_only);
-			if (SPI_finish() != SPI_OK_FINISH)
-				elog(ERROR, "SPI_finish failed");
-			table_close(fk_rel, RowShareLock);
-			return !referenced;
+				table_close(fk_rel, RowShareLock);
+				return false;
+			}
+			if (ri_SelfReferenceMatches(riinfo, pk_rel, pk_rel, oldslot, fk_rel, oldslot))
+			{
+				StringInfoData querybuf;
+				char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
+				char		attname[MAX_QUOTED_NAME_LEN];
+				char		paramname[16];
+				const char *querysep = "WHERE";
+				const char *fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ? "" : "ONLY ";
+				Oid			queryoids[RI_MAX_NUMKEYS + 2];
+				Datum		vals[RI_MAX_NUMKEYS + 2];
+				char		nulls[RI_MAX_NUMKEYS + 2];
+				int			nargs;
+				Oid			save_userid;
+				int			save_sec_context;
+				int			spi_result = 0;
+				bool		referenced;
+
+				SPI_connect();
+				initStringInfo(&querybuf);
+				quoteRelationName(fkrelname, fk_rel);
+				appendStringInfo(&querybuf, "SELECT 1 FROM %s%s x", fk_only, fkrelname);
+				for (int i = 0; i < riinfo->nkeys; i++)
+				{
+					Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
+					Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
+
+					quoteOneName(attname, RIAttName(fk_rel, riinfo->fk_attnums[i]));
+					sprintf(paramname, "$%d", i + 1);
+					ri_GenerateQual(&querybuf, querysep, paramname, pk_type,
+									riinfo->pf_eq_oprs[i], attname, fk_type);
+					querysep = "AND";
+					queryoids[i] = pk_type;
+				}
+				ri_ExtractValues(pk_rel, oldslot, riinfo, true, vals, nulls);
+				if (is_part_self)
+				{
+					appendStringInfo(&querybuf,
+									 " AND (x.tableoid OPERATOR(pg_catalog.<>) $%d OR x.ctid OPERATOR(pg_catalog.<>) $%d) FOR KEY SHARE OF x",
+									 riinfo->nkeys + 1, riinfo->nkeys + 2);
+					queryoids[riinfo->nkeys] = OIDOID;
+					vals[riinfo->nkeys] = ObjectIdGetDatum(RelationGetRelid(pk_rel));
+					nulls[riinfo->nkeys] = ' ';
+					queryoids[riinfo->nkeys + 1] = TIDOID;
+					vals[riinfo->nkeys + 1] = ItemPointerGetDatum(&oldslot->tts_tid);
+					nulls[riinfo->nkeys + 1] = ' ';
+					nargs = riinfo->nkeys + 2;
+				}
+				else
+				{
+					appendStringInfo(&querybuf, " AND x.ctid OPERATOR(pg_catalog.<>) $%d FOR KEY SHARE OF x",
+									 riinfo->nkeys + 1);
+					queryoids[riinfo->nkeys] = TIDOID;
+					vals[riinfo->nkeys] = ItemPointerGetDatum(&oldslot->tts_tid);
+					nulls[riinfo->nkeys] = ' ';
+					nargs = riinfo->nkeys + 1;
+				}
+
+				GetUserIdAndSecContext(&save_userid, &save_sec_context);
+				SetUserIdAndSecContext(RelationGetForm(fk_rel)->relowner,
+									   save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
+									   SECURITY_NOFORCE_RLS);
+				PG_TRY();
+				{
+					SPIPlanPtr	plan = SPI_prepare(querybuf.data, nargs, queryoids);
+
+					if (plan == NULL)
+						elog(ERROR, "SPI_prepare failed: %s", SPI_result_code_string(SPI_result));
+					/* SPI must scan the latest snapshot even in transaction-snapshot mode. */
+					CommandCounterIncrement();
+					spi_result = SPI_execute_snapshot(plan, vals, nulls, GetLatestSnapshot(),
+													  InvalidSnapshot, false, false, 1);
+				}
+				PG_FINALLY();
+				{
+					SetUserIdAndSecContext(save_userid, save_sec_context);
+				}
+				PG_END_TRY();
+				if (spi_result != SPI_OK_SELECT)
+					elog(ERROR, "SPI_execute_snapshot returned %s", SPI_result_code_string(spi_result));
+				referenced = (SPI_processed != 0);
+				if (referenced)
+					ri_ReportViolationExt(riinfo, pk_rel, fk_rel, oldslot, NULL,
+										  is_no_action ? RI_PLAN_NO_ACTION : RI_PLAN_RESTRICT,
+										  !is_no_action, false, warn_only);
+				if (SPI_finish() != SPI_OK_FINISH)
+					elog(ERROR, "SPI_finish failed");
+				table_close(fk_rel, RowShareLock);
+				return !referenced;
+			}
 		}
 	}
 
@@ -4263,6 +4335,7 @@ ri_KeysEqual(Relation rel, TupleTableSlot *oldslot, TupleTableSlot *newslot,
 		else
 		{
 			Oid			eq_opr;
+			Oid			typeid = RIAttType(rel, attnums[i]);
 
 			/*
 			 * When comparing the PERIOD columns we can skip the check
@@ -4279,7 +4352,7 @@ ri_KeysEqual(Relation rel, TupleTableSlot *oldslot, TupleTableSlot *newslot,
 			 * operator.  Changes that compare equal will still satisfy the
 			 * constraint after the update.
 			 */
-			if (!ri_CompareWithCast(eq_opr, RIAttType(rel, attnums[i]), RIAttCollation(rel, attnums[i]),
+			if (!ri_CompareWithCast(eq_opr, typeid, typeid, RIAttCollation(rel, attnums[i]),
 									newvalue, oldvalue))
 				return false;
 		}
@@ -4288,6 +4361,22 @@ ri_KeysEqual(Relation rel, TupleTableSlot *oldslot, TupleTableSlot *newslot,
 	return true;
 }
 
+
+/* Check each distinct cast once, as for a same-type RI comparison. */
+static Datum
+ri_CastOperand(FmgrInfo *cast, Datum value, bool check_acl)
+{
+	if (check_acl)
+	{
+		AclResult	aclresult = object_aclcheck(ProcedureRelationId, cast->fn_oid,
+												GetUserId(), ACL_EXECUTE);
+
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(cast->fn_oid));
+		InvokeFunctionExecuteHook(cast->fn_oid);
+	}
+	return FunctionCall3(cast, value, Int32GetDatum(-1), BoolGetDatum(false));
+}
 
 /*
  * ri_CompareWithCast -
@@ -4300,33 +4389,16 @@ ri_KeysEqual(Relation rel, TupleTableSlot *oldslot, TupleTableSlot *newslot,
  * NB: we have already checked that neither value is null.
  */
 static bool
-ri_CompareWithCast(Oid eq_opr, Oid typeid, Oid collid,
+ri_CompareWithCast(Oid eq_opr, Oid lhstype, Oid rhstype, Oid collid,
 				   Datum lhs, Datum rhs)
 {
-	RI_CompareHashEntry *entry = ri_HashCompareOp(eq_opr, typeid);
+	RI_CompareHashEntry *entry = ri_HashCompareOp(eq_opr, lhstype, rhstype);
 
-	/* Do we need to cast the values? */
-	if (OidIsValid(entry->cast_func_finfo.fn_oid))
-	{
-		Oid			castfunc = entry->cast_func_finfo.fn_oid;
-		AclResult	aclresult;
-
-		aclresult = object_aclcheck(ProcedureRelationId, castfunc,
-									GetUserId(), ACL_EXECUTE);
-		if (aclresult != ACLCHECK_OK)
-			aclcheck_error(aclresult, OBJECT_FUNCTION,
-						   get_func_name(castfunc));
-		InvokeFunctionExecuteHook(castfunc);
-
-		lhs = FunctionCall3(&entry->cast_func_finfo,
-							lhs,
-							Int32GetDatum(-1),	/* typmod */
-							BoolGetDatum(false));	/* implicit coercion */
-		rhs = FunctionCall3(&entry->cast_func_finfo,
-							rhs,
-							Int32GetDatum(-1),	/* typmod */
-							BoolGetDatum(false));	/* implicit coercion */
-	}
+	if (OidIsValid(entry->lcast_finfo.fn_oid))
+		lhs = ri_CastOperand(&entry->lcast_finfo, lhs, true);
+	if (OidIsValid(entry->rcast_finfo.fn_oid))
+		rhs = ri_CastOperand(&entry->rcast_finfo, rhs,
+							 entry->rcast_finfo.fn_oid != entry->lcast_finfo.fn_oid);
 
 	/*
 	 * Apply the comparison operator.
@@ -4349,6 +4421,29 @@ ri_CompareWithCast(Oid eq_opr, Oid typeid, Oid collid,
 	return DatumGetBool(FunctionCall2Coll(&entry->eq_opr_finfo, collid, lhs, rhs));
 }
 
+/* Resolve the implicit cast selected for this side of the FK operator. */
+static void
+ri_InitCompareCast(FmgrInfo *info, Oid target, Oid source)
+{
+	Oid			func = InvalidOid;
+
+	if (target != source)
+	{
+		CoercionPathType path = find_coercion_pathway(target, source,
+													  COERCION_IMPLICIT, &func);
+
+		/* Includes binary-compatible polymorphic inputs such as anyenum. */
+		if (path != COERCION_PATH_FUNC && path != COERCION_PATH_RELABELTYPE &&
+			!IsBinaryCoercible(source, target))
+			elog(ERROR, "no conversion function from %s to %s",
+				 format_type_be(source), format_type_be(target));
+	}
+	if (OidIsValid(func))
+		fmgr_info_cxt(func, info, TopMemoryContext);
+	else
+		info->fn_oid = InvalidOid;
+}
+
 /*
  * ri_HashCompareOp -
  *
@@ -4356,7 +4451,7 @@ ri_CompareWithCast(Oid eq_opr, Oid typeid, Oid collid,
  * if not.
  */
 static RI_CompareHashEntry *
-ri_HashCompareOp(Oid eq_opr, Oid typeid)
+ri_HashCompareOp(Oid eq_opr, Oid lhstype, Oid rhstype)
 {
 	RI_CompareKey key;
 	RI_CompareHashEntry *entry;
@@ -4373,7 +4468,8 @@ ri_HashCompareOp(Oid eq_opr, Oid typeid)
 	 * contains no struct padding.
 	 */
 	key.eq_opr = eq_opr;
-	key.typeid = typeid;
+	key.lhstype = lhstype;
+	key.rhstype = rhstype;
 	entry = (RI_CompareHashEntry *) hash_search(ri_compare_cache,
 												&key,
 												HASH_ENTER, &found);
@@ -4388,55 +4484,15 @@ ri_HashCompareOp(Oid eq_opr, Oid typeid)
 	if (!entry->valid)
 	{
 		Oid			lefttype,
-					righttype,
-					castfunc;
-		CoercionPathType pathtype;
+					righttype;
 
-		/* We always need to know how to call the equality operator */
-		fmgr_info_cxt(get_opcode(eq_opr), &entry->eq_opr_finfo,
-					  TopMemoryContext);
-
-		/*
-		 * If we chose to use a cast from FK to PK type, we may have to apply
-		 * the cast function to get to the operator's input type.
-		 *
-		 * XXX eventually it would be good to support array-coercion cases
-		 * here and in ri_CompareWithCast().  At the moment there is no point
-		 * because cases involving nonidentical array types will be rejected
-		 * at constraint creation time.
-		 *
-		 * XXX perhaps also consider supporting CoerceViaIO?  No need at the
-		 * moment since that will never be generated for implicit coercions.
-		 */
+		fmgr_info_cxt(get_opcode(eq_opr), &entry->eq_opr_finfo, TopMemoryContext);
 		op_input_types(eq_opr, &lefttype, &righttype);
-		Assert(lefttype == righttype);
-		if (typeid == lefttype)
-			castfunc = InvalidOid;	/* simplest case */
+		ri_InitCompareCast(&entry->lcast_finfo, lefttype, lhstype);
+		if (lefttype == righttype && lhstype == rhstype)
+			entry->rcast_finfo = entry->lcast_finfo;
 		else
-		{
-			pathtype = find_coercion_pathway(lefttype, typeid,
-											 COERCION_IMPLICIT,
-											 &castfunc);
-			if (pathtype != COERCION_PATH_FUNC &&
-				pathtype != COERCION_PATH_RELABELTYPE)
-			{
-				/*
-				 * The declared input type of the eq_opr might be a
-				 * polymorphic type such as ANYARRAY or ANYENUM, or other
-				 * special cases such as RECORD; find_coercion_pathway
-				 * currently doesn't subsume these special cases.
-				 */
-				if (!IsBinaryCoercible(typeid, lefttype))
-					elog(ERROR, "no conversion function from %s to %s",
-						 format_type_be(typeid),
-						 format_type_be(lefttype));
-			}
-		}
-		if (OidIsValid(castfunc))
-			fmgr_info_cxt(castfunc, &entry->cast_func_finfo,
-						  TopMemoryContext);
-		else
-			entry->cast_func_finfo.fn_oid = InvalidOid;
+			ri_InitCompareCast(&entry->rcast_finfo, righttype, rhstype);
 		entry->valid = true;
 	}
 

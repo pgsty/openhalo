@@ -457,7 +457,7 @@ BEGIN
     tabName := $4;
     columnIndex := 0;
 
-    ret := pg_catalog.concat('CREATE TABLE `', tabName, '` (');
+    ret := pg_catalog.concat('CREATE TABLE `', replace(tabName, '`', '``'), '` (');
 
     FOR records IN
         select att.attidentity as identity, mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C" as extra, att.attname as column_name,
@@ -524,7 +524,7 @@ BEGIN
             end if;
 
             ret := pg_catalog.concat(ret, '`');
-            ret := pg_catalog.concat(ret, records.column_name);
+            ret := pg_catalog.concat(ret, replace(records.column_name, '`', '``'));
             ret := pg_catalog.concat(ret, '`');
             ret := pg_catalog.concat(ret, ' ', records.column_type);
             if (records.generation is not null) then
@@ -589,7 +589,7 @@ BEGIN
         --    from pg_index ind join pg_class cl on ind.indrelid = cl.oid
         --    where ind.indrelid = tabOid and cl.oid = tabOid
     LOOP
-        select pg_catalog.string_agg(pg_catalog.concat('`', k.column_name, '`',
+        select pg_catalog.string_agg(pg_catalog.concat('`', replace(k.column_name, '`', '``'), '`',
                 case when k.sub_part is not null then pg_catalog.concat('(', k.sub_part, ')') end), ',' order by k.seq)
             from mysql.index_key_parts(records.indexrelid) k into columnNames;
         continue when columnNames is null;
@@ -601,9 +601,9 @@ BEGIN
         if (records.indisprimary = 1) then
             ret := pg_catalog.concat(ret, 'PRIMARY KEY (', columnNames, ')');
         elsif (records.indisunique = 1) then
-            ret := pg_catalog.concat(ret, 'UNIQUE KEY `', records.indname, '` (', columnNames, ')');
+            ret := pg_catalog.concat(ret, 'UNIQUE KEY `', replace(records.indname, '`', '``'), '` (', columnNames, ')');
         else
-            ret := pg_catalog.concat(ret, 'KEY `', records.indname, '` (', columnNames, ')');
+            ret := pg_catalog.concat(ret, 'KEY `', replace(records.indname, '`', '``'), '` (', columnNames, ')');
         end if;
     END LOOP;
 
@@ -1462,6 +1462,421 @@ CREATE OR REPLACE VIEW mys_informa_schema.tables AS
 
 -- Remove obsolete temporary scratch table after replacing get_funcs_procs_parameters()
 DROP TABLE mys_informa_schema.parameters_tmp;
+
+-- Restore MySQL boolean/integer cast contexts (also lost across pg_upgrade)
+UPDATE pg_catalog.pg_cast SET castcontext = 'i' WHERE castsource = 23 AND casttarget = 16;
+UPDATE pg_catalog.pg_cast SET castcontext = 'a' WHERE castsource = 16 AND casttarget = 23;
+
+-- Replace TIMEDIFF overloads to return formatted MySQL TIME text (supports negative and >24h)
+DROP FUNCTION IF EXISTS mysql.timediff(timestamp, timestamp);
+DROP FUNCTION IF EXISTS mysql.timediff(time, time);
+DROP FUNCTION IF EXISTS mysql.timediff(text, text);
+CREATE OR REPLACE FUNCTION mysql.timediff(text, text)
+RETURNS text
+LANGUAGE c
+IMMUTABLE STRICT PARALLEL SAFE
+AS '$libdir/aux_mysql', $function$mys_timediff_text$function$;
+
+CREATE OR REPLACE FUNCTION mysql.timediff(time, time)
+RETURNS text
+AS $$
+    SELECT mysql.timediff($1::text, $2::text)
+$$ IMMUTABLE STRICT PARALLEL SAFE LANGUAGE SQL;
+
+CREATE OR REPLACE FUNCTION mysql.timediff(timestamp, timestamp)
+RETURNS text
+AS $$
+    SELECT mysql.timediff($1::text, $2::text)
+$$ IMMUTABLE STRICT PARALLEL SAFE LANGUAGE SQL;
+
+-- Fix O(N^2) PL/pgSQL loop in mysql.space() and cap at max_allowed_packet default (64MB)
+CREATE OR REPLACE FUNCTION mysql.space(pg_catalog.int4)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE STRICT PARALLEL SAFE
+AS
+$$
+    SELECT CASE
+        WHEN $1 <= 0 THEN ''::pg_catalog.text
+        WHEN $1 > 67108864 THEN NULL::pg_catalog.text
+        ELSE pg_catalog.repeat(' ', $1)
+    END
+$$;
+
+-- Fix broken PL/pgSQL string literals and @@sql_mode in routine inspection helpers
+CREATE OR REPLACE FUNCTION mysql.get_proc_def(funcName text,
+                                              proallargtypes oid[],
+                                              proargmodes "char"[],
+                                              proargnames text[],
+                                              prosrc text)
+RETURNS text
+AS
+$$
+DECLARE
+    ret text;
+    allArgNum int;
+    argIndex int;
+BEGIN
+    ret := 'CREATE PROCEDURE';
+
+    ret := ret || ' ';
+    ret := ret || funcName;
+
+    ret := ret || '(';
+    if (proallargtypes is not null) then
+        allArgNum := array_length(proallargtypes, 1);
+        argIndex := 1;
+        LOOP
+            if (1 < argIndex) then
+                ret := ret || ',';
+            end if;
+
+            if (proargmodes[argIndex] = 'i') then
+                ret := ret || ' IN';
+            else
+                ret := ret || ' OUT';
+            end if;
+
+            ret := ret || ' ';
+            ret := ret || coalesce(proargnames[argIndex], '');
+
+            ret := ret || ' ';
+            ret := ret || proallargtypes[argIndex]::regType::text;
+
+            argIndex := argIndex + 1;
+            EXIT WHEN argIndex > allArgNum;
+        END LOOP;
+    end if;
+    ret := ret || E')\n';
+
+    ret := ret || prosrc;
+
+    RETURN ret;
+END
+$$
+IMMUTABLE LANGUAGE PLPGSQL;
+
+CREATE OR REPLACE FUNCTION mysql.show_create_function(pg_catalog.text, pg_catalog.text)
+RETURNS setof RECORD
+AS
+$$
+DECLARE
+    schName pg_catalog.varchar(128);
+    funcName pg_catalog.varchar(128);
+    func RECORD;
+    recordNum pg_catalog.int4;
+BEGIN
+    schName := $1;
+    funcName := $2;
+    recordNum := 0;
+
+    FOR func IN
+        select
+            Name,
+            mysql.get_system_session_variable('sql_mode')::varchar(256) as sql_mode,
+            Define,
+            Character_set_client,
+            Collation_connection,
+            Database_Collation
+        FROM mys_informa_schema.functions
+        WHERE Db = schName and Name = funcName
+    LOOP
+        recordNum := recordNum + 1;
+        return next func;
+    END LOOP;
+
+    if (recordNum = 0) then
+        raise exception 'FUNCTION % does not exist', funcName;
+    end if;
+
+    return;
+END;
+$$
+STABLE LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION mysql.show_create_procedure(pg_catalog.text, pg_catalog.text)
+RETURNS setof RECORD
+AS
+$$
+DECLARE
+    schName pg_catalog.varchar(128);
+    procName pg_catalog.varchar(128);
+    proc RECORD;
+    recordNum pg_catalog.int4;
+BEGIN
+    schName := $1;
+    procName := $2;
+    recordNum := 0;
+
+    FOR proc IN
+        select
+            Name,
+            mysql.get_system_session_variable('sql_mode')::varchar(256) as sql_mode,
+            Define,
+            Character_set_client,
+            Collation_connection,
+            Database_Collation
+        FROM mys_informa_schema.procedures
+        WHERE Db = schName and Name = procName
+    LOOP
+        recordNum := recordNum + 1;
+        return next proc;
+    END LOOP;
+
+    if (recordNum = 0) then
+        raise exception 'PROCEDURE % does not exist', procName;
+    end if;
+
+    return;
+END;
+$$
+STABLE LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION mysql.get_proc_def(procName pg_catalog.text,
+                                                procOwner pg_catalog.text,
+                                                proargtypes pg_catalog.oidvector,
+                                                proallargtypes pg_catalog.oid[],
+                                                proargmodes "char"[],
+                                                proargnames pg_catalog.text[],
+                                                prosrc pg_catalog.text)
+RETURNS pg_catalog.text
+AS
+$$
+DECLARE
+    ret pg_catalog.text;
+    allArgNum pg_catalog.int4;
+    argIndex pg_catalog.int4;
+    argTypes pg_catalog.int4[];
+BEGIN
+    ret := 'CREATE DEFINER=`';
+    ret := pg_catalog.concat(ret, replace(procOwner, '`', '``'));
+    ret := pg_catalog.concat(ret, '`@`%` PROCEDURE `');
+    ret := pg_catalog.concat(ret, replace(procName, '`', '``'));
+    ret := pg_catalog.concat(ret, '`(');
+    if (proallargtypes is not null) then
+        allArgNum := array_length(proallargtypes, 1);
+        argIndex := 1;
+        LOOP
+            if (1 < argIndex) then
+                ret := pg_catalog.concat(ret, ', ');
+            end if;
+
+            if (proargmodes[argIndex] = 'i') then
+                ret := pg_catalog.concat(ret, 'IN');
+            elsif (proargmodes[argIndex] = 'b') then
+                ret := pg_catalog.concat(ret, 'INOUT');
+            else
+                ret := pg_catalog.concat(ret, 'OUT');
+            end if;
+
+            ret := pg_catalog.concat(ret, ' ');
+            ret := pg_catalog.concat(ret, proargnames[argIndex]);
+
+            ret := pg_catalog.concat(ret, ' ');
+            ret := pg_catalog.concat(ret, proallargtypes[argIndex]::regType::pg_catalog.text);
+
+            argIndex := argIndex + 1;
+
+            EXIT WHEN argIndex > allArgNum;
+        END LOOP;
+    else
+        argTypes := string_to_array(proargtypes::text, ' ');
+        allArgNum := array_length(argTypes, 1);
+        if (0 < allArgNum) then
+            argIndex := 1;
+            LOOP
+                if (1 < argIndex) then
+                    ret := pg_catalog.concat(ret, ',');
+                end if;
+
+                ret := pg_catalog.concat(ret, ' IN');
+
+                ret := pg_catalog.concat(ret, ' ');
+                ret := pg_catalog.concat(ret, proargnames[argIndex]);
+
+                ret := pg_catalog.concat(ret, ' ');
+                ret := pg_catalog.concat(ret, argTypes[argIndex]::regType::pg_catalog.text);
+
+                argIndex := argIndex + 1;
+                EXIT WHEN argIndex > allArgNum;
+            END LOOP;
+        end if;
+    end if;
+    ret := pg_catalog.concat(ret, E')\n');
+
+    ret := pg_catalog.concat(ret, prosrc);
+
+    RETURN ret;
+END
+$$
+IMMUTABLE LANGUAGE PLPGSQL;
+
+CREATE OR REPLACE FUNCTION mysql.get_func_def(funcName text,
+                                              procOwner pg_catalog.text,
+                                              prorettype pg_catalog.oid,
+                                              proargtypes pg_catalog.oidvector,
+                                              proargnames pg_catalog.text[],
+                                              prosrc text)
+RETURNS text
+AS
+$$
+DECLARE
+    ret pg_catalog.text;
+    argTypes pg_catalog.int4[];
+    allArgNum pg_catalog.int4;
+    argIndex pg_catalog.int4;
+BEGIN
+    ret := 'CREATE DEFINER=`';
+    ret := pg_catalog.concat(ret, replace(procOwner, '`', '``'));
+    ret := pg_catalog.concat(ret, '`@`%` FUNCTION `');
+    ret := pg_catalog.concat(ret, replace(funcName, '`', '``'));
+    ret := pg_catalog.concat(ret, '`(');
+    argTypes := string_to_array(proargtypes::text, ' ');
+    allArgNum := array_length(argTypes, 1);
+    argIndex := 1;
+    if (0 < allArgNum) then
+        LOOP
+            if (1 < argIndex) then
+                ret := pg_catalog.concat(ret, ', ');
+            end if;
+
+            ret := pg_catalog.concat(ret, proargnames[argIndex]);
+            ret := pg_catalog.concat(ret, ' ');
+            ret := pg_catalog.concat(ret, argTypes[argIndex]::regType::text);
+
+            argIndex := argIndex + 1;
+            EXIT WHEN argIndex > allArgNum;
+        END LOOP;
+    end if;
+    ret := pg_catalog.concat(ret, ')');
+
+    ret := pg_catalog.concat(ret, ' ');
+    ret := pg_catalog.concat(ret, 'RETURNS ', prorettype::regType::text);
+
+    ret := pg_catalog.concat(ret, E'\n');
+    ret := pg_catalog.concat(ret, prosrc);
+
+    RETURN ret;
+END
+$$
+IMMUTABLE LANGUAGE PLPGSQL;
+
+-- Replace superuser-only pg_statistic / pg_authid reads in information_schema views
+CREATE OR REPLACE VIEW mys_informa_schema.partitions AS
+SELECT
+'def'::varchar(512) as TABLE_CATALOG,
+n.nspname::varchar(64) AS TABLE_SCHEMA,
+p.relname::varchar(64) AS TABLE_NAME,
+c.relname::varchar(64) AS PARTITION_NAME,
+NULL::varchar(64) AS SUBPARTITION_NAME,
+rank() over(partition by p.relname order by c.oid) AS PARTITION_ORDINAL_POSITION,
+NULL::bigint AS SUBPARTITION_ORDINAL_POSITION,
+CASE pg_partitioned_table.partstrat
+WHEN 'r'::char THEN 'RANGE'::varchar(18)
+WHEN 'l'::char THEN 'LIST'::varchar(18)
+WHEN 'h'::char THEN 'HASH'::varchar(18)
+ELSE 'UNKNOWN'::varchar(18)
+END AS PARTITION_METHOD,
+NULL::varchar(12) AS SUBPARTITION_METHOD,
+NULL::text AS PARTITION_EXPRESSION,
+NULL::text AS SUBPARTITION_EXPRESSION,
+NULL::text AS PARTITION_DESCRIPTION,
+c.reltuples::bigint AS TABLE_ROWS,
+avg_row.stawidth::bigint AS AVG_ROW_LENGTH,
+0::bigint AS DATA_LENGTH,
+NULL::bigint AS MAX_DATA_LENGTH,
+0::bigint AS INDEX_LENGTH,
+0::bigint AS DATA_FREE,
+NULL::mysql.datetime AS CREATE_TIME,
+NULL::mysql.datetime AS UPDATE_TIME,
+NULL::mysql.datetime AS CHECK_TIME,
+NULL::bigint AS CHECKSUM,
+''::varchar(80) AS PARTITION_COMMENT,
+'default'::varchar(12) AS NODEGROUP,
+coalesce(t.spcname::text, 'PG_DEFAULT')::varchar(64) as TABLESPACE_NAME
+FROM pg_inherits i
+JOIN pg_partitioned_table ON i.inhparent = pg_partitioned_table.partrelid
+JOIN pg_class p ON i.inhparent = p.oid
+JOIN pg_class c ON i.inhrelid = c.oid
+LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN (SELECT parent.oid, parent.relname AS partitioned_table_name,
+    count(child.oid) AS num_partitions
+    FROM pg_class parent
+    LEFT JOIN pg_inherits ON pg_inherits.inhparent = parent.oid
+    LEFT JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+    WHERE parent.relkind = 'p'
+    GROUP BY parent.oid, parent.relname, parent.relkind) par on par.oid = i.inhrelid
+LEFT JOIN pg_tablespace t on p.reltablespace = t.oid
+LEFT JOIN (select i.inhparent,  sum(c.relpages) as blocks
+    from pg_class c LEFT JOIN pg_inherits i ON c.oid=i.inhrelid
+    where c.relispartition is true group by 1) s on c.oid = s.inhparent
+LEFT JOIN (select schemaname, tablename, sum(avg_width) as stawidth
+    FROM pg_catalog.pg_stats
+    group by schemaname, tablename) avg_row
+    on n.nspname = avg_row.schemaname and c.relname = avg_row.tablename
+WHERE p.relispartition = false AND p.relkind NOT IN ('i', 'I') order by 1, 2, 3;
+
+CREATE OR REPLACE VIEW mys_informa_schema.functions AS
+SELECT
+    (select ns.nspname from pg_namespace ns where ns.oid = pc.pronamespace)::varchar(256) as Db,
+    pc.proname::varchar(256) as Name,
+    'FUNCTION'::varchar(256) as Type,
+    (mysql.get_func_def(pc.proname, pc.proowner::regrole::pg_catalog.text, pc.prorettype, pc.proargtypes, pc.proargnames, pc.prosrc))::text as Define,
+    pg_catalog.pg_get_userbyid(pc.proowner)::varchar(256) as Definer,
+    null::varchar(256) as Modified,
+    null::varchar(256) as Created,
+    'DEFINER'::varchar(256) as Security_type,
+    ''::varchar(512) as Comment,
+    'utf8mb4'::varchar(128) as Character_set_client,
+    'utf8mb4_general_ci'::varchar(128) as Collation_connection,
+    'utf8mb4_general_ci'::varchar(128) as Database_Collation
+FROM pg_proc pc
+WHERE pc.prokind = 'f' and substring(pc.proname from 1 for 21) != 'func_reset_serial_for';
+
+CREATE OR REPLACE VIEW mys_informa_schema.procedures AS
+SELECT
+    (select ns.nspname from pg_namespace ns where ns.oid = pc.pronamespace)::varchar(256) as Db,
+    pc.proname::varchar(256) as Name,
+    'PROCEDURE'::varchar(256) as Type,
+    (mysql.get_proc_def(pc.proname, pc.proowner::regrole::pg_catalog.text, pc.proargtypes, pc.proallargtypes, pc.proargmodes, pc.proargnames, pc.prosrc))::text as Define,
+    pg_catalog.pg_get_userbyid(pc.proowner)::varchar(256) as Definer,
+    '2022-10-21 10:20:30'::varchar(256) as Modified,
+    '2022-10-20 10:20:30'::varchar(256) as Created,
+    'DEFINER'::varchar(256) as Security_type,
+    ''::varchar(512) as Comment,
+    'utf8mb4'::varchar(128) as Character_set_client,
+    'utf8mb4_general_ci'::varchar(128) as Collation_connection,
+    'utf8mb4_general_ci'::varchar(128) as Database_Collation
+FROM pg_proc pc
+WHERE pc.prokind = 'p' and substring(pc.proname from 1 for 21) != 'func_reset_serial_for';
+
+-- Fix volatility & parallel safety for session-stateful / warning-emitting functions
+ALTER FUNCTION mysql.current_user() STABLE PARALLEL RESTRICTED;
+ALTER FUNCTION mysql.session_user() STABLE PARALLEL RESTRICTED;
+
+DO $$
+DECLARE
+    rec record;
+BEGIN
+    FOR rec IN
+        SELECT p.oid::pg_catalog.regprocedure AS sig
+        FROM pg_catalog.pg_depend d
+        JOIN pg_catalog.pg_extension e
+          ON e.oid = d.refobjid AND e.extname = 'aux_mysql'
+        JOIN pg_catalog.pg_proc p
+          ON p.oid = d.objid AND d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+        JOIN pg_catalog.pg_namespace n
+          ON n.oid = p.pronamespace
+        WHERE d.deptype = 'e'
+          AND n.nspname = 'mysql'
+          AND p.provolatile = 's'
+          AND p.proparallel = 's'
+          AND p.proname NOT IN ('time_to_timestamp', 'concat', 'concat_ws')
+    LOOP
+        EXECUTE pg_catalog.format('ALTER FUNCTION %s PARALLEL RESTRICTED', rec.sig);
+    END LOOP;
+END;
+$$;
 
 -- Reconcile legacy PUBLIC execute grants on PostgreSQL file-read functions
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_read_file(pg_catalog.text, pg_catalog.int8, pg_catalog.int8, pg_catalog.bool) FROM PUBLIC;

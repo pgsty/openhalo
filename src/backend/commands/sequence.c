@@ -991,9 +991,12 @@ do_setval(Oid relid, int64 next, bool iscalled, bool advance_only)
 	/* Cached or cycling sequences cannot promise a monotonic next value. */
 	if (advance_only &&
 		(pgsform->seqincrement != 1 || pgsform->seqcache != 1 || pgsform->seqcycle))
+	{
+		ReleaseSysCache(pgstuple);
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("monotonic sequence advancement requires INCREMENT 1 CACHE 1 NO CYCLE")));
+	}
 	ReleaseSysCache(pgstuple);
 
 	/* read-only transactions may only modify temp sequences */

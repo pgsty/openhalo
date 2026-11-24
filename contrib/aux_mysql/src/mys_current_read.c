@@ -375,8 +375,11 @@ collect_valid_root_unique_indexes(Oid root_relid)
 			info->indexid = indexid;
 			info->nkeys = index->rd_index->indnkeyatts;
 			result = lappend(result, info);
+			/* Keep AccessShareLock until end of transaction to prevent DROP INDEX CONCURRENTLY TOCTOU. */
+			index_close(index, NoLock);
 		}
-		index_close(index, AccessShareLock);
+		else
+			index_close(index, AccessShareLock);
 	}
 	list_free(indexes);
 	table_close(table, AccessShareLock);
@@ -427,7 +430,8 @@ find_leaf_partition_unique_key_match(Oid leaf_relid, Index rti, List *quals,
 		{
 			*chosen_leaf_indexid = indexid;
 			*chosen_keys = keys;
-			index_close(index, AccessShareLock);
+			/* Retain AccessShareLock on chosen leaf index across planning. */
+			index_close(index, NoLock);
 			found = true;
 			break;
 		}
@@ -640,6 +644,7 @@ mys_current_read_rewrite_limit(Query *query)
 		};
 		int			toid_bit = TableOidAttributeNumber - FirstLowInvalidHeapAttributeNumber;
 		int			ctid_bit = SelfItemPointerAttributeNumber - FirstLowInvalidHeapAttributeNumber;
+		int			wholerow_bit = InvalidAttrNumber - FirstLowInvalidHeapAttributeNumber;
 
 		collect_rel_varattnos_walker(lifted, &vctx);
 		collect_rel_varattnos_walker((Node *) query->targetList, &vctx);
@@ -650,9 +655,9 @@ mys_current_read_rewrite_limit(Query *query)
 		outer_perm->requiredPerms |= sub_perm->requiredPerms;
 		outer_perm->selectedCols = bms_add_members(outer_perm->selectedCols,
 												   sub_perm->selectedCols);
-		if (!bms_is_member(toid_bit, vctx.varattnos) && !bms_is_member(0, vctx.varattnos))
+		if (!bms_is_member(toid_bit, vctx.varattnos) && !bms_is_member(wholerow_bit, vctx.varattnos))
 			outer_perm->selectedCols = bms_del_member(outer_perm->selectedCols, toid_bit);
-		if (!bms_is_member(ctid_bit, vctx.varattnos) && !bms_is_member(0, vctx.varattnos))
+		if (!bms_is_member(ctid_bit, vctx.varattnos) && !bms_is_member(wholerow_bit, vctx.varattnos))
 			outer_perm->selectedCols = bms_del_member(outer_perm->selectedCols, ctid_bit);
 		bms_free(vctx.varattnos);
 	}
@@ -709,9 +714,30 @@ plan_partitioned_current_read(PlannedStmt *stmt, ModifyTable *modify)
 
 	root_rte = list_nth_node(RangeTblEntry, stmt->rtable, modify->rootRelation - 1);
 	if (root_rte->rtekind != RTE_RELATION ||
-		root_rte->relkind != RELKIND_PARTITIONED_TABLE ||
-		!partition_hierarchy_all_safe_heap(root_rte->relid))
+		root_rte->relkind != RELKIND_PARTITIONED_TABLE)
 		return;
+
+	/*
+	 * Verify only the unpruned target partitions already in modify->resultRelations
+	 * rather than locking every pruned partition via find_all_inheritors().
+	 */
+	foreach_int(rti, modify->resultRelations)
+	{
+		RangeTblEntry *leaf_rte = list_nth_node(RangeTblEntry, stmt->rtable, rti - 1);
+		Relation	leaf_rel;
+		bool		safe;
+
+		if (leaf_rte->rtekind != RTE_RELATION || leaf_rte->relkind != RELKIND_RELATION)
+			return;
+		leaf_rel = table_open(leaf_rte->relid, AccessShareLock);
+		safe = (leaf_rel->rd_rel->relkind == RELKIND_RELATION &&
+				leaf_rel->rd_rel->relispartition &&
+				leaf_rel->rd_rel->relam == HEAP_TABLE_AM_OID &&
+				!leaf_rel->rd_rel->relrowsecurity);
+		table_close(leaf_rel, AccessShareLock);
+		if (!safe)
+			return;
+	}
 
 	root_uqs = collect_valid_root_unique_indexes(root_rte->relid);
 	if (root_uqs == NIL)
@@ -1013,7 +1039,7 @@ close_scan(MysCurrentRead *node)
  * FK checks and already-ended LOCK_ONLY xids/multixacts are allowed).
  */
 static bool
-tuple_has_no_modify_lock(TupleTableSlot *slot)
+tuple_has_no_modify_lock(TupleTableSlot *slot, LockTupleMode lockmode)
 {
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 	uint16		infomask;
@@ -1034,7 +1060,9 @@ tuple_has_no_modify_lock(TupleTableSlot *slot)
 		return false;
 	if ((infomask & HEAP_XMAX_IS_MULTI) == 0)
 	{
-		if ((infomask & HEAP_LOCK_MASK) == HEAP_XMAX_KEYSHR_LOCK)
+		/* FOR KEY SHARE only permits LockTupleNoKeyExclusive, never LockTupleExclusive. */
+		if (lockmode == LockTupleNoKeyExclusive &&
+			(infomask & HEAP_LOCK_MASK) == HEAP_XMAX_KEYSHR_LOCK)
 			return true;
 		return !TransactionIdIsInProgress(raw_xmax);
 	}
@@ -1143,7 +1171,7 @@ current_read_exec(CustomScanState *css)
 
 		tid = slot->tts_tid;
 		if (node->can_defer_lock &&
-			tuple_has_no_modify_lock(slot) &&
+			tuple_has_no_modify_lock(slot, node->lockmode) &&
 			!(ItemPointerIsValid(&node->deferred_tid) &&
 			  ItemPointerEquals(&tid, &node->deferred_tid)))
 		{
@@ -1180,7 +1208,14 @@ current_read_exec(CustomScanState *css)
 			return NULL;
 		}
 		if (result == TM_SelfModified)
+		{
+			if (tmfd.cmax != estate->es_output_cid)
+				ereport(ERROR,
+						(errcode(ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION),
+						 errmsg("tuple to be updated was already modified by an operation triggered by the current command"),
+						 errhint("Consider using an AFTER trigger instead of a BEFORE trigger to propagate changes to other rows.")));
 			break;
+		}
 		if (result != TM_Updated && result != TM_Deleted)
 			elog(ERROR, "unexpected current-read tuple lock status: %u", result);
 

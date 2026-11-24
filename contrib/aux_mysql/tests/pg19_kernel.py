@@ -3,7 +3,7 @@
 """PG19 port regressions on a disposable instance (PG* and MYSQL_* settings).
 
 Checks stored ON CONFLICT DO SELECT locking, native cancellation and TLS,
-and MySQL string escaping independently of PostgreSQL's removed scanner GUCs.
+MySQL string escaping and execution of extension expressions with LLVM JIT.
 Requires psycopg2, PyMySQL, a TLS-enabled server and matching PGBIN.
 """
 import concurrent.futures
@@ -118,6 +118,15 @@ def main():
             cursor.execute("SELECT HEX(v) FROM strings")
             assert cursor.fetchone() == ("615C62",)
         print("PASS MySQL TLS, escaped literals and default DDL round trip", flush=True)
+
+        sql(admin, "SET jit=on")
+        if sql(admin, "SELECT pg_jit_available()") == [(True,)]:
+            for option in ("jit_above_cost", "jit_inline_above_cost", "jit_optimize_above_cost"):
+                sql(admin, f"SET {option}=0")
+            plan = sql(admin, """EXPLAIN (ANALYZE, FORMAT JSON, TIMING OFF)
+                SELECT sum(length(mysql.part_list_columns(i))) FROM generate_series(1,20) AS g(i)""")[0][0][0]
+            assert plan["JIT"]["Functions"] > 0 and plan["JIT"]["Options"]["Inlining"], plan
+            print("PASS LLVM JIT compiled and executed an extension expression", flush=True)
     finally:
         if mysql:
             mysql.close()

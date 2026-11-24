@@ -82,6 +82,17 @@ typedef struct SystemVar
 	char		showResult[SYSTEM_VAR_RESULT_RULE_NUM][SYSTEM_VAR_RESULT_RULE_LEN];
 } SystemVar;
 
+typedef struct SystemVarChange
+{
+	const char *name;
+	const char *value;
+	SystemVar  *session_var;	/* destination, including a GLOBAL-only mirror */
+	bool		global;
+	uint64		sql_mode;
+	int			week_format;
+	char	   *timezone;
+} SystemVarChange;
+
 static SystemVar *baseSystemVars[SYSTEM_VAR_MAX_NUM];
 static int	baseSystemVarsNum = 0;
 static HTAB *sessionSystemVars = NULL;
@@ -117,13 +128,13 @@ static void setSystemVarValueByVarName(const char *varName,
 static void setSystemVarValueForOptimizerSwitch(const char *value,
 												char *varValue);
 static void setSystemVarValue(const char *value, char *varValue);
-static void rectifySystemVarValue(const char *varName, char **varValue,
+static void rectifySystemVarValue(MysSetBatch *batch, const char *varName, char **varValue,
 								  bool isSessionSystemVar);
-static void getDefaultValue(const char *varName, bool isSessionSystemVar,
+static void getDefaultValue(MysSetBatch *batch, const char *varName, bool isSessionSystemVar,
 							char **varValue);
+static void validateSystemVarValue(const char *varName, const char *varValue,
+								   uint64 *sqlModeOut, int *weekFormatOut, char **timezoneOut);
 static void applySystemVarValue(const char *varName, const char *varValue);
-static void setSystemVariableValueOne(const char *rawVarName, const char *rawVarValue,
-									  bool isSessionSystemVar);
 static int	getSystemVariableValueImpl(const char *rawVarName,
 									   bool isSessionSystemVar,
 									   int selectShowType,
@@ -290,6 +301,7 @@ static bool txn_used = false;
 static bool txn_explicit = false;
 static bool txn_started = false;
 static bool stmt_touched = false;
+static pg_tz *transaction_timezone = NULL;
 bool		mys_server_read_only = false;
 
 static bool
@@ -465,20 +477,26 @@ mys_transaction_active(void)
 }
 
 static void
-sync_transaction_defaults(void)
+set_transaction_defaults(const char *level, bool read_only)
 {
-	bool		read_only;
-	const char *level;
-	int			pglevel;
+	int			pglevel = pg_isolation(level, read_only);
 
-	if (sessionSystemVars == NULL)
-		return;
-	level = next_transaction(&read_only);
-	pglevel = pg_isolation(level, read_only);
 	if (DefaultXactIsoLevel != pglevel)
 		set_guc("default_transaction_isolation", pg_isolation_name(pglevel));
 	if (DefaultXactReadOnly != read_only)
 		set_guc("default_transaction_read_only", read_only ? "on" : "off");
+}
+
+static void
+sync_transaction_defaults(void)
+{
+	bool		read_only;
+	const char *level;
+
+	if (sessionSystemVars == NULL)
+		return;
+	level = next_transaction(&read_only);
+	set_transaction_defaults(level, read_only);
 }
 
 void
@@ -549,9 +567,53 @@ mys_statement_done(bool end, bool next_ddl)
 bool
 mys_server_read_only_applies(void)
 {
+	/* SET ROLE changes the outer user; a definer function does not. */
 	mys_server_read_only = global_flag("super_read_only") ||
-		(global_flag("read_only") && !superuser());
+		(global_flag("read_only") && !superuser_arg(GetOuterUserId()));
 	return mys_server_read_only;
+}
+
+void
+mys_finish_set_autocommit(bool enabled)
+{
+	SystemVar  *var = hash_search(sessionSystemVars, "autocommit", HASH_FIND, NULL);
+	const char *value = enabled ? "1" : "0";
+
+	Assert(var != NULL);
+	applySystemVarValue("autocommit", value);
+	strlcpy(var->varConfValue, value, sizeof(var->varConfValue));
+}
+
+/* MySQL session SET survives ROLLBACK, including ROLLBACK TO SAVEPOINT.
+ * PostgreSQL has already unwound the TimeZone GUC at this point. */
+void
+mys_finish_timezone_transaction(bool rollback)
+{
+	if (transaction_timezone == NULL)
+		return;
+	if (rollback && session_timezone != transaction_timezone)
+	{
+		char		value[SYSTEM_VAR_VALUE_MAX_LEN];
+
+		session_value("time_zone", value, sizeof(value));
+		applySystemVarValue("time_zone", value);
+	}
+	/* A skipped implicit COMMIT can also report CMDTAG_COMMIT. */
+	if (!IsTransactionBlock())
+		transaction_timezone = NULL;
+}
+
+/* A failed COMMIT can close the PostgreSQL transaction without reaching
+ * end_statement. The next command must be able to start a new block. */
+void
+mys_statement_failed(void)
+{
+	if (!IsTransactionBlock())
+	{
+		mys_finish_timezone_transaction(true);
+		if (txn_started)
+			mys_statement_done(true, false);
+	}
 }
 
 static bool
@@ -568,6 +630,9 @@ mys_foreign_key_checks(void)
 	SystemVar  *var;
 	bool		found;
 
+	/* Never let a caller's FOREIGN_KEY_CHECKS=0 disable RI inside SECURITY DEFINER. */
+	if (InLocalUserIdChange())
+		return true;
 	if (sessionSystemVars == NULL)
 		return true;
 	var = (SystemVar *) hash_search(sessionSystemVars, "foreign_key_checks",
@@ -581,27 +646,21 @@ mys_sync_foreign_key_checks(void)
 	/* RI trigger and TRUNCATE hooks consult the session variable directly. */
 }
 
-bool
-mys_default_autocommit(void)
-{
-	if (sessionSystemVars == NULL)
-		initSystemVariables();
-	if (global_shmem_ready())
-		return global_flag("autocommit");
-	return true;
-}
-
 /* ----------------------------------------------------------------
  *	SET [SESSION | GLOBAL] system variable implementation
  * ----------------------------------------------------------------
  */
 
-static void
-setSystemVariableValueOne(const char *rawVarName, const char *rawVarValue,
-						  bool isSessionSystemVar)
+static SystemVarChange *
+prepare_system_var(MysSetBatch *batch, const char *rawVarName,
+				   const char *rawVarValue, bool isSessionSystemVar)
 {
 	char		varName[SYSTEM_VAR_NAME_MAX_LEN];
+	char		candidate[SYSTEM_VAR_VALUE_MAX_LEN];
 	char	   *varValue;
+	SystemVar  *svar = NULL;
+	SystemVarChange *change;
+	MemoryContext old;
 
 	if (rawVarName == NULL)
 		ereport(ERROR,
@@ -637,7 +696,7 @@ setSystemVariableValueOne(const char *rawVarName, const char *rawVarValue,
 		if (varValue && (pg_strcasecmp(varValue, "OFF") == 0 ||
 						 strcmp(varValue, "0") == 0 ||
 						 pg_strcasecmp(varValue, "DEFAULT") == 0))
-			return;
+			return NULL;
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("MySQL GTID replication is unavailable; transactions have no MySQL GTID")));
@@ -655,6 +714,10 @@ setSystemVariableValueOne(const char *rawVarName, const char *rawVarValue,
 		const char *value = is_isolation_var(varName + 5) ?
 			canonical_isolation(varValue) : canonical_flag(varValue);
 
+		if (!isSessionSystemVar)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Variable '%s' is a SESSION variable", varName)));
 		if (mys_transaction_active())
 			ereport(ERROR,
 					(errcode(MYS_ERRCODE_TXN_CHARACTERISTICS),
@@ -664,11 +727,8 @@ setSystemVariableValueOne(const char *rawVarName, const char *rawVarValue,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("Variable '%s' can't be set to the value of '%s'",
 							varName + 5, varValue ? varValue : "NULL")));
-		if (is_isolation_var(varName + 5))
-			strlcpy(pending_isolation, value, sizeof(pending_isolation));
-		else
-			pending_read_only = strcmp(value, "1") == 0;
-		return;
+		strlcpy(candidate, value, sizeof(candidate));
+		goto prepared;
 	}
 
 	/*
@@ -680,7 +740,7 @@ setSystemVariableValueOne(const char *rawVarName, const char *rawVarValue,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("Variable '%s' can't be set to the value of 'NULL'", varName)));
 
-	rectifySystemVarValue(varName, &varValue, isSessionSystemVar);
+	rectifySystemVarValue(batch, varName, &varValue, isSessionSystemVar);
 
 	if (is_isolation_var(varName) || is_tx_read_only_var(varName))
 	{
@@ -695,137 +755,207 @@ setSystemVariableValueOne(const char *rawVarName, const char *rawVarValue,
 		varValue = pstrdup(value);
 	}
 
+	if (strcmp(varName, "global_system_vars_init_flag") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("Unknown system variable '%s'", varName)));
+
 	if (isSessionSystemVar)
 	{
-		SystemVar  *systemVar;
-		bool		found;
-		char		candidate[SYSTEM_VAR_VALUE_MAX_LEN];
-
-		systemVar = (SystemVar *) hash_search(sessionSystemVars,
-											  varName,
-											  HASH_FIND,
-											  &found);
-		if (!found && (systemVar = dynAddSystemVar(varName)) == NULL)
+		svar = hash_search(sessionSystemVars, varName, HASH_FIND, NULL);
+		if (!svar && (svar = dynAddSystemVar(varName)) == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("Unknown system variable '%s'", varName)));
 
-		if (systemVar->sessionGlobalType != 0 &&
-			systemVar->sessionGlobalType != 2 &&
-			systemVar->sessionGlobalType != 3)
+		if (svar->sessionGlobalType != 0 && svar->sessionGlobalType != 2 &&
+			svar->sessionGlobalType != 3)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL",
 							varName)));
-
-		if (!systemVar->isReadWrite)
+		if (!svar->isReadWrite)
 			ereport(ERROR,
 					(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
 					 errmsg("Variable '%s' is a read only variable", varName)));
-
-		/*
-		 * Validate and apply side effects against a stack copy BEFORE mutating
-		 * TopMemoryContext state so a failed SET leaves @@var untouched.
-		 */
-		strlcpy(candidate, systemVar->varConfValue, sizeof(candidate));
-		setSystemVarValueByVarName(varName, varValue, candidate);
-		applySystemVarValue(varName, varValue ? candidate : NULL);
-		strlcpy(systemVar->varConfValue, candidate, sizeof(systemVar->varConfValue));
+		strlcpy(candidate, svar->varConfValue, sizeof(candidate));
 	}
 	else
 	{
 		SystemVar	globalCopy;
-		bool		found;
-		char		candidate[SYSTEM_VAR_VALUE_MAX_LEN];
 
-		found = lookup_global_system_var(varName, &globalCopy);
-		if (!found)
-		{
-			if (dynAddSystemVar(varName) == NULL ||
-				!lookup_global_system_var(varName, &globalCopy))
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("Unknown system variable '%s'", varName)));
-		}
-
-		if (globalCopy.sessionGlobalType != 0 &&
-			globalCopy.sessionGlobalType != 1)
+		if (!lookup_global_system_var(varName, &globalCopy) &&
+			(dynAddSystemVar(varName) == NULL || !lookup_global_system_var(varName, &globalCopy)))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("Unknown system variable '%s'", varName)));
+		if (globalCopy.sessionGlobalType != 0 && globalCopy.sessionGlobalType != 1)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL",
 							varName)));
-
 		if (!globalCopy.isReadWrite)
 			ereport(ERROR,
 					(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
 					 errmsg("Variable '%s' is a read only variable", varName)));
 
-		strlcpy(candidate, globalCopy.varConfValue, sizeof(candidate));
-		setSystemVarValueByVarName(varName, varValue, candidate);
-
-		if (global_shmem_ready())
-		{
-			SystemVar  *gvar;
-			bool		gfound;
-
-			LWLockAcquire(sysvar_lwlock, LW_EXCLUSIVE);
-			gvar = (SystemVar *) hash_search(globalSystemVars, varName, HASH_FIND, &gfound);
-			if (gfound)
-				strlcpy(gvar->varConfValue, candidate, sizeof(gvar->varConfValue));
-			LWLockRelease(sysvar_lwlock);
-		}
-
 		if (globalCopy.sessionGlobalType == 1 && globalCopy.sessionDefValueFromGlobal)
-		{
-			SystemVar  *svar;
-			bool		sfound;
+			svar = hash_search(sessionSystemVars, varName, HASH_FIND, NULL);
+		strlcpy(candidate, globalCopy.varConfValue, sizeof(candidate));
+	}
+	setSystemVarValueByVarName(varName, varValue, candidate);
 
-			svar = (SystemVar *) hash_search(sessionSystemVars, varName, HASH_FIND, &sfound);
-			if (sfound)
-				strlcpy(svar->varConfValue, candidate, sizeof(svar->varConfValue));
+	if (isSessionSystemVar && strcmp(varName, "autocommit") == 0)
+	{
+		MysStmtInfo *info = mys_current_stmt_info();
+
+		if (info && info->txn_kind == MYS_TXN_SET_AUTOCOMMIT)
+		{
+			info->set_autocommit = strcmp(candidate, "1") == 0;
+			return NULL;
 		}
 	}
+
+prepared:
+	old = MemoryContextSwitchTo(batch->context);
+	change = palloc0_object(SystemVarChange);
+	change->name = pstrdup(varName);
+	change->value = pstrdup(candidate);
+	change->session_var = svar;
+	change->global = !isSessionSystemVar;
+	validateSystemVarValue(varName, candidate, &change->sql_mode, &change->week_format,
+						   isSessionSystemVar ? &change->timezone : NULL);
+	batch->system_vars = lappend(batch->system_vars, change);
+	batch->has_global |= change->global;
+	MemoryContextSwitchTo(old);
+	return change;
+}
+
+/* Run fallible GUC assignments inside the SET's transaction, after all RHSs.
+ * A later error rolls them back through PostgreSQL's normal GUC stack. */
+void
+mys_prepare_set_batch(MysSetBatch *batch)
+{
+	const char *level = NULL;
+	int			read_only = -1;
+
+	foreach_ptr(SystemVarChange, change, batch->system_vars)
+	{
+		const char *name = change->name;
+
+		if (change->global)
+			continue;
+		if (change->timezone)
+			(void) set_config_option("timezone", change->timezone, PGC_USERSET, PGC_S_SESSION,
+									 GUC_ACTION_SET, true, ERROR, false);
+
+		if (strncmp(name, "next_", 5) == 0)
+			name += 5;
+		if (is_isolation_var(name))
+			level = change->value;
+		else if (is_tx_read_only_var(name))
+			read_only = strcmp(change->value, "1") == 0;
+	}
+	if (level || read_only >= 0)
+	{
+		bool		current_ro;
+		const char *current_level = next_transaction(&current_ro);
+
+		set_transaction_defaults(level ? level : current_level,
+								 read_only >= 0 ? read_only != 0 : current_ro);
+	}
+	mys_reserve_user_vars(batch);
+}
+
+/* No validation, allocations or user code after the first value is visible. */
+void
+mys_publish_set_batch(MysSetBatch *batch)
+{
+	/* A deferred trigger could have cleared the user-variable table. */
+	mys_reserve_user_vars(batch);
+	if (batch->has_global)
+	{
+		LWLockAcquire(sysvar_lwlock, LW_EXCLUSIVE);
+		foreach_ptr(SystemVarChange, change, batch->system_vars)
+		{
+			if (change->global)
+			{
+				SystemVar  *var = hash_search(globalSystemVars, change->name, HASH_FIND, NULL);
+
+				/* Shared entries are never removed. */
+				Assert(var);
+				strlcpy(var->varConfValue, change->value, sizeof(var->varConfValue));
+			}
+		}
+		LWLockRelease(sysvar_lwlock);
+	}
+	foreach_ptr(SystemVarChange, change, batch->system_vars)
+	{
+		const char *name = change->name;
+		const char *value = change->value;
+
+		if (change->session_var)
+			strlcpy(change->session_var->varConfValue, value, SYSTEM_VAR_VALUE_MAX_LEN);
+		if (change->global)
+			continue;
+		if (is_isolation_var(name))
+			pending_isolation[0] = '\0';
+		else if (is_tx_read_only_var(name))
+			pending_read_only = -1;
+		else if (strncmp(name, "next_", 5) == 0 && is_isolation_var(name + 5))
+			strlcpy(pending_isolation, value, sizeof(pending_isolation));
+		else if (strncmp(name, "next_", 5) == 0 && is_tx_read_only_var(name + 5))
+			pending_read_only = strcmp(value, "1") == 0;
+		else if (strcmp(name, "sql_mode") == 0)
+		{
+			mys_sqlMode = change->sql_mode;
+			isStrictTransTablesOn = (mys_sqlMode & (MYS_MODE_STRICT_TRANS_TABLES |
+													MYS_MODE_STRICT_ALL_TABLES)) != 0;
+		}
+		else if (strcmp(name, "default_week_format") == 0)
+			default_week_format = change->week_format;
+		else if (change->timezone && mys_is_mysql_session())
+			transaction_timezone = IsTransactionBlock() ? session_timezone : NULL;
+		else if (strcmp(name, "autocommit") == 0)
+			applySystemVarValue(name, value);
+	}
+	mys_publish_user_vars(batch);
 }
 
 void
 setSystemVariableValue(char *varName, char *varValue, bool isSessionSystemVar)
 {
+	MysStmtInfo *info = mys_current_stmt_info();
+	MysSetBatch local = {.context = CurrentMemoryContext};
+	MysSetBatch *batch = info && info->set_batch ? info->set_batch : &local;
+	SystemVarChange *change;
 	const char *also = NULL;
-	char		normName[SYSTEM_VAR_NAME_MAX_LEN];
-	char		value[SYSTEM_VAR_VALUE_MAX_LEN];
+	const char *name;
 
-	setSystemVariableValueOne(varName, varValue, isSessionSystemVar);
-
-	strlcpy(normName, varName, sizeof(normName));
-	lowerSystemVarName(normName);
-
-	if (strncmp(normName, "next_", 5) == 0)
+	change = prepare_system_var(batch, varName, varValue, isSessionSystemVar);
+	if (change == NULL)
 		return;
-	if (isSessionSystemVar && is_isolation_var(normName))
-		pending_isolation[0] = '\0';
-	else if (isSessionSystemVar && is_tx_read_only_var(normName))
-		pending_read_only = -1;
-
-	if (isSessionSystemVar)
-		session_value(normName, value, sizeof(value));
-	else
-		global_value(normName, value, sizeof(value));
-
-	if (strcmp(normName, "transaction_isolation") == 0)
+	name = change->name;
+	if (strcmp(name, "transaction_isolation") == 0)
 		also = "tx_isolation";
-	else if (strcmp(normName, "tx_isolation") == 0)
+	else if (strcmp(name, "tx_isolation") == 0)
 		also = "transaction_isolation";
-	else if (strcmp(normName, "transaction_read_only") == 0)
+	else if (strcmp(name, "transaction_read_only") == 0)
 		also = "tx_read_only";
-	else if (strcmp(normName, "tx_read_only") == 0)
+	else if (strcmp(name, "tx_read_only") == 0)
 		also = "transaction_read_only";
-	else if (strcmp(normName, "super_read_only") == 0 && strcmp(value, "1") == 0)
+	else if (strcmp(name, "super_read_only") == 0 && strcmp(change->value, "1") == 0)
 		also = "read_only";
-	else if (strcmp(normName, "read_only") == 0 && strcmp(value, "0") == 0)
+	else if (strcmp(name, "read_only") == 0 && strcmp(change->value, "0") == 0)
 		also = "super_read_only";
-
 	if (also)
-		setSystemVariableValueOne(also, value, isSessionSystemVar);
+		prepare_system_var(batch, also, change->value, isSessionSystemVar);
+
+	if (batch == &local)
+	{
+		mys_prepare_set_batch(batch);
+		mys_publish_set_batch(batch);
+	}
 }
 
 void
@@ -905,15 +1035,28 @@ initSystemVariables(void)
 	}
 
 	/* Apply outside any LWLock: applying a value may invoke GUC routines or allocate */
-	for (int i = 0; i < baseSystemVarsNum; i++)
+	PG_TRY();
 	{
-		SystemVar  *var = (SystemVar *) hash_search(sessionSystemVars,
-													baseSystemVars[i]->varName,
-													HASH_FIND, NULL);
+		for (int i = 0; i < baseSystemVarsNum; i++)
+		{
+			SystemVar  *var = (SystemVar *) hash_search(sessionSystemVars,
+														baseSystemVars[i]->varName,
+														HASH_FIND, NULL);
 
-		if (var)
-			applySystemVarValue(var->varName, var->varConfValue);
+			if (var)
+				applySystemVarValue(var->varName, var->varConfValue);
+		}
 	}
+	PG_CATCH();
+	{
+		if (sessionSystemVars != NULL)
+		{
+			hash_destroy(sessionSystemVars);
+			sessionSystemVars = NULL;
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 static bool
@@ -1154,7 +1297,7 @@ initGlobalSystemVarsLocked(SystemVar *systemVars[], int systemVarsNum)
 	SystemVar  *globalSystemVar;
 	bool		found;
 
-	if (!global_shmem_ready())
+	if (!global_shmem_ready() || systemVarsNum <= 0)
 		return;
 
 	globalSystemVar = (SystemVar *) hash_search(globalSystemVars,
@@ -1225,6 +1368,7 @@ resetSessionSystemVariables(void)
 	SystemVar  *entry;
 
 	pending_isolation[0] = '\0';
+	transaction_timezone = NULL;
 	pending_read_only = -1;
 	pending_armed = txn_used = txn_explicit = txn_started = stmt_touched = false;
 	mys_server_read_only = false;
@@ -1247,7 +1391,6 @@ resetSessionSystemVariables(void)
 
 		applySystemVarValue(entry->varName, entry->varConfValue);
 	}
-	needCommitTrx = needStartNewTrx = false;
 }
 
 static SystemVar *
@@ -1577,7 +1720,7 @@ setSystemVarValue(const char *value, char *varValue)
 }
 
 static void
-rectifySystemVarValue(const char *varName, char **varValue,
+rectifySystemVarValue(MysSetBatch *batch, const char *varName, char **varValue,
 					  bool isSessionSystemVar)
 {
 	SystemVar  *systemVar;
@@ -1589,7 +1732,7 @@ rectifySystemVarValue(const char *varName, char **varValue,
 
 	if (strcmp(*varValue, "halo_mysql_system_var_default") == 0)
 	{
-		getDefaultValue(varName, isSessionSystemVar, varValue);
+		getDefaultValue(batch, varName, isSessionSystemVar, varValue);
 		return;
 	}
 
@@ -1656,7 +1799,7 @@ rectifySystemVarValue(const char *varName, char **varValue,
 }
 
 static void
-getDefaultValue(const char *varName, bool isSessionSystemVar,
+getDefaultValue(MysSetBatch *batch, const char *varName, bool isSessionSystemVar,
 				char **varValue)
 {
 	bool		sessionDefValueFromGlobal = false;
@@ -1686,6 +1829,17 @@ getDefaultValue(const char *varName, bool isSessionSystemVar,
 	{
 		SystemVar	globalCopy;
 
+		/* DEFAULT inherits an earlier GLOBAL assignment in the same SET. */
+		for (int i = list_length(batch->system_vars) - 1; i >= 0; i--)
+		{
+			SystemVarChange *change = list_nth(batch->system_vars, i);
+
+			if (change->global && strcmp(change->name, varName) == 0)
+			{
+				*varValue = pstrdup(change->value);
+				return;
+			}
+		}
 		if (lookup_global_system_var(varName, &globalCopy))
 		{
 			*varValue = pstrdup(globalCopy.varConfValue);
@@ -1715,6 +1869,8 @@ getDefaultValue(const char *varName, bool isSessionSystemVar,
 static char *
 resolveMysqlTimeZoneForPG(const char *tzVal)
 {
+	pg_tz	   *tz;
+
 	if (tzVal == NULL || tzVal[0] == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1781,7 +1937,8 @@ resolveMysqlTimeZoneForPG(const char *tzVal)
 		return psprintf("INTERVAL '%c%02d:%02d'", sign, hh, mm);
 	}
 
-	if (pg_tzset(tzVal) == NULL)
+	tz = pg_tzset(tzVal);
+	if (tz == NULL || !pg_tz_acceptable(tz))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("Unknown or incorrect time zone: '%s'", tzVal)));
@@ -1790,38 +1947,20 @@ resolveMysqlTimeZoneForPG(const char *tzVal)
 }
 
 static void
-applySystemVarValue(const char *varName, const char *varValue)
+validateSystemVarValue(const char *varName, const char *varValue,
+					   uint64 *sqlModeOut, int *weekFormatOut, char **timezoneOut)
 {
 	if (varValue == NULL)
 		return;
 
-	if (strcmp(varName, "autocommit") == 0)
-	{
-		if (pg_strcasecmp(varValue, "1") == 0 ||
-			pg_strcasecmp(varValue, "on") == 0)
-		{
-			if (autoCommit == 0)
-				needCommitTrx = true;
-			needStartNewTrx = false;
-			autoCommit = 2;
-		}
-		else
-		{
-			needStartNewTrx = (autoCommit != 0);
-			autoCommit = 0;
-		}
-	}
-	else if (strcmp(varName, "foreign_key_checks") == 0)
-		mys_sync_foreign_key_checks();
-	else if (is_isolation_var(varName) || is_tx_read_only_var(varName))
-		sync_transaction_defaults();
-	else if (strcmp(varName, "time_zone") == 0)
+	if (strcmp(varName, "time_zone") == 0)
 	{
 		char	   *pgTz = resolveMysqlTimeZoneForPG(varValue);
 
-		(void) set_config_option("timezone", pgTz, PGC_USERSET, PGC_S_SESSION,
-								 GUC_ACTION_SET, true, ERROR, false);
-		pfree(pgTz);
+		if (timezoneOut)
+			*timezoneOut = pgTz;
+		else
+			pfree(pgTz);
 	}
 	else if (strcmp(varName, "sql_mode") == 0)
 	{
@@ -1911,9 +2050,8 @@ applySystemVarValue(const char *varName, const char *varValue)
 		pfree(rawValue);
 		list_free(valueList);
 
-		isStrictTransTablesOn = (tempSqlMode & (MYS_MODE_STRICT_TRANS_TABLES |
-												MYS_MODE_STRICT_ALL_TABLES)) != 0;
-		mys_sqlMode = tempSqlMode;
+		if (sqlModeOut)
+			*sqlModeOut = tempSqlMode;
 	}
 	else if (strcmp(varName, "default_week_format") == 0)
 	{
@@ -1928,7 +2066,46 @@ applySystemVarValue(const char *varName, const char *varValue)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("incorrect default_week_format value: %s", varValue)));
 
-		default_week_format = (int) value;
+		if (weekFormatOut)
+			*weekFormatOut = (int) value;
+	}
+}
+
+static void
+applySystemVarValue(const char *varName, const char *varValue)
+{
+	if (varValue == NULL)
+		return;
+
+	if (strcmp(varName, "autocommit") == 0)
+		autoCommit = (strcmp(varValue, "1") == 0 || pg_strcasecmp(varValue, "on") == 0) ? 2 : 0;
+	else if (strcmp(varName, "foreign_key_checks") == 0)
+		mys_sync_foreign_key_checks();
+	else if (is_isolation_var(varName) || is_tx_read_only_var(varName))
+		sync_transaction_defaults();
+	else if (strcmp(varName, "time_zone") == 0)
+	{
+		char	   *pgTz = resolveMysqlTimeZoneForPG(varValue);
+
+		(void) set_config_option("timezone", pgTz, PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SET, true, ERROR, false);
+		pfree(pgTz);
+	}
+	else if (strcmp(varName, "sql_mode") == 0)
+	{
+		uint64		tempSqlMode = 0;
+
+		validateSystemVarValue(varName, varValue, &tempSqlMode, NULL, NULL);
+		isStrictTransTablesOn = (tempSqlMode & (MYS_MODE_STRICT_TRANS_TABLES |
+												MYS_MODE_STRICT_ALL_TABLES)) != 0;
+		mys_sqlMode = tempSqlMode;
+	}
+	else if (strcmp(varName, "default_week_format") == 0)
+	{
+		int			weekFmt = 0;
+
+		validateSystemVarValue(varName, varValue, NULL, &weekFmt, NULL);
+		default_week_format = weekFmt;
 	}
 }
 
@@ -1953,6 +2130,12 @@ getSystemVariableValueImpl(const char *rawVarName,
 
 	strlcpy(varName, rawVarName, sizeof(varName));
 	lowerSystemVarName(varName);
+
+	if (strcmp(varName, "global_system_vars_init_flag") == 0)
+	{
+		*varValue = NULL;
+		return 1;
+	}
 
 	if (isSessionSystemVar)
 	{

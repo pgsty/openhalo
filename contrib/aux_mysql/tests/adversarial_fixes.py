@@ -760,7 +760,14 @@ def test_extension_upgrade_parity(pg, pgbin):
                     SELECT p.oid::regprocedure::text, coalesce(p.proacl::text, '')
                     FROM pg_proc p WHERE proname IN ('pg_read_file', 'pg_read_binary_file') ORDER BY 1
                 """)
-                return p, r, acl
+                casts = query(c, """
+                    SELECT castsource, casttarget, castcontext
+                    FROM pg_cast
+                    WHERE (castsource = 23 AND casttarget = 16)
+                       OR (castsource = 16 AND casttarget = 23)
+                    ORDER BY 1, 2
+                """)
+                return p, r, acl, casts
 
             assert snap(cup) == snap(cfr), 'catalog/ACL mismatch after 1.9 -> 2.0 update!'
         finally:

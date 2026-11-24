@@ -232,6 +232,54 @@ pending_keys(Oid relid)
 	return parse_label(guard_metadata(relid, &trigger));
 }
 
+/*
+ * Read pending FK metadata directly from pg_trigger without taking a relation
+ * lock on relid.  Used during DDL scans so an unrelated table locked by
+ * another session does not block DDL across the database.
+ */
+static List *
+pending_keys_catalog(Oid relid)
+{
+	Oid func = guard_function(true);
+	Relation triggers;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple tup;
+	char *data = NULL;
+
+	if (!OidIsValid(func))
+		return NIL;
+	triggers = table_open(TriggerRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_trigger_tgrelid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	scan = systable_beginscan(triggers, TriggerRelidNameIndexId, true, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_trigger row = (Form_pg_trigger) GETSTRUCT(tup);
+		Datum d;
+		bool isnull;
+
+		if (row->tgfoid != func || row->tgparentid != InvalidOid)
+			continue;
+		if (data != NULL || row->tgnargs != 1)
+		{
+			systable_endscan(scan);
+			table_close(triggers, AccessShareLock);
+			fk_error("expected one metadata-bearing guard");
+		}
+		d = heap_getattr(tup, Anum_pg_trigger_tgargs, RelationGetDescr(triggers), &isnull);
+		if (!isnull)
+		{
+			bytea *b = DatumGetByteaPP(d);
+
+			data = pnstrdup(VARDATA_ANY(b), strnlen(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b)));
+		}
+	}
+	systable_endscan(scan);
+	table_close(triggers, AccessShareLock);
+	return parse_label(data);
+}
+
 static void
 store_metadata(Oid relid, const char *data)
 {
@@ -1017,13 +1065,19 @@ mys_fk_before_utility(PlannedStmt **pstmt)
 			if (list_length(s->args) != 1 || !s->row || s->timing != TRIGGER_TYPE_AFTER ||
 				s->events != (TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE) || s->whenClause || s->columns)
 				fk_error("guard must check every inserted/updated row");
-			/* Validate the declaration now; binding below checks its owner's
-			 * current ACLs, not the identity of the restoring connection. */
+			/* Validate the declaration now; attaching a pending-FK guard is
+			 * equivalent to ALTER TABLE ADD CONSTRAINT and requires table ownership. */
 			(void) parse_label(strVal(linitial(s->args)));
-			relid = RangeVarGetRelid(s->relation, AccessShareLock, false);
-			if (pg_class_aclcheck(relid, GetUserId(), ACL_TRIGGER) != ACLCHECK_OK)
-				aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, s->relation->relname);
-			state->target = RangeVarGetRelid(s->relation, AccessExclusiveLock, false);
+			relid = RangeVarGetRelidExtended(s->relation, AccessExclusiveLock, 0,
+											 RangeVarCallbackOwnsRelation, NULL);
+			{
+				Oid existing_trig = InvalidOid;
+
+				(void) guard_metadata(relid, &existing_trig);
+				if (OidIsValid(existing_trig))
+					fk_error("table already has a pending foreign key guard");
+			}
+			state->target = relid;
 		}
 		else state->rebind = false;
 	}
@@ -1076,7 +1130,7 @@ rename_pending(MysFKUtility *state)
 				object_aclcheck(NamespaceRelationId, target_nsp, owner, ACL_USAGE) != ACLCHECK_OK)
 				continue;
 		}
-		keys = pending_keys(child);
+		keys = pending_keys_catalog(child);
 		foreach_node(Constraint, c, keys)
 		{
 			bool parent = strcmp(c->pktable->schemaname, state->old_schema) == 0 &&
@@ -1137,8 +1191,22 @@ mys_fk_after_utility(MysFKUtility *state)
 		rename_pending(state);
 	foreach_oid(child, pending_tables(false))
 	{
-		List *keys = pending_keys(child), *remaining = NIL;
+		List *keys = pending_keys_catalog(child), *remaining = NIL;
 		bool touched = false;
+		bool relevant = false;
+
+		foreach_node(Constraint, c, keys)
+		{
+			Oid parent = parent_oid(c);
+
+			if (OidIsValid(parent) && (parent == state->target || child == state->target || state->new_schema))
+			{
+				relevant = true;
+				break;
+			}
+		}
+		if (!relevant)
+			continue;
 
 		foreach_node(Constraint, c, keys)
 		{

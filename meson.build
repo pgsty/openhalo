@@ -978,12 +978,11 @@ if not icuopt.disabled()
   if icu.found()
     cdata.set('USE_ICU', 1)
   else
-    icu_i18n = not_found_dep
+    error('OpenHalo requires ICU support (-Dicu=enabled)')
   endif
 
 else
-  icu = not_found_dep
-  icu_i18n = not_found_dep
+  error('OpenHalo requires ICU support; do not disable -Dicu')
 endif
 
 

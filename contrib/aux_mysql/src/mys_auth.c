@@ -65,9 +65,14 @@ typedef struct MysAuthCacheEntry
 	uint8		verifier[SHA2_LEN]; /* SHA256(pg_authid.rolpassword) */
 } MysAuthCacheEntry;
 
+typedef struct MysAuthShmemCtl
+{
+	uint32		evict_cursor;
+} MysAuthShmemCtl;
+
 static HTAB *auth_cache = NULL;
 static LWLock *auth_cache_lock = NULL;
-static uint32 auth_evict_cursor = 0;
+static MysAuthShmemCtl *auth_ctl = NULL;
 
 #define AUTH_CACHE_TRANCHE "aux_mysql auth cache"
 
@@ -114,7 +119,8 @@ mys_auth_shmem_size(void)
 {
 	if (halo_mysql_auth_cache_size <= 0)
 		return 0;
-	return hash_estimate_size(halo_mysql_auth_cache_size, sizeof(MysAuthCacheEntry));
+	return add_size(MAXALIGN(sizeof(MysAuthShmemCtl)),
+					hash_estimate_size(halo_mysql_auth_cache_size, sizeof(MysAuthCacheEntry)));
 }
 
 void
@@ -129,11 +135,17 @@ void
 mys_auth_shmem_startup(void)
 {
 	HASHCTL		info;
+	bool		found;
 
 	if (halo_mysql_auth_cache_size <= 0)
 		return;
 
 	auth_cache_lock = &(GetNamedLWLockTranche(AUTH_CACHE_TRANCHE))->lock;
+	auth_ctl = (MysAuthShmemCtl *) ShmemInitStruct("aux_mysql auth ctl",
+												   sizeof(MysAuthShmemCtl),
+												   &found);
+	if (!found)
+		auth_ctl->evict_cursor = 0;
 	info.keysize = NAMEDATALEN;
 	info.entrysize = sizeof(MysAuthCacheEntry);
 	auth_cache = ShmemInitHash("aux_mysql auth cache",
@@ -232,7 +244,7 @@ mys_sha2_cache_store(const char *user, const char *shadow_pass, const char *pass
 		HASH_SEQ_STATUS seq;
 		MysAuthCacheEntry *victim = NULL;
 		long		entries = hash_get_num_entries(auth_cache);
-		long		target = entries > 0 ? (long) (auth_evict_cursor++ % (uint32) entries) : 0;
+		long		target = entries > 0 ? (long) (auth_ctl->evict_cursor++ % (uint32) entries) : 0;
 		long		step = 0;
 
 		hash_seq_init(&seq, auth_cache);
@@ -305,6 +317,52 @@ ssl_errmsg(void)
 	return buf;
 }
 
+static int
+no_passphrase_cb(char *buf, int size, int rwflag, void *u)
+{
+	return 0;
+}
+
+/* Validate the same open file from which the PEM will be read. */
+static EVP_PKEY *
+read_key(FILE *fp, const char *path)
+{
+	struct stat st;
+	EVP_PKEY   *key;
+
+	if (fstat(fileno(fp), &st) != 0 || !S_ISREG(st.st_mode))
+	{
+		FreeFile(fp);
+		ereport(WARNING,
+				(errmsg("aux_mysql: RSA private key file \"%s\" is not a regular file", path)));
+		return NULL;
+	}
+#ifndef WIN32
+	if (st.st_uid != geteuid() && st.st_uid != 0)
+	{
+		FreeFile(fp);
+		ereport(WARNING,
+				(errmsg("aux_mysql: RSA private key file \"%s\" must be owned by the database user or root", path)));
+		return NULL;
+	}
+	if ((st.st_mode & (S_IRWXG | S_IRWXO)) != 0)
+	{
+		FreeFile(fp);
+		ereport(WARNING,
+				(errmsg("aux_mysql: RSA private key file \"%s\" has group or world access; permissions should be u=rw (0600) or less", path)));
+		return NULL;
+	}
+#endif
+	ERR_clear_error();
+	key = PEM_read_PrivateKey(fp, NULL, no_passphrase_cb, NULL);
+	FreeFile(fp);
+	if (key == NULL)
+		ereport(WARNING,
+				(errmsg("aux_mysql: could not load RSA private key \"%s\": %s",
+						path, ssl_errmsg())));
+	return key;
+}
+
 static EVP_PKEY *
 generate_key(const char *path)
 {
@@ -374,25 +432,17 @@ generate_key(const char *path)
 		FILE	   *other;
 
 		(void) unlink(tmppath);
+		EVP_PKEY_free(key);
 		other = AllocateFile(path, "r");
 		if (other != NULL)
+			key = read_key(other, path);
+		else
 		{
-			EVP_PKEY   *existing;
-
-			ERR_clear_error();
-			existing = PEM_read_PrivateKey(other, NULL, NULL, NULL);
-			FreeFile(other);
-			if (existing != NULL)
-			{
-				EVP_PKEY_free(key);
-				key = existing;
-			}
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("aux_mysql: could not open RSA private key file \"%s\": %m", path)));
+			key = NULL;
 		}
-	}
-	else if (rename(tmppath, path) == 0)
-	{
-		ereport(LOG,
-				(errmsg("aux_mysql: generated RSA key pair \"%s\" for caching_sha2_password", path)));
 	}
 	else
 	{
@@ -420,18 +470,7 @@ load_key(void)
 
 	fp = AllocateFile(path, "r");
 	if (fp != NULL)
-	{
-		ERR_clear_error();
-		rsa_key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
-		FreeFile(fp);
-		if (rsa_key == NULL)
-		{
-			ereport(WARNING,
-					(errmsg("aux_mysql: could not load RSA private key \"%s\": %s",
-							path, ssl_errmsg())));
-			return;
-		}
-	}
+		rsa_key = read_key(fp, path);
 	else if (errno == ENOENT && !IsUnderPostmaster)
 		rsa_key = generate_key(path);
 	else

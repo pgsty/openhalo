@@ -139,6 +139,7 @@ const uint16 MysScanKeywordTokens[] = {
 #define POP_YYLLOC()	(*(yylloc) = yyextra->save_yylloc)
 
 #define startlit()	( yyextra->literallen = 0 )
+static const char *token_source(const char *token, core_yyscan_t yyscanner);
 static void addlit(char *ytext, int yleng, core_yyscan_t yyscanner);
 static void addlitchar(unsigned char ychar, core_yyscan_t yyscanner);
 static char *litbufdup(core_yyscan_t yyscanner);
@@ -714,7 +715,7 @@ other			.
                             }
                             else
                             {
-                                if (yyextra->saw_non_ascii)
+								if (yyextra->saw_non_ascii && !MYS_YYEXTRA(yyextra)->normalizing)
                                     pg_verifymbstr(yyextra->literalbuf,
                                                 yyextra->literallen,
                                                 false);
@@ -747,21 +748,23 @@ other			.
 									 errhint("Use '' to write quotes in strings. \\' is insecure in client-only encodings."),
 									 lexer_errposition()));
 					}
-                    if(yytext[1] == '0')
-                        yytext[1] = '\0';
-					if (yytext[1] == '%' || yytext[1] == '_')
-					{
-						/*
-						 * MySQL keeps the backslash of \% and \_: they stand
-						 * for a literal % and _ in a LIKE pattern, and are
-						 * the two characters \% and \_ anywhere else.
-						 */
-						addlitchar('\\', yyscanner);
-						addlitchar(yytext[1], yyscanner);
-					}
-					else
-						addlitchar(unescape_single_char(yytext[1], yyscanner),
-								   yyscanner);
+                    {
+                        char        esc = (yytext[1] == '0') ? '\0' : yytext[1];
+
+                        if (esc == '%' || esc == '_')
+                        {
+                            /*
+                             * MySQL keeps the backslash of \% and \_: they stand
+                             * for a literal % and _ in a LIKE pattern, and are
+                             * the two characters \% and \_ anywhere else.
+                             */
+                            addlitchar('\\', yyscanner);
+                            addlitchar(esc, yyscanner);
+                        }
+                        else
+                            addlitchar(unescape_single_char(esc, yyscanner),
+                                       yyscanner);
+                    }
 				}
 <xe>.			{
 					/* This is only needed for \ just before EOF */
@@ -834,7 +837,7 @@ other			.
                             }
                             else
                             {
-                                if (yyextra->saw_non_ascii)
+								if (yyextra->saw_non_ascii && !MYS_YYEXTRA(yyextra)->normalizing)
                                     pg_verifymbstr(yyextra->literalbuf,
                                                 yyextra->literallen,
                                                 false);
@@ -867,21 +870,23 @@ other			.
 									 errhint("Use \"\" to write double quotes in strings. \\\" is insecure in client-only encodings."),
 									 lexer_errposition()));
 					}
-                    if(yytext[1] == '0')
-                        yytext[1] = '\0';
-					if (yytext[1] == '%' || yytext[1] == '_')
-					{
-						/*
-						 * MySQL keeps the backslash of \% and \_: they stand
-						 * for a literal % and _ in a LIKE pattern, and are
-						 * the two characters \% and \_ anywhere else.
-						 */
-						addlitchar('\\', yyscanner);
-						addlitchar(yytext[1], yyscanner);
-					}
-					else
-						addlitchar(unescape_single_char(yytext[1], yyscanner),
-								   yyscanner);
+                    {
+                        char        esc = (yytext[1] == '0') ? '\0' : yytext[1];
+
+                        if (esc == '%' || esc == '_')
+                        {
+                            /*
+                             * MySQL keeps the backslash of \% and \_: they stand
+                             * for a literal % and _ in a LIKE pattern, and are
+                             * the two characters \% and \_ anywhere else.
+                             */
+                            addlitchar('\\', yyscanner);
+                            addlitchar(esc, yyscanner);
+                        }
+                        else
+                            addlitchar(unescape_single_char(esc, yyscanner),
+                                       yyscanner);
+                    }
 				}
 <xde>.			{
 					/* This is only needed for \ just before EOF */
@@ -891,7 +896,7 @@ other			.
 
 {dolqdelim}		{
 					SET_YYLLOC();
-					yyextra->dolqstart = pstrdup(yytext);
+					yyextra->dolqstart = pnstrdup(token_source(yytext, yyscanner), yyleng);
 					BEGIN(xdolq);
 					startlit();
 				}
@@ -903,7 +908,8 @@ other			.
 					return yytext[0];
 				}
 <xdolq>{dolqdelim} {
-					if (strcmp(yytext, yyextra->dolqstart) == 0)
+					if (strncmp(token_source(yytext, yyscanner), yyextra->dolqstart, yyleng) == 0 &&
+						yyextra->dolqstart[yyleng] == '\0')
 					{
 						pfree(yyextra->dolqstart);
 						yyextra->dolqstart = NULL;
@@ -945,7 +951,8 @@ other			.
 					BEGIN(INITIAL);
 					if (yyextra->literallen == 0)
 						yyerror("zero-length delimited identifier");
-					pg_verifymbstr(yyextra->literalbuf, yyextra->literallen, false);
+					if (!MYS_YYEXTRA(yyextra)->normalizing)
+						pg_verifymbstr(yyextra->literalbuf, yyextra->literallen, false);
                     ident = downcase_truncate_identifier(yyextra->literalbuf, yyextra->literallen, true);
 					yylval->str = ident;
 					return IDENT;
@@ -1181,7 +1188,7 @@ other			.
                         }
                         else if (strcmp(yytext, "||") == 0)
                         {
-                            if ((yytext - 1)[0] != '.')
+                            if (yytext == yyextra->scanbuf || yytext[-1] != '.')
                             {
                                 return Op_Or;
                             }
@@ -1223,6 +1230,7 @@ other			.
             }
 
 {MysSysVar_fail}    {
+						SET_YYLLOC();
 						yyerror("incomplete system variable");
                     }
 
@@ -1435,7 +1443,12 @@ mys_cancel_scanner_errposition_callback(ScannerCallbackState *scbstate)
 void
 mys_scanner_yyerror(const char *message, core_yyscan_t yyscanner)
 {
-	const char *loc = yyextra->scanbuf + *yylloc;
+	int			off = *yylloc;
+	const char *loc;
+
+	if (off < 0 || off > yyextra->scanbuflen)
+		off = yyextra->scanbuflen;
+	loc = yyextra->scanbuf + off;
 
 	if (*loc == YY_END_OF_BUFFER_CHAR)
 	{
@@ -1492,6 +1505,7 @@ mys_scanner_init_len(const char *str,
 	yyext->backslash_quote = backslash_quote;
     MYS_YYEXTRA(yyext)->saw_underscore_binary = false;
 	MYS_YYEXTRA(yyext)->normalizing = false;
+	MYS_YYEXTRA(yyext)->wire_source = NULL;
 	MYS_YYEXTRA(yyext)->in_exec_comment = false;
 	MYS_YYEXTRA(yyext)->xc_version_skip = false;
 
@@ -1536,6 +1550,15 @@ mys_scanner_finish(core_yyscan_t yyscanner)
 }
 
 
+/* Masking client-only encodings changes lexer bytes but never token offsets. */
+static inline const char *
+token_source(const char *token, core_yyscan_t yyscanner)
+{
+	const char *original = MYS_YYEXTRA(yyextra)->wire_source;
+
+	return original ? original + (token - yyextra->scanbuf) : token;
+}
+
 static void
 addlit(char *ytext, int yleng, core_yyscan_t yyscanner)
 {
@@ -1556,8 +1579,7 @@ addlit(char *ytext, int yleng, core_yyscan_t yyscanner)
 		yyextra->literalbuf = (char *) repalloc(yyextra->literalbuf,
 												yyextra->literalalloc);
 	}
-	/* append new data */
-	memcpy(yyextra->literalbuf + yyextra->literallen, ytext, yleng);
+	memcpy(yyextra->literalbuf + yyextra->literallen, token_source(ytext, yyscanner), yleng);
 	yyextra->literallen += yleng;
 }
 
@@ -1606,7 +1628,7 @@ literal_needs_binary(core_yyscan_t yyscanner)
 	if (!MYS_YYEXTRA(yyextra)->normalizing)
 		return false;
 	return memchr(yyextra->literalbuf, '\0', yyextra->literallen) != NULL ||
-		!pg_verify_mbstr(GetDatabaseEncoding(), yyextra->literalbuf,
+		!pg_verify_mbstr(MYS_YYEXTRA(yyextra)->literal_encoding, yyextra->literalbuf,
 						 yyextra->literallen, true);
 }
 

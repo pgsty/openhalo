@@ -16,11 +16,13 @@
 #include "postgres.h"
 #include "fmgr.h"
 
+struct MysSetBatch;
+
 extern void clearUserVars(void);
 extern bool varValueIsDigit(Datum varValue, Oid varValueType);
 extern void mysSetUserVarBytes(const char *userVarName, const char *bytes,
 							   size_t byteLen, bool isDigit, bool isNull);
-extern void mysSetUserVarDatum(const char *userVarName, Datum datumValue,
+extern void mysSetUserVarDatum(struct MysSetBatch *batch, const char *userVarName, Datum datumValue,
 							   Oid varValueType, FmgrInfo *foutcache, bool isNull);
 extern void mysSetUserVarInternal(char *userVarName, char *userVarValue,
 								  Oid varValueType, bool isDigit, bool isNull);

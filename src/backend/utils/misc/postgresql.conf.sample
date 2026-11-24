@@ -943,6 +943,7 @@ shared_preload_libraries = 'aux_mysql'  # OpenHalo: MySQL compatibility
 #mysql.listener_on = true               # enable MySQL listener
                                         # (change requires restart)
 #mysql.port = 3306                       # (change requires restart)
+#mysql.max_allowed_packet = 67108864     # incoming packet / long-data byte limit
 #mysql.halo_mysql_version = '5.7.32-log' # version reported to MySQL clients
 #mysql.listen_addresses = ''            # empty: same as listen_addresses
                                         # (change requires restart)

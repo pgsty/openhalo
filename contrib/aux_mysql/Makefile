@@ -87,14 +87,19 @@ src/parser/mys_kwlist_d.h: src/parser/mys_kwlist.h tools/gen_keywordlist.pl tool
 	@$(MKDIR_P) src/parser
 	$(PERL) -I $(srcdir)/tools $(srcdir)/tools/gen_keywordlist.pl --extern --varname=MysScanKeywords --output src/parser $<
 
-src/mysql_parser.o src/mys_stmt.o src/parser/mys_gram.o src/parser/mys_scan.o src/parser/mys_parser.o src/parser/mys_keywords.o: \
+PARSER_OBJS = src/mysql_parser.o src/mys_stmt.o src/parser/mys_gram.o \
+	src/parser/mys_scan.o src/parser/mys_parser.o src/parser/mys_keywords.o
+
+$(PARSER_OBJS) $(PARSER_OBJS:.o=.bc): \
 	src/parser/mys_gram.h src/parser/mys_kwlist_d.h
 
 # PGXS tracks header dependencies only with --enable-depend: the shared
 # structs (MysStmtInfo, mys_yy_extra_type, ...) must not get out of sync between objects.
-$(OBJS): src/halo_mysql.h src/mys_proto.h src/mys_binary.h src/parser/mys_gramparse.h
-src/mys_prefix.o src/mys_rewrite.o src/mys_binary.o src/halo_mysql.o: src/mys_prefix.h
-src/mys_prefix.o: src/mys_general_ci_weights.h
-src/mys_fk.o src/mys_utility.o: src/mys_fk.h
-src/mys_current_read.o src/mys_utility.o: src/mys_current_read.h
+$(OBJS) $(OBJS:.o=.bc): src/halo_mysql.h src/mys_proto.h src/mys_binary.h src/parser/mys_gramparse.h
+src/mys_prefix.o src/mys_rewrite.o src/mys_binary.o src/halo_mysql.o \
+src/mys_prefix.bc src/mys_rewrite.bc src/mys_binary.bc src/halo_mysql.bc: src/mys_prefix.h
+src/mys_prefix.o src/mys_prefix.bc: src/mys_general_ci_weights.h
+src/mys_utility.o src/mys_utility.bc: src/mys_generated_policy.h
+src/mys_fk.o src/mys_utility.o src/mys_fk.bc src/mys_utility.bc: src/mys_fk.h
+src/mys_current_read.o src/mys_utility.o src/mys_current_read.bc src/mys_utility.bc: src/mys_current_read.h
 src/halo_mysql.o src/mysm/sysvar_core.o src/halo_mysql.bc src/mysm/sysvar_core.bc: src/openhalo_version.h

@@ -36,6 +36,17 @@ typedef struct MysqlUserVariableItem
 	bool		isnull;
 } MysqlUserVariableItem;
 
+typedef struct PendingUserVar
+{
+	MemoryContextCallback cleanup;
+	char		key[MYS_USERVAR_KEYSIZE];
+	bytea	   *value;
+	bool		is_digit;
+	bool		created;
+	MysqlUserVariableItem *entry;
+	uint64		generation;
+} PendingUserVar;
+
 /*
  * Track bytea* values returned by mysGetUserVarValueInternal() whose stored
  * variable has isDigit = true, using a memory-context reset callback rather
@@ -50,6 +61,7 @@ typedef struct DigitByteaTag
 } DigitByteaTag;
 
 static HTAB *mysql_user_variables = NULL;
+static uint64 user_var_generation = 1;
 static DigitByteaTag *digit_bytea_head = NULL;
 
 static void
@@ -156,6 +168,7 @@ clearUserVars(void)
 			entry->varValue = NULL;
 		}
 	}
+	user_var_generation++;
 	hash_destroy(mysql_user_variables);
 	mysql_user_variables = NULL;
 }
@@ -187,19 +200,99 @@ varValueIsDigit(Datum varValue, Oid varValueType)
 	return (ncategory == TYPCATEGORY_NUMERIC);
 }
 
-void
-mysSetUserVarBytes(const char *userVarName, const char *bytes,
-				   size_t byteLen, bool isDigit, bool isNull)
+static MysqlUserVariableItem *
+reserve_user_var(const char *key, bool *created)
 {
-	char		key[MYS_USERVAR_KEYSIZE];
 	MysqlUserVariableItem *entry;
 	bool		found;
-	bytea	   *newVal = NULL;
-
-	normalize_uservar_key(userVarName, key);
 
 	if (!mysql_user_variables)
 		initMysqlUserVariableHashTable();
+	entry = hash_search(mysql_user_variables, key, HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->varValue = NULL;
+		entry->isnull = true;
+		entry->isDigit = false;
+	}
+	*created = !found;
+	return entry;
+}
+
+static void
+assign_user_var(MysqlUserVariableItem *entry, bytea *value, bool is_digit)
+{
+	if (entry->varValue)
+		pfree(entry->varValue);
+	entry->varValue = value;
+	entry->isnull = value == NULL;
+	entry->isDigit = value != NULL && is_digit;
+}
+
+static void
+discard_pending_user_var(void *arg)
+{
+	PendingUserVar *var = arg;
+
+	if (var->value)
+		pfree(var->value);
+	if (var->created && var->generation == user_var_generation && var->entry->isnull)
+		hash_search(mysql_user_variables, var->key, HASH_REMOVE, NULL);
+}
+
+void
+mys_reserve_user_vars(MysSetBatch *batch)
+{
+	foreach_ptr(PendingUserVar, var, batch->user_vars)
+	{
+		if (var->generation != user_var_generation)
+		{
+			var->entry = reserve_user_var(var->key, &var->created);
+			var->generation = user_var_generation;
+		}
+	}
+}
+
+void
+mys_publish_user_vars(MysSetBatch *batch)
+{
+	foreach_ptr(PendingUserVar, var, batch->user_vars)
+	{
+		assign_user_var(var->entry, var->value, var->is_digit);
+		var->value = NULL;
+		var->created = false;
+	}
+}
+
+static void
+set_user_var_bytes(MysSetBatch *batch, const char *userVarName, const char *bytes,
+				   size_t byteLen, bool isDigit, bool isNull)
+{
+	char		key[MYS_USERVAR_KEYSIZE];
+	PendingUserVar *pending = NULL;
+	MysqlUserVariableItem *entry = NULL;
+	bytea	   *newVal = NULL;
+
+	normalize_uservar_key(userVarName, key);
+	if (batch)
+	{
+		MemoryContext old = MemoryContextSwitchTo(batch->context);
+
+		pending = palloc0_object(PendingUserVar);
+		strlcpy(pending->key, key, sizeof(pending->key));
+		pending->is_digit = isDigit;
+		pending->cleanup.func = discard_pending_user_var;
+		pending->cleanup.arg = pending;
+		MemoryContextRegisterResetCallback(batch->context, &pending->cleanup);
+		batch->user_vars = lappend(batch->user_vars, pending);
+		MemoryContextSwitchTo(old);
+	}
+	else
+	{
+		bool		created;
+
+		entry = reserve_user_var(key, &created);
+	}
 
 	if (!isNull)
 	{
@@ -208,29 +301,17 @@ mysSetUserVarBytes(const char *userVarName, const char *bytes,
 		if (byteLen > 0)
 			memcpy(VARDATA(newVal), bytes, byteLen);
 	}
-
-	entry = (MysqlUserVariableItem *) hash_search(mysql_user_variables,
-												  key,
-												  HASH_ENTER,
-												  &found);
-	if (found && !entry->isnull && entry->varValue != NULL)
-	{
-		pfree(entry->varValue);
-		entry->varValue = NULL;
-	}
-
-	if (!isNull)
-	{
-		entry->varValue = newVal;
-		entry->isDigit = isDigit;
-		entry->isnull = false;
-	}
+	if (pending)
+		pending->value = newVal;
 	else
-	{
-		entry->varValue = NULL;
-		entry->isDigit = false;
-		entry->isnull = true;
-	}
+		assign_user_var(entry, newVal, isDigit);
+}
+
+void
+mysSetUserVarBytes(const char *userVarName, const char *bytes,
+				   size_t byteLen, bool isDigit, bool isNull)
+{
+	set_user_var_bytes(NULL, userVarName, bytes, byteLen, isDigit, isNull);
 }
 
 /*
@@ -271,7 +352,7 @@ varbit_to_mysql_bytes(VarBit *vb, char **out_bytes, size_t *out_len)
 }
 
 void
-mysSetUserVarDatum(const char *userVarName, Datum datumValue,
+mysSetUserVarDatum(MysSetBatch *batch, const char *userVarName, Datum datumValue,
 				   Oid varValueType, FmgrInfo *foutcache, bool isNull)
 {
 	Oid			baseType;
@@ -279,7 +360,7 @@ mysSetUserVarDatum(const char *userVarName, Datum datumValue,
 
 	if (isNull)
 	{
-		mysSetUserVarBytes(userVarName, NULL, 0, false, true);
+		set_user_var_bytes(batch, userVarName, NULL, 0, false, true);
 		return;
 	}
 
@@ -290,14 +371,14 @@ mysSetUserVarDatum(const char *userVarName, Datum datumValue,
 	{
 		bytea	   *bv = DatumGetByteaPP(datumValue);
 
-		mysSetUserVarBytes(userVarName, VARDATA_ANY(bv), VARSIZE_ANY_EXHDR(bv),
+		set_user_var_bytes(batch, userVarName, VARDATA_ANY(bv), VARSIZE_ANY_EXHDR(bv),
 						   isDigit, false);
 	}
 	else if (getBaseType(varValueType) == BPCHAROID)
 	{
 		bytea	   *bv = mys_bpchar_bytes(datumValue);
 
-		mysSetUserVarBytes(userVarName, VARDATA_ANY(bv), VARSIZE_ANY_EXHDR(bv),
+		set_user_var_bytes(batch, userVarName, VARDATA_ANY(bv), VARSIZE_ANY_EXHDR(bv),
 						   false, false);
 	}
 	else if (baseType == BITOID || baseType == VARBITOID)
@@ -307,7 +388,7 @@ mysSetUserVarDatum(const char *userVarName, Datum datumValue,
 		size_t		bitlen = 0;
 
 		varbit_to_mysql_bytes(vb, &bitbytes, &bitlen);
-		mysSetUserVarBytes(userVarName, bitbytes, bitlen, false, false);
+		set_user_var_bytes(batch, userVarName, bitbytes, bitlen, false, false);
 		if (bitbytes)
 			pfree(bitbytes);
 	}
@@ -315,7 +396,7 @@ mysSetUserVarDatum(const char *userVarName, Datum datumValue,
 	{
 		char		bch = DatumGetBool(datumValue) ? '1' : '0';
 
-		mysSetUserVarBytes(userVarName, &bch, 1, true, false);
+		set_user_var_bytes(batch, userVarName, &bch, 1, true, false);
 	}
 	else
 	{
@@ -331,7 +412,7 @@ mysSetUserVarDatum(const char *userVarName, Datum datumValue,
 			getTypeOutputInfo(varValueType, &typOutput, &typIsVarlena);
 			str = OidOutputFunctionCall(typOutput, datumValue);
 		}
-		mysSetUserVarBytes(userVarName, str, strlen(str), isDigit, false);
+		set_user_var_bytes(batch, userVarName, str, strlen(str), isDigit, false);
 		pfree(str);
 	}
 }
@@ -401,7 +482,7 @@ void
 mysSetUserVarForPl(char *userVarName, Datum userVarValue,
 				   Oid varValueType, bool isNull)
 {
-	mysSetUserVarDatum(userVarName, userVarValue, varValueType, NULL, isNull);
+	mysSetUserVarDatum(NULL, userVarName, userVarValue, varValueType, NULL, isNull);
 }
 
 bytea *

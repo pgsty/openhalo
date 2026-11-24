@@ -186,6 +186,8 @@ PG_FUNCTION_INFO_V1(mysSetUserVar);
 Datum
 mysSetUserVar(PG_FUNCTION_ARGS)
 {
+	MysStmtInfo *info = mys_current_stmt_info();
+	MysSetBatch *batch = info ? info->set_batch : NULL;
 	char	   *varName;
 
 	if (PG_ARGISNULL(0))
@@ -203,11 +205,11 @@ mysSetUserVar(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("could not determine data type of user variable input")));
 
-		mysSetUserVarDatum(varName, datumValue, varValueType, NULL, false);
+		mysSetUserVarDatum(batch, varName, datumValue, varValueType, NULL, false);
 	}
 	else
 	{
-		mysSetUserVarDatum(varName, (Datum) 0, InvalidOid, NULL, true);
+		mysSetUserVarDatum(batch, varName, (Datum) 0, InvalidOid, NULL, true);
 	}
 
 	pfree(varName);
@@ -267,11 +269,11 @@ mysSetUserVarInExpr(PG_FUNCTION_ARGS)
 			}
 		}
 
-		mysSetUserVarDatum(varName, datumValue, varValueType, foutcache, false);
+		mysSetUserVarDatum(NULL, varName, datumValue, varValueType, foutcache, false);
 	}
 	else
 	{
-		mysSetUserVarDatum(varName, (Datum) 0, InvalidOid, NULL, true);
+		mysSetUserVarDatum(NULL, varName, (Datum) 0, InvalidOid, NULL, true);
 	}
 
 	result = mysGetUserVarValueInternal(varName);
@@ -1531,6 +1533,7 @@ truncateStrTailWhiteSpacesForDigit(size_t strLen, char *str)
 {
 	bool		meetNumber = false;
 	bool		meetWhiteSpace = false;
+	size_t		firstWs = 0;
 	size_t		index;
 
 	for (index = 0; index < strLen; index++)
@@ -1544,18 +1547,13 @@ truncateStrTailWhiteSpacesForDigit(size_t strLen, char *str)
 				if (ch == ' ' || ch == '\t' || ch == '\n')
 				{
 					meetWhiteSpace = true;
-					str[index] = '\0';
+					firstWs = index;
 				}
 			}
-			else
+			else if (ch != ' ' && ch != '\t' && ch != '\n')
 			{
-				if (ch != ' ' && ch != '\t' && ch != '\n')
-				{
-					/* Non-whitespace after trailing space: restore space so PG rejects it */
-					str[index - 1] = ' ';
-					return;
-				}
-				str[index] = '\0';
+				/* Non-whitespace after trailing space: leave string intact so PG rejects it */
+				return;
 			}
 		}
 		else if (isdigit(ch) || ch == '.')
@@ -1563,6 +1561,9 @@ truncateStrTailWhiteSpacesForDigit(size_t strLen, char *str)
 			meetNumber = true;
 		}
 	}
+
+	if (meetWhiteSpace)
+		str[firstWs] = '\0';
 }
 
 static Datum

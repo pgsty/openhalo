@@ -110,6 +110,7 @@ typedef struct ProtocolExtensionConfig
 									   struct TupleTableSlot *newslot,
 									   bool warn_only);
 	void		(*sequence_write) (struct RelationData *sequence);
+	void		(*check_read_only) (const char *cmdname);
 	void		(*on_conflict_row) (struct TupleTableSlot *oldslot,
 								struct TupleTableSlot *newslot, uint64 deleted);
 

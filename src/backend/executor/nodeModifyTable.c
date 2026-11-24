@@ -1798,7 +1798,10 @@ ldelete:
 				bool		ok;
 
 				if (context->mtstate->mt_has_written)
+				{
 					CommandCounterIncrement();
+					estate->es_output_cid = GetCurrentCommandId(true);
+				}
 				ok = RI_FKey_check_delete(resultRelationDesc, lockSlot);
 				ExecClearTuple(lockSlot);
 				if (!ok)
@@ -2234,7 +2237,10 @@ ExecCrossPartitionUpdate(ModifyTableContext *context,
 			}
 
 			if (mtstate->mt_has_written)
+			{
 				CommandCounterIncrement();
+				estate->es_output_cid = GetCurrentCommandId(true);
+			}
 			if (!RI_FKey_check_insert(partrel->ri_RelationDesc, checkSlot) ||
 				!RI_FKey_check_update(rootRelInfo->ri_RelationDesc,
 									  oldRootSlot, rootSlot))
@@ -2583,7 +2589,10 @@ lreplace:
 		}
 
 		if (context->mtstate->mt_has_written)
+		{
 			CommandCounterIncrement();
+			estate->es_output_cid = GetCurrentCommandId(true);
+		}
 		if (!RI_FKey_check_update(resultRelationDesc,
 								  updateCxt->oldSlot, slot))
 		{

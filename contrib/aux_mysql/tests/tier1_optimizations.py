@@ -182,7 +182,7 @@ class RawStmtClient:
         }
 
     def prepare(self, sql):
-        self.send(COM_STMT_PREPARE, sql.encode('utf-8'))
+        self.send(COM_STMT_PREPARE, sql if isinstance(sql, bytes) else sql.encode('utf-8'))
         p = self.read_pkt()
         if p[0] == 0xff:
             return {'errno': struct.unpack('<H', p[1:3])[0], 'msg': p[9:].decode('utf-8', 'replace')}
@@ -369,11 +369,12 @@ def test_1a_1b_version_serialization_and_acl(pg, schema):
 
         uconn = my_conn(user=role, password='AclPass!123', database=schema)
         try:
-            # Legitimate ODKU & AUTO_INCREMENT INSERT (synthetic internal RETURNING) succeed without SELECT(secret)
-            query(uconn, 'INSERT INTO acl_t(id) VALUES (1) ON DUPLICATE KEY UPDATE id = id')
+            # Legitimate ODKU (VALUES(id), no target-column read) & AUTO_INCREMENT INSERT succeed without SELECT
+            query(uconn, 'INSERT INTO acl_t(id) VALUES (1) ON DUPLICATE KEY UPDATE id = VALUES(id)')
             query(uconn, 'INSERT INTO acl_t(id) VALUES (NULL)')
-            # Unauthorized read of secret in ODKU or explicit PG-mode RETURNING must be rejected
+            # Unauthorized read of target columns (even updated ones) in ODKU or explicit PG-mode RETURNING must be rejected
             for bad_sql, mode in (
+                ('INSERT INTO acl_t(id) VALUES (1) ON DUPLICATE KEY UPDATE id = id', 'mysql'),
                 ('INSERT INTO acl_t(id) VALUES (1) ON DUPLICATE KEY UPDATE id = LENGTH(secret)', 'mysql'),
                 (
                     f'INSERT INTO {schema}.acl_t(id) VALUES (1) '
@@ -1111,8 +1112,8 @@ def test_1d_prepared_cached_plan_fastpath_and_benchmark(pg, schema):
                 cur.execute('COMMIT')
                 cur.execute('SET autocommit = 1')
 
-            # Client encoding != server encoding (LATIN1) declines fast path so pq_getmsgstring transcodes,
-            # and non-UTF8 bytes in UTF8 mode fall back cleanly to _binary hex literals
+            # Client encoding != server encoding (LATIN1) transcodes both query and string params
+            # cleanly from LATIN1 -> UTF8; in UTF8 mode, non-UTF8 bytes fall back to _binary hex.
             with c_misc.conn.cursor() as cur:
                 cur.execute("SELECT pg_catalog.set_config('client_encoding', 'LATIN1', false)")
             p_lat = c_misc.prepare("UPDATE fp_items SET pad = CONCAT(?, '_', HEX(?)) WHERE id = ?")
@@ -1127,10 +1128,26 @@ def test_1d_prepared_cached_plan_fastpath_and_benchmark(pg, schema):
                 )['affected']
                 == 1
             )
+            c_misc.close_stmt(p_lat['id'])
             with c_misc.conn.cursor() as cur:
                 cur.execute("SELECT pg_catalog.set_config('client_encoding', 'UTF8', false)")
                 cur.execute('SELECT pad FROM fp_items WHERE id = 1')
-                assert cur.fetchone() == ('cafÃ©_636166E9',)
+                assert cur.fetchone() == ('cafÃ©_636166C3A9',)
+            p_raw = c_misc.prepare("UPDATE fp_items SET pad = HEX(?) WHERE id = ?")
+            assert (
+                c_misc.execute(
+                    p_raw['id'],
+                    [
+                        (T_VARCHAR, enc_str(b'caf\xe9')),
+                        (T_LONG, struct.pack('<i', 1)),
+                    ],
+                )['affected']
+                == 1
+            )
+            c_misc.close_stmt(p_raw['id'])
+            with c_misc.conn.cursor() as cur:
+                cur.execute('SELECT pad FROM fp_items WHERE id = 1')
+                assert cur.fetchone() == ('636166E9',)
 
             # 200-cycle PREPARE -> EXECUTE -> CLOSE must not leak CachedPlanSource in CacheMemoryContext!
             for _ in range(10):

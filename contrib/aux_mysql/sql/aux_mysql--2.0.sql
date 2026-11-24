@@ -20513,35 +20513,31 @@ RETURNS integer AS $$
     END
 $$ IMMUTABLE STRICT LANGUAGE SQL;
 
+drop function if exists mysql.timediff(timestamp, timestamp);
+drop function if exists mysql.timediff(time, time);
 drop function if exists mysql.timediff(text, text);
 CREATE OR REPLACE FUNCTION mysql.timediff(text, text)
-RETURNS time
+RETURNS text
 LANGUAGE c
-IMMUTABLE STRICT
-AS '$libdir/aux_mysql', $function$timediff$function$;
+IMMUTABLE STRICT PARALLEL SAFE
+AS '$libdir/aux_mysql', $function$mys_timediff_text$function$;
 
-drop function if exists mysql.timediff(time, time);
 CREATE OR REPLACE FUNCTION mysql.timediff(time, time)
-RETURNS time
+RETURNS text
 AS $$
     SELECT mysql.timediff($1::text, $2::text)
-$$ IMMUTABLE STRICT LANGUAGE SQL;
+$$ IMMUTABLE STRICT PARALLEL SAFE LANGUAGE SQL;
 
-drop function if exists mysql.timediff(timestamp, timestamp);
 CREATE OR REPLACE FUNCTION mysql.timediff(timestamp, timestamp)
-RETURNS time
-AS $$
-    SELECT mysql.timediff($1::text, $2::text)
-$$ IMMUTABLE STRICT LANGUAGE SQL;
+RETURNS text
+AS '$libdir/aux_mysql', 'mys_timediff_timestamp'
+IMMUTABLE STRICT PARALLEL SAFE LANGUAGE C;
 
 drop function if exists mysql.addtime(timestamp, pg_catalog.interval);
 CREATE OR REPLACE FUNCTION mysql.addtime(timestamp, text)
 RETURNS timestamp
-AS
-$$
-    SELECT mysql.addtime($1::text, $2)::timestamp(6)
-$$
-IMMUTABLE STRICT LANGUAGE SQL;
+AS '$libdir/aux_mysql', 'mys_addtime_timestamp_text'
+IMMUTABLE STRICT LANGUAGE C;
 
 drop function if exists mysql.addtime(time, pg_catalog.interval);
 CREATE OR REPLACE FUNCTION mysql.addtime(time, text)
@@ -20562,11 +20558,8 @@ IMMUTABLE STRICT LANGUAGE SQL;
 
 CREATE OR REPLACE FUNCTION mysql.addtime(timestamp, time)
 RETURNS timestamp
-AS
-$$
-    select mysql.addtime($1::text, $2::text)::timestamp(6)
-$$
-IMMUTABLE STRICT LANGUAGE SQL;
+AS '$libdir/aux_mysql', 'mys_addtime_timestamp_time'
+IMMUTABLE STRICT LANGUAGE C;
 
 CREATE OR REPLACE FUNCTION mysql.addtime(time, time)
 RETURNS time
@@ -20660,12 +20653,8 @@ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION mysql.subtime(timestamp, text)
 RETURNS timestamp
-AS
-$$
-    --SELECT $1 - mysql.convert_to_time_format($2)::pg_catalog.interval
-    select mysql.subtime($1::text, $2)::timestamp(6)
-$$
-IMMUTABLE STRICT LANGUAGE SQL;
+AS '$libdir/aux_mysql', 'mys_subtime_timestamp_text'
+IMMUTABLE STRICT LANGUAGE C;
 
 CREATE OR REPLACE FUNCTION mysql.subtime(time, text)
 RETURNS time
@@ -20687,12 +20676,8 @@ IMMUTABLE STRICT LANGUAGE SQL;
 
 CREATE OR REPLACE FUNCTION mysql.subtime(timestamp, time)
 RETURNS timestamp
-AS
-$$
-    --SELECT $1 - mysql.convert_to_time_format($2)::pg_catalog.interval
-    select mysql.subtime($1::text, $2::text)::timestamp(6)
-$$
-IMMUTABLE STRICT LANGUAGE SQL;
+AS '$libdir/aux_mysql', 'mys_subtime_timestamp_time'
+IMMUTABLE STRICT LANGUAGE C;
 
 CREATE OR REPLACE FUNCTION mysql.subtime(time, time)
 RETURNS time
@@ -28515,37 +28500,37 @@ DECLARE
     allArgNum int;
     argIndex int;
 BEGIN
-    ret := "CREATE PROCEDURE";
+    ret := 'CREATE PROCEDURE';
 
-    ret := ret || " ";
+    ret := ret || ' ';
     ret := ret || funcName;
 
-    ret := ret || "(";
+    ret := ret || '(';
     if (proallargtypes is not null) then
         allArgNum := array_length(proallargtypes, 1);
         argIndex := 1;
         LOOP
             if (1 < argIndex) then
-                ret := ret || ",";
+                ret := ret || ',';
             end if;
 
             if (proargmodes[argIndex] = 'i') then
-                ret := ret || " IN";
+                ret := ret || ' IN';
             else
-                ret := ret || " OUT";
+                ret := ret || ' OUT';
             end if;
 
-            ret := ret || " ";
-            ret := ret || proargnames[argIndex];
+            ret := ret || ' ';
+            ret := ret || coalesce(proargnames[argIndex], '');
 
-            ret := ret || " ";
+            ret := ret || ' ';
             ret := ret || proallargtypes[argIndex]::regType::text;
 
             argIndex := argIndex + 1;
             EXIT WHEN argIndex > allArgNum;
         END LOOP;
     end if;
-    ret := ret || ")\n";
+    ret := ret || E')\n';
 
     ret := ret || prosrc;
 
@@ -29551,25 +29536,16 @@ IMMUTABLE LANGUAGE C;
 
 CREATE OR REPLACE FUNCTION mysql.space(pg_catalog.int4)
 RETURNS text
+LANGUAGE sql
+IMMUTABLE STRICT PARALLEL SAFE
 AS
 $$
-DECLARE
-    ret pg_catalog.text;
-BEGIN
-    ret := '';
-
-    IF (1 <= $1) THEN
-        FOR i IN 1..$1 LOOP
-            ret := ret operator(pg_catalog.||) ' ';
-        END LOOP;
-    ELSE
-        ret := '';
-    END IF;
-
-    return ret;
-END
-$$
-IMMUTABLE STRICT LANGUAGE 'plpgsql';
+    SELECT CASE
+        WHEN $1 <= 0 THEN ''::pg_catalog.text
+        WHEN $1 > 67108864 THEN NULL::pg_catalog.text
+        ELSE pg_catalog.repeat(' ', $1)
+    END
+$$;
 
 CREATE OR REPLACE FUNCTION mysql.log2(double precision)
 RETURNS pg_catalog.numeric
@@ -33222,9 +33198,10 @@ LEFT JOIN pg_tablespace t on p.reltablespace = t.oid
 LEFT JOIN (select i.inhparent,  sum(c.relpages) as blocks
     from pg_class c LEFT JOIN pg_inherits i ON c.oid=i.inhrelid
     where c.relispartition is true group by 1) s on c.oid = s.inhparent
-LEFT JOIN (select starelid, sum(stawidth) as stawidth
-    FROM pg_statistic
-    group by starelid) avg_row on c.oid = avg_row.starelid
+LEFT JOIN (select schemaname, tablename, sum(avg_width) as stawidth
+    FROM pg_catalog.pg_stats
+    group by schemaname, tablename) avg_row
+    on n.nspname = avg_row.schemaname and c.relname = avg_row.tablename
 WHERE p.relispartition = false AND p.relkind NOT IN ('i', 'I') order by 1, 2, 3;
 
 drop table if exists mys_informa_schema.base_variables cascade;
@@ -33597,7 +33574,7 @@ BEGIN
     FOR func IN
         select
             Name,
-            @@sql_mode::varchar(256) as sql_mode,
+            mysql.get_system_session_variable('sql_mode')::varchar(256) as sql_mode,
             Define,
             Character_set_client,
             Collation_connection,
@@ -33636,7 +33613,7 @@ BEGIN
     FOR proc IN
         select
             Name,
-            @@sql_mode::varchar(256) as sql_mode,
+            mysql.get_system_session_variable('sql_mode')::varchar(256) as sql_mode,
             Define,
             Character_set_client,
             Collation_connection,
@@ -33673,31 +33650,31 @@ DECLARE
     argIndex pg_catalog.int4;
     argTypes pg_catalog.int4[];
 BEGIN
-    ret := "CREATE DEFINER=`";
-    ret := pg_catalog.concat(ret, procOwner);
-    ret := pg_catalog.concat(ret, "`@`%` PROCEDURE `");
-    ret := pg_catalog.concat(ret, procName);
-    ret := pg_catalog.concat(ret, "`(");
+    ret := 'CREATE DEFINER=`';
+    ret := pg_catalog.concat(ret, replace(procOwner, '`', '``'));
+    ret := pg_catalog.concat(ret, '`@`%` PROCEDURE `');
+    ret := pg_catalog.concat(ret, replace(procName, '`', '``'));
+    ret := pg_catalog.concat(ret, '`(');
     if (proallargtypes is not null) then
         allArgNum := array_length(proallargtypes, 1);
         argIndex := 1;
         LOOP
             if (1 < argIndex) then
-                ret := pg_catalog.concat(ret, ", ");
+                ret := pg_catalog.concat(ret, ', ');
             end if;
 
             if (proargmodes[argIndex] = 'i') then
-                ret := pg_catalog.concat(ret, "IN");
+                ret := pg_catalog.concat(ret, 'IN');
             elsif (proargmodes[argIndex] = 'b') then
-                ret := pg_catalog.concat(ret, "INOUT");
+                ret := pg_catalog.concat(ret, 'INOUT');
             else
-                ret := pg_catalog.concat(ret, "OUT");
+                ret := pg_catalog.concat(ret, 'OUT');
             end if;
 
-            ret := pg_catalog.concat(ret, " ");
+            ret := pg_catalog.concat(ret, ' ');
             ret := pg_catalog.concat(ret, proargnames[argIndex]);
 
-            ret := pg_catalog.concat(ret, " ");
+            ret := pg_catalog.concat(ret, ' ');
             ret := pg_catalog.concat(ret, proallargtypes[argIndex]::regType::pg_catalog.text);
 
             argIndex := argIndex + 1;
@@ -33711,15 +33688,15 @@ BEGIN
             argIndex := 1;
             LOOP
                 if (1 < argIndex) then
-                    ret := pg_catalog.concat(ret, ",");
+                    ret := pg_catalog.concat(ret, ',');
                 end if;
 
-                ret := pg_catalog.concat(ret, " IN");
+                ret := pg_catalog.concat(ret, ' IN');
 
-                ret := pg_catalog.concat(ret, " ");
+                ret := pg_catalog.concat(ret, ' ');
                 ret := pg_catalog.concat(ret, proargnames[argIndex]);
 
-                ret := pg_catalog.concat(ret, " ");
+                ret := pg_catalog.concat(ret, ' ');
                 ret := pg_catalog.concat(ret, argTypes[argIndex]::regType::pg_catalog.text);
 
                 argIndex := argIndex + 1;
@@ -33727,7 +33704,7 @@ BEGIN
             END LOOP;
         end if;
     end if;
-    ret := pg_catalog.concat(ret, ")\n");
+    ret := pg_catalog.concat(ret, E')\n');
 
     ret := pg_catalog.concat(ret, prosrc);
 
@@ -33751,35 +33728,34 @@ DECLARE
     allArgNum pg_catalog.int4;
     argIndex pg_catalog.int4;
 BEGIN
-    ret := "CREATE DEFINER=`";
-    ret := pg_catalog.concat(ret, procOwner);
-    ret := pg_catalog.concat(ret, "`@`%` FUNCTION `");
-    ret := pg_catalog.concat(ret, funcName);
-    ret := pg_catalog.concat(ret, "`(");
+    ret := 'CREATE DEFINER=`';
+    ret := pg_catalog.concat(ret, replace(procOwner, '`', '``'));
+    ret := pg_catalog.concat(ret, '`@`%` FUNCTION `');
+    ret := pg_catalog.concat(ret, replace(funcName, '`', '``'));
+    ret := pg_catalog.concat(ret, '`(');
     argTypes := string_to_array(proargtypes::text, ' ');
     allArgNum := array_length(argTypes, 1);
     argIndex := 1;
     if (0 < allArgNum) then
         LOOP
             if (1 < argIndex) then
-                ret := pg_catalog.concat(ret, ", ");
+                ret := pg_catalog.concat(ret, ', ');
             end if;
 
             ret := pg_catalog.concat(ret, proargnames[argIndex]);
-            ret := pg_catalog.concat(ret, " ");
+            ret := pg_catalog.concat(ret, ' ');
             ret := pg_catalog.concat(ret, argTypes[argIndex]::regType::text);
 
             argIndex := argIndex + 1;
             EXIT WHEN argIndex > allArgNum;
         END LOOP;
     end if;
-    ret := pg_catalog.concat(ret, ")");
+    ret := pg_catalog.concat(ret, ')');
 
-    -- ret := pg_catalog.concat(ret, "\n");
-    ret := pg_catalog.concat(ret, " ");
-    ret := pg_catalog.concat(ret, "RETURNS ", prorettype::regType::text);
+    ret := pg_catalog.concat(ret, ' ');
+    ret := pg_catalog.concat(ret, 'RETURNS ', prorettype::regType::text);
 
-    ret := pg_catalog.concat(ret, "\n");
+    ret := pg_catalog.concat(ret, E'\n');
     ret := pg_catalog.concat(ret, prosrc);
 
     RETURN ret;
@@ -33794,7 +33770,7 @@ SELECT
     pc.proname::varchar(256) as Name,
     'FUNCTION'::varchar(256) as Type,
     (mysql.get_func_def(pc.proname, pc.proowner::regrole::pg_catalog.text, pc.prorettype, pc.proargtypes, pc.proargnames, pc.prosrc))::text as Define,
-    (select au.rolname from pg_authid au where au.oid = pc.proowner)::varchar(256) as Definer,
+    pg_catalog.pg_get_userbyid(pc.proowner)::varchar(256) as Definer,
     null::varchar(256) as Modified,
     null::varchar(256) as Created,
     'DEFINER'::varchar(256) as Security_type,
@@ -33812,7 +33788,7 @@ SELECT
     pc.proname::varchar(256) as Name,
     'PROCEDURE'::varchar(256) as Type,
     (mysql.get_proc_def(pc.proname, pc.proowner::regrole::pg_catalog.text, pc.proargtypes, pc.proallargtypes, pc.proargmodes, pc.proargnames, pc.prosrc))::text as Define,
-    (select au.rolname from pg_authid au where au.oid = pc.proowner)::varchar(256) as Definer,
+    pg_catalog.pg_get_userbyid(pc.proowner)::varchar(256) as Definer,
     '2022-10-21 10:20:30'::varchar(256) as Modified,
     '2022-10-20 10:20:30'::varchar(256) as Created,
     'DEFINER'::varchar(256) as Security_type,
@@ -33827,13 +33803,13 @@ DROP FUNCTION IF EXISTS mysql.current_user() cascade;
 CREATE OR REPLACE FUNCTION mysql.current_user()
 RETURNS text
 AS '$libdir/aux_mysql', 'getCurrentUser'
-LANGUAGE C STRICT IMMUTABLE;
+LANGUAGE C STRICT STABLE PARALLEL RESTRICTED;
 
 DROP FUNCTION IF EXISTS mysql.session_user() cascade;
 CREATE OR REPLACE FUNCTION mysql.session_user()
 RETURNS text
 AS '$libdir/aux_mysql', 'getSessionUser'
-LANGUAGE C STRICT IMMUTABLE;
+LANGUAGE C STRICT STABLE PARALLEL RESTRICTED;
 
 CREATE OR REPLACE FUNCTION mysql.get_column_key(pg_catalog.Oid, pg_catalog.text)
 RETURNS pg_catalog.text
@@ -34614,7 +34590,7 @@ BEGIN
     tabName := $4;
     columnIndex := 0;
 
-    ret := pg_catalog.concat('CREATE TABLE `', tabName, '` (');
+    ret := pg_catalog.concat('CREATE TABLE `', replace(tabName, '`', '``'), '` (');
 
     FOR records IN
         select att.attidentity as identity, mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C" as extra, att.attname as column_name,
@@ -34681,7 +34657,7 @@ BEGIN
             end if;
 
             ret := pg_catalog.concat(ret, '`');
-            ret := pg_catalog.concat(ret, records.column_name);
+            ret := pg_catalog.concat(ret, replace(records.column_name, '`', '``'));
             ret := pg_catalog.concat(ret, '`');
             ret := pg_catalog.concat(ret, ' ', records.column_type);
             if (records.generation is not null) then
@@ -34746,7 +34722,7 @@ BEGIN
         --    from pg_index ind join pg_class cl on ind.indrelid = cl.oid
         --    where ind.indrelid = tabOid and cl.oid = tabOid
     LOOP
-        select pg_catalog.string_agg(pg_catalog.concat('`', k.column_name, '`',
+        select pg_catalog.string_agg(pg_catalog.concat('`', replace(k.column_name, '`', '``'), '`',
                 case when k.sub_part is not null then pg_catalog.concat('(', k.sub_part, ')') end), ',' order by k.seq)
             from mysql.index_key_parts(records.indexrelid) k into columnNames;
         continue when columnNames is null;
@@ -34758,9 +34734,9 @@ BEGIN
         if (records.indisprimary = 1) then
             ret := pg_catalog.concat(ret, 'PRIMARY KEY (', columnNames, ')');
         elsif (records.indisunique = 1) then
-            ret := pg_catalog.concat(ret, 'UNIQUE KEY `', records.indname, '` (', columnNames, ')');
+            ret := pg_catalog.concat(ret, 'UNIQUE KEY `', replace(records.indname, '`', '``'), '` (', columnNames, ')');
         else
-            ret := pg_catalog.concat(ret, 'KEY `', records.indname, '` (', columnNames, ')');
+            ret := pg_catalog.concat(ret, 'KEY `', replace(records.indname, '`', '``'), '` (', columnNames, ')');
         end if;
     END LOOP;
 
@@ -35691,7 +35667,7 @@ VALUES ('version', coalesce(current_setting('mysql.halo_mysql_version', true), '
         coalesce(current_setting('mysql.halo_mysql_version', true), '5.7.32-log'), 0, true, false)
 ON CONFLICT (variable_name) DO NOTHING;
 CREATE OR REPLACE FUNCTION mysql.connection_id() RETURNS bigint
-    LANGUAGE sql STABLE PARALLEL SAFE AS $$ SELECT pg_catalog.pg_backend_pid()::bigint $$;
+    LANGUAGE sql STABLE PARALLEL RESTRICTED AS $$ SELECT pg_catalog.pg_backend_pid()::bigint $$;
 
 -- caching_sha2_password fast-auth cache (shared memory).  MySQL clears it
 -- with FLUSH PRIVILEGES; entries also expire by themselves whenever the
@@ -35713,15 +35689,15 @@ REVOKE ALL ON FUNCTION mysql.flush_auth_cache() FROM PUBLIC;
 -- pg_catalog has, since an exact match is looked up first.
 -- ---------------------------------------------------------------------------
 CREATE FUNCTION mysql.mys_div_int8(int8, int8) RETURNS numeric
-    AS '$libdir/aux_mysql', 'mys_div_int8' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_div_int8' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.mys_div_numeric(numeric, numeric) RETURNS numeric
-    AS '$libdir/aux_mysql', 'mys_div_numeric' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_div_numeric' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.mys_div_float8(float8, float8) RETURNS float8
-    AS '$libdir/aux_mysql', 'mys_div_float8' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_div_float8' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.mys_mod_int8(int8, int8) RETURNS int8
-    AS '$libdir/aux_mysql', 'mys_mod_int8' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_mod_int8' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.mys_mod_numeric(numeric, numeric) RETURNS numeric
-    AS '$libdir/aux_mysql', 'mys_mod_numeric' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_mod_numeric' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 
 DO $do$
 DECLARE
@@ -35731,17 +35707,17 @@ BEGIN
     FOREACH l IN ARRAY ARRAY['int2', 'int4', 'int8'] LOOP
         FOREACH r IN ARRAY ARRAY['int2', 'int4', 'int8'] LOOP
             EXECUTE format($f$CREATE FUNCTION mysql.div_%1$s_%2$s(%1$s, %2$s) RETURNS numeric
-                LANGUAGE sql STABLE STRICT PARALLEL SAFE AS 'SELECT mysql.mys_div_int8($1, $2)'$f$, l, r);
+                LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED AS 'SELECT mysql.mys_div_int8($1, $2)'$f$, l, r);
             EXECUTE format('CREATE OPERATOR mysql./ (FUNCTION = mysql.div_%1$s_%2$s, LEFTARG = %1$s, RIGHTARG = %2$s)', l, r);
             EXECUTE format($f$CREATE FUNCTION mysql.mod_%1$s_%2$s(%1$s, %2$s) RETURNS int8
-                LANGUAGE sql STABLE STRICT PARALLEL SAFE AS 'SELECT mysql.mys_mod_int8($1, $2)'$f$, l, r);
+                LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED AS 'SELECT mysql.mys_mod_int8($1, $2)'$f$, l, r);
             EXECUTE format('CREATE OPERATOR mysql.%% (FUNCTION = mysql.mod_%1$s_%2$s, LEFTARG = %1$s, RIGHTARG = %2$s)', l, r);
         END LOOP;
     END LOOP;
     FOREACH l IN ARRAY ARRAY['float4', 'float8'] LOOP
         FOREACH r IN ARRAY ARRAY['float4', 'float8'] LOOP
             EXECUTE format($f$CREATE FUNCTION mysql.div_%1$s_%2$s(%1$s, %2$s) RETURNS float8
-                LANGUAGE sql STABLE STRICT PARALLEL SAFE AS 'SELECT mysql.mys_div_float8($1, $2)'$f$, l, r);
+                LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED AS 'SELECT mysql.mys_div_float8($1, $2)'$f$, l, r);
             EXECUTE format('CREATE OPERATOR mysql./ (FUNCTION = mysql.div_%1$s_%2$s, LEFTARG = %1$s, RIGHTARG = %2$s)', l, r);
         END LOOP;
     END LOOP;
@@ -35751,13 +35727,13 @@ $do$;
 CREATE OPERATOR mysql./ (FUNCTION = mysql.mys_div_numeric, LEFTARG = numeric, RIGHTARG = numeric);
 CREATE OPERATOR mysql.% (FUNCTION = mysql.mys_mod_numeric, LEFTARG = numeric, RIGHTARG = numeric);
 CREATE FUNCTION mysql.mod(numeric, numeric) RETURNS numeric
-    LANGUAGE sql STABLE STRICT PARALLEL SAFE AS 'SELECT mysql.mys_mod_numeric($1, $2)';
+    LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED AS 'SELECT mysql.mys_mod_numeric($1, $2)';
 
 -- (aux_mysql already has MOD() for integers returning NULL for 0)
 
 -- DIV: integer part of the DECIMAL quotient, NULL for 0
 CREATE FUNCTION mysql.int_div(numeric, numeric) RETURNS int8
-    LANGUAGE sql STABLE STRICT PARALLEL SAFE
+    LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED
     AS 'SELECT trunc(mysql.mys_div_numeric($1, $2))::int8';
 
 -- aux_mysql's string "/" returned bigint ('5'/'2' = 2); MySQL converts
@@ -35774,13 +35750,13 @@ BEGIN
 END
 $do$;
 CREATE FUNCTION mysql.str_to_double(text) RETURNS float8
-    LANGUAGE sql STABLE STRICT PARALLEL SAFE
+    LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED
     AS 'SELECT mysql.convert_text_to_digit_text_for_mysql($1)::float8';
-CREATE FUNCTION mysql.div_text_text(text, text) RETURNS float8 LANGUAGE sql STABLE STRICT PARALLEL SAFE
+CREATE FUNCTION mysql.div_text_text(text, text) RETURNS float8 LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED
     AS 'SELECT mysql.mys_div_float8(mysql.str_to_double($1), mysql.str_to_double($2))';
-CREATE FUNCTION mysql.div_text_float8(text, float8) RETURNS float8 LANGUAGE sql STABLE STRICT PARALLEL SAFE
+CREATE FUNCTION mysql.div_text_float8(text, float8) RETURNS float8 LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED
     AS 'SELECT mysql.mys_div_float8(mysql.str_to_double($1), $2)';
-CREATE FUNCTION mysql.div_float8_text(float8, text) RETURNS float8 LANGUAGE sql STABLE STRICT PARALLEL SAFE
+CREATE FUNCTION mysql.div_float8_text(float8, text) RETURNS float8 LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED
     AS 'SELECT mysql.mys_div_float8($1, mysql.str_to_double($2))';
 CREATE OPERATOR mysql./ (FUNCTION = mysql.div_text_text, LEFTARG = text, RIGHTARG = text);
 CREATE OPERATOR mysql./ (FUNCTION = mysql.div_text_float8, LEFTARG = text, RIGHTARG = float8);
@@ -35812,13 +35788,13 @@ CREATE FUNCTION mysql.auto_increment_advance() RETURNS trigger
 -- -> 'too').  mys_rewrite.c inserts these calls.
 -- ---------------------------------------------------------------------------
 CREATE FUNCTION mysql.lenient_int(text, int8, int8) RETURNS int8
-    AS '$libdir/aux_mysql', 'mys_lenient_int' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_lenient_int' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.lenient_numeric(text, int4) RETURNS numeric
-    AS '$libdir/aux_mysql', 'mys_lenient_numeric' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_lenient_numeric' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.lenient_float8(text) RETURNS float8
-    AS '$libdir/aux_mysql', 'mys_lenient_float8' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_lenient_float8' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.lenient_varchar(text, int4) RETURNS text
-    AS '$libdir/aux_mysql', 'mys_lenient_varchar' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_lenient_varchar' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 
 -- ---------------------------------------------------------------------------
 -- mysql.getenv() (aux_mysql 1.4, openHalo issue 10) is only needed while the
@@ -36094,16 +36070,18 @@ BEGIN
             END IF;
             nm := replace(t, 'mysql.', '');
             EXECUTE format($f$CREATE FUNCTION mysql.hexlit_%1$s_%2$s(mysql.hexlit, %3$s) RETURNS %4$s
-                LANGUAGE sql %5$s STRICT PARALLEL SAFE AS %6$L$f$,
+                LANGUAGE sql %5$s STRICT %7$s AS %6$L$f$,
                 c[2], nm, t, res, vol,
-                format(body, 'mysql.hexlit_numeric($1)', format(num, '$2')));
+                format(body, 'mysql.hexlit_numeric($1)', format(num, '$2')),
+                CASE WHEN vol = 'STABLE' THEN 'PARALLEL RESTRICTED' ELSE 'PARALLEL SAFE' END);
             EXECUTE format('CREATE OPERATOR mysql.%1$s (FUNCTION = mysql.hexlit_%2$s_%3$s, '
                            'LEFTARG = mysql.hexlit, RIGHTARG = %4$s)', c[1], c[2], nm, t);
             IF t <> 'mysql.hexlit' THEN
                 EXECUTE format($f$CREATE FUNCTION mysql.%2$s_%1$s_hexlit(%3$s, mysql.hexlit) RETURNS %4$s
-                    LANGUAGE sql %5$s STRICT PARALLEL SAFE AS %6$L$f$,
+                    LANGUAGE sql %5$s STRICT %7$s AS %6$L$f$,
                     c[2], nm, t, res, vol,
-                    format(body, format(num, '$1'), 'mysql.hexlit_numeric($2)'));
+                    format(body, format(num, '$1'), 'mysql.hexlit_numeric($2)'),
+                    CASE WHEN vol = 'STABLE' THEN 'PARALLEL RESTRICTED' ELSE 'PARALLEL SAFE' END);
                 EXECUTE format('CREATE OPERATOR mysql.%1$s (FUNCTION = mysql.%3$s_%2$s_hexlit, '
                                'LEFTARG = %4$s, RIGHTARG = mysql.hexlit)', c[1], c[2], nm, t);
             END IF;
@@ -36144,11 +36122,11 @@ CREATE FUNCTION mysql.hexlit_not(mysql.hexlit) RETURNS numeric LANGUAGE sql IMMU
     AS 'SELECT mysql.mys_uint64_bitnot(mysql.hexlit_numeric($1))';
 CREATE OPERATOR mysql.~ (FUNCTION = mysql.hexlit_not, RIGHTARG = mysql.hexlit);
 -- DIV
-CREATE FUNCTION mysql.int_div(mysql.hexlit, numeric) RETURNS int8 LANGUAGE sql STABLE STRICT PARALLEL SAFE
+CREATE FUNCTION mysql.int_div(mysql.hexlit, numeric) RETURNS int8 LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED
     AS 'SELECT mysql.int_div(mysql.hexlit_numeric($1), $2)';
-CREATE FUNCTION mysql.int_div(numeric, mysql.hexlit) RETURNS int8 LANGUAGE sql STABLE STRICT PARALLEL SAFE
+CREATE FUNCTION mysql.int_div(numeric, mysql.hexlit) RETURNS int8 LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED
     AS 'SELECT mysql.int_div($1, mysql.hexlit_numeric($2))';
-CREATE FUNCTION mysql.int_div(mysql.hexlit, mysql.hexlit) RETURNS int8 LANGUAGE sql STABLE STRICT PARALLEL SAFE
+CREATE FUNCTION mysql.int_div(mysql.hexlit, mysql.hexlit) RETURNS int8 LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED
     AS 'SELECT mysql.int_div(mysql.hexlit_numeric($1), mysql.hexlit_numeric($2))';
 
 -- LOWER() / UPPER() leave a binary string as it is
@@ -36185,11 +36163,11 @@ CREATE FUNCTION mysql.hex(varbit) RETURNS text
 CREATE FUNCTION mysql.hex(bool) RETURNS text
     LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT CASE WHEN $1 THEN '1' ELSE '0' END $$;
 CREATE FUNCTION mysql.unhex(text) RETURNS bytea
-    AS '$libdir/aux_mysql', 'mys_unhex' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_unhex' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.unhex(bytea) RETURNS bytea
-    AS '$libdir/aux_mysql', 'mys_unhex' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_unhex' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.unhex(int8) RETURNS bytea
-    LANGUAGE sql STABLE STRICT PARALLEL SAFE AS 'SELECT mysql.unhex($1::pg_catalog.text)';
+    LANGUAGE sql STABLE STRICT PARALLEL RESTRICTED AS 'SELECT mysql.unhex($1::pg_catalog.text)';
 -- Copyright (c) 2026, PGSTY PTE. LTD.
 -- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
 -- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
@@ -36279,7 +36257,7 @@ END $support$;
 -- Type resolution takes place at every concat_one/concat_pair node. Binary
 -- dominates character. No bytea -> text cast.
 CREATE FUNCTION mysql.concat_one("any") RETURNS text
-    AS '$libdir/aux_mysql', 'mys_concat_one' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_concat_one' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 DO $concat$
 DECLARE t text; u text; rt text;
 BEGIN
@@ -36366,7 +36344,7 @@ BEGIN
 END $binary_cross_cmp$;
 
 CREATE FUNCTION mysql.raw_bytes("any") RETURNS bytea
-    AS '$libdir/aux_mysql', 'mys_raw_bytes' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_raw_bytes' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.binary_truth("any") RETURNS bool
     AS '$libdir/aux_mysql', 'mys_binary_truth' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 DO $more$
@@ -36429,17 +36407,17 @@ END $string_search$;
 -- and ELT. The NULL first argument fixes the result OID before its parent
 -- expression is analyzed; bytea data never masquerades as native PG text.
 CREATE FUNCTION mysql.string_result(anyelement, "any") RETURNS anyelement
-    AS '$libdir/aux_mysql', 'mys_string_result' LANGUAGE C STABLE PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_string_result' LANGUAGE C STABLE PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.concat_ws_bytes(VARIADIC "any") RETURNS bytea
-    AS '$libdir/aux_mysql', 'mys_concat_ws_bytes' LANGUAGE C STABLE PARALLEL SAFE;
+    AS '$libdir/aux_mysql', 'mys_concat_ws_bytes' LANGUAGE C STABLE PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.elt_index("any") RETURNS int4
     AS '$libdir/aux_mysql', 'mys_elt_index' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 
 -- Used only by the MySQL grammar; native PostgreSQL CAST is unchanged.
 CREATE FUNCTION mysql.cast_char("any",int4) RETURNS text
-    AS '$libdir/aux_mysql','mys_cast_char' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql','mys_cast_char' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.convert_using("any",text) RETURNS text
-    AS '$libdir/aux_mysql','mys_convert_using' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql','mys_convert_using' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 
 -- GROUP_CONCAT arrays preserve their element payload and binary result type.
 -- Include the old bytea domains: upgraded application columns keep those OIDs.
@@ -36449,21 +36427,21 @@ BEGIN
     FOREACH t IN ARRAY ARRAY['bytea','mysql.blob','mysql.binary','mysql.varbinary',
                              'mysql.hexlit','mysql.binary_n','mysql.varbinary_n'] LOOP
         EXECUTE format($f$CREATE FUNCTION mysql.array_to_string_for_mysql(%s[],text) RETURNS bytea
-            AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL SAFE$f$,t);
+            AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED$f$,t);
     END LOOP;
 END $group_concat$;
 
 -- CHAR arguments observe the writer/session PAD_CHAR_TO_FULL_LENGTH setting.
 CREATE FUNCTION mysql.hex(bpchar) RETURNS text
-    AS '$libdir/aux_mysql','mys_hex_bytes' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql','mys_hex_bytes' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.array_to_string_for_mysql(bpchar[],text) RETURNS text
-    AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.concat_one(bpchar) RETURNS text
-    AS '$libdir/aux_mysql','mys_concat_one' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql','mys_concat_one' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.array_to_string_for_mysql(text[],text) RETURNS text
-    AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 CREATE FUNCTION mysql.array_to_string_for_mysql(varchar[],text) RETURNS text
-    AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 -- Copyright (c) 2026, PGSTY PTE. LTD.
 -- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
 -- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
@@ -36597,7 +36575,7 @@ SET LOCAL search_path = pg_catalog, mysql, public;
 -- Keep the generic array identity: a bool[] overload alone makes integer[]
 -- resolution ambiguous against the existing polymorphic function.
 CREATE OR REPLACE FUNCTION mysql.array_to_string_for_mysql(anyarray,text) RETURNS text
-    AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+    AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 
 -- FIND_IN_SET uses the caller's collation, but unlike ordinary equality it
 -- must not pad comma-separated items with spaces. Check both directions,
@@ -36626,7 +36604,7 @@ BEGIN
         ['bpchar','text'],['text','bpchar'],['varchar','text'],['text','varchar']]
     LOOP
         EXECUTE format($f$CREATE FUNCTION mysql.ifnull(%s,%s) RETURNS varchar
-            LANGUAGE sql STABLE PARALLEL SAFE AS 'SELECT coalesce(mysql.concat_one($1)::varchar, mysql.concat_one($2)::varchar)'$f$,pair[1],pair[2]);
+            LANGUAGE sql STABLE PARALLEL RESTRICTED AS 'SELECT coalesce(mysql.concat_one($1)::varchar, mysql.concat_one($2)::varchar)'$f$,pair[1],pair[2]);
     END LOOP;
     FOR t IN SELECT DISTINCT pg_catalog.format_type(p.proargtypes[0], NULL)
         FROM pg_catalog.pg_proc p
@@ -36638,11 +36616,11 @@ BEGIN
             ['bpchar','text'],['text','bpchar'],['varchar','text'],['text','varchar']]
         LOOP
             EXECUTE format($f$CREATE FUNCTION mysql.if(%s,%s,%s) RETURNS varchar
-                LANGUAGE sql STABLE PARALLEL SAFE AS 'SELECT CASE WHEN mysql.binary_truth($1) THEN mysql.concat_one($2)::varchar ELSE mysql.concat_one($3)::varchar END'$f$,
+                LANGUAGE sql STABLE PARALLEL RESTRICTED AS 'SELECT CASE WHEN mysql.binary_truth($1) THEN mysql.concat_one($2)::varchar ELSE mysql.concat_one($3)::varchar END'$f$,
                 t,pair[1],pair[2]);
         END LOOP;
         EXECUTE format($f$CREATE FUNCTION mysql.if(%s,bool,bool) RETURNS bool
-            LANGUAGE sql STABLE PARALLEL SAFE AS 'SELECT CASE WHEN mysql.binary_truth($1) THEN $2 ELSE $3 END'$f$,t);
+            LANGUAGE sql STABLE PARALLEL RESTRICTED AS 'SELECT CASE WHEN mysql.binary_truth($1) THEN $2 ELSE $3 END'$f$,t);
     END LOOP;
 END $conditional_strings$;
 

@@ -37,7 +37,7 @@ static const int64 log_10_int[MAX_TIMESTAMP_PRECISION + 1] = {
 
 static bool mysCheckTimestampRange(struct pg_tm *tm, fsec_t fsec);
 static bool tzDisplacement2Seconds(const char *str, int length, int *result);
-static char *mysPreTimeInInternal(char *str);
+static char *mysPreTimeInInternal(char *str, bool *isTimestamp);
 static char *mysProcessStringTimeForFormat1(char *str);
 static char *mysProcessStringTimeForFormat2(char *str);
 static char *mysProcessStringTimeForFormat3(char *str);
@@ -46,42 +46,111 @@ static char *mysPreTimestampInForTime(char *str, bool *isTimestamp);
 void
 mys_pre_time_in_for_subtime(char *str, struct pg_tm *tm, fsec_t *fsec, int *sign)
 {
-	int			tz;
-	int			nf;
-	int			dterr;
-	DateTimeErrorExtra dterr_extra;
-	char		workbuf[MAXDATELEN + 1];
-	char	   *field[MAXDATEFIELDS];
-	int			dtype;
-	int			ftype[MAXDATEFIELDS];
+	char	   *norm;
+	char	   *p;
+	bool		is_timestamp = false;
 
 	*sign = 1;
 
-	str = mysPreTimeInInternal(str);
-	if (str == NULL)
+	norm = mysPreTimeInInternal(str, &is_timestamp);
+	if (norm == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_DATETIME_FORMAT),
 				 errmsg("Incorrect time value.")));
 
-	if (str[0] == '-')
+	p = norm;
+	if (p[0] == '-')
 	{
 		*sign = -1;
-		str = str + 1;
+		p++;
 	}
 
-	dterr = ParseDateTime(str, workbuf, sizeof(workbuf),
-						  field, ftype, MAXDATEFIELDS, &nf);
-	if (dterr == 0)
-		dterr = DecodeTimeOnly(field, ftype, nf, &dtype, tm, fsec, &tz, &dterr_extra);
-	if (dterr != 0)
-		DateTimeParseError(dterr, &dterr_extra, str, "time", NULL);
+	if (!is_timestamp)
+	{
+		unsigned int hour = 0;
+		unsigned int min = 0;
+		unsigned int sec = 0;
+		unsigned int fsec_u = 0;
+		unsigned int nano = 0;
+		char		extra;
 
-	if (tm->tm_year > 0)
-		*sign = 1;
+		/*
+		 * Pure MySQL TIME values allow hours up to MYS_MAX_TIME_HOUR (838),
+		 * which PG's DecodeTimeOnly() rejects (> 24:00:00). Parse the
+		 * normalized "H:MM:SS.FFFFFFN" string directly.
+		 */
+		if (sscanf(p, "%u:%2u:%2u.%6u%1u%c",
+				   &hour, &min, &sec, &fsec_u, &nano, &extra) != 5)
+		{
+			pfree(norm);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_DATETIME_FORMAT),
+					 errmsg("Incorrect time value.")));
+		}
+
+		if (nano >= 5)
+		{
+			fsec_u++;
+			if (fsec_u >= USECS_PER_SEC)
+			{
+				fsec_u = 0;
+				sec++;
+				if (sec >= SECS_PER_MINUTE)
+				{
+					sec = 0;
+					min++;
+					if (min >= MINS_PER_HOUR)
+					{
+						min = 0;
+						hour++;
+					}
+				}
+			}
+		}
+
+		if (hour > MYS_MAX_TIME_HOUR || min > 59 || sec > 59 || fsec_u > 999999)
+		{
+			pfree(norm);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_FIELD_OVERFLOW),
+					 errmsg("time value out of range")));
+		}
+
+		memset(tm, 0, sizeof(*tm));
+		tm->tm_hour = (int) hour;
+		tm->tm_min = (int) min;
+		tm->tm_sec = (int) sec;
+		*fsec = (fsec_t) fsec_u;
+	}
+	else
+	{
+		int			tz;
+		int			nf;
+		int			dterr;
+		DateTimeErrorExtra dterr_extra;
+		char		workbuf[MAXDATELEN + 1];
+		char	   *field[MAXDATEFIELDS];
+		int			dtype;
+		int			ftype[MAXDATEFIELDS];
+
+		dterr = ParseDateTime(p, workbuf, sizeof(workbuf),
+							  field, ftype, MAXDATEFIELDS, &nf);
+		if (dterr == 0)
+			dterr = DecodeTimeOnly(field, ftype, nf, &dtype, tm, fsec, &tz, &dterr_extra);
+		if (dterr != 0)
+		{
+			char	   *errstr = pstrdup(p);
+
+			pfree(norm);
+			DateTimeParseError(dterr, &dterr_extra, errstr, "time", NULL);
+		}
+	}
+
+	pfree(norm);
 }
 
 static char *
-mysPreTimeInInternal(char *str)
+mysPreTimeInInternal(char *str, bool *isTimestamp)
 {
 	char	   *result;
 	char	   *tempResult;
@@ -91,6 +160,8 @@ mysPreTimeInInternal(char *str)
 	int			strLen = strlen(str);
 	uint64		value;
 	int			numOfSpaceAfterDay;
+
+	*isTimestamp = false;
 
 	for (strIndex = 0; strIndex < strLen; strIndex++)
 	{
@@ -112,13 +183,14 @@ mysPreTimeInInternal(char *str)
 
 	if ((strLen - strIndex) >= 12)
 	{
-		bool		isTimestamp = false;
+		bool		isTs = false;
 
-		tempResult = mysPreTimestampInForTime(str + strIndex, &isTimestamp);
-		if (isTimestamp)
+		tempResult = mysPreTimestampInForTime(str + strIndex, &isTs);
+		if (isTs)
 		{
 			if (tempResult != NULL)
 			{
+				*isTimestamp = true;
 				pg_snprintf(result, 64, nega ? "-%s" : "%s", tempResult);
 				pfree(tempResult);
 				return result;

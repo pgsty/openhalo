@@ -35,8 +35,6 @@ long long	affectedRows = 0;
 unsigned long lastInsertID = 0;
 bool		isStrictTransTablesOn = true;
 Oid			caseInsensitiveId = InvalidOid;
-bool		needCommitTrx = false;
-bool		needStartNewTrx = false;
 
 static bool coll_callback_registered = false;
 

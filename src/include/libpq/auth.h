@@ -6,6 +6,8 @@
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, PGSTY PTE. LTD.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
  *
  * src/include/libpq/auth.h
  *
@@ -37,6 +39,8 @@ extern PGDLLIMPORT bool pg_krb_caseins_users;
 extern PGDLLIMPORT bool pg_gss_accept_delegation;
 
 extern void ClientAuthentication(Port *port);
+extern void ClientAuthenticationCheckCertPre(Port *port);
+extern int	ClientAuthenticationCheckCertPost(Port *port);
 extern void sendAuthRequest(Port *port, AuthRequest areq, const void *extradata,
 							int extralen);
 extern void set_authn_id(Port *port, const char *id);

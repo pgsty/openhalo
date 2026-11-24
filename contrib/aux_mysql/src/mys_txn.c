@@ -50,7 +50,6 @@
 
 /* sysvar_core.c: 0 = off, otherwise on */
 extern int	autoCommit;
-extern bool needCommitTrx;
 
 bool		halo_mysql_statement_rollback = true;
 
@@ -82,14 +81,13 @@ autocommit_value(Node *expr)
 				{
 					const char *s = strVal(&c->val);
 
-					if (strcmp(s, "halo_mysql_system_var_default") == 0)
-						return mys_default_autocommit() ? 1 : 0;
 					if (pg_strcasecmp(s, "1") == 0 || pg_strcasecmp(s, "on") == 0 ||
 						pg_strcasecmp(s, "true") == 0)
 						return 1;
 					if (pg_strcasecmp(s, "0") == 0 || pg_strcasecmp(s, "off") == 0 ||
 						pg_strcasecmp(s, "false") == 0)
 						return 0;
+					/* Includes DEFAULT, which reads GLOBAL at execution time. */
 					return -1;
 				}
 			default:
@@ -170,7 +168,7 @@ mys_txn_classify(Node *stmt, MysStmtInfo *info)
 				case TRANS_STMT_COMMIT:
 				case TRANS_STMT_ROLLBACK:
 					info->txn_kind = ((TransactionStmt *) stmt)->chain ?
-						MYS_TXN_NEUTRAL : MYS_TXN_END;
+						MYS_TXN_CHAIN : MYS_TXN_END;
 					info->is_commit = ((TransactionStmt *) stmt)->kind == TRANS_STMT_COMMIT;
 					break;
 				default:
@@ -182,7 +180,14 @@ mys_txn_classify(Node *stmt, MysStmtInfo *info)
 
 		case T_MysVariableSetStmt:
 			{
-				int			v = find_set_autocommit(((MysVariableSetStmt *) stmt)->varSetStmt);
+				Node	   *set = ((MysVariableSetStmt *) stmt)->varSetStmt;
+				int			v = find_set_autocommit(set);
+
+				if (set && IsA(set, SelectStmt) && list_length(((SelectStmt *) set)->targetList) > 1)
+				{
+					info->set_batch = palloc0_object(MysSetBatch);
+					info->set_batch->context = CurrentMemoryContext;
+				}
 
 				info->txn_kind = MYS_TXN_NEUTRAL;
 				if (v != -2)
@@ -327,8 +332,6 @@ mys_txn_apply(List *stmts, List **infos)
 	int			n = list_length(stmts);
 	int			i = 0;
 
-	needCommitTrx = false;
-
 	/* A failed statement can leave a provisional block behind.  End it
 	 * before planning another statement, so its snapshot/isolation cannot
 	 * prevent a subsequent SET TRANSACTION from applying to the first table. */
@@ -359,21 +362,20 @@ mys_txn_apply(List *stmts, List **infos)
 		RawStmt    *rs = list_nth(stmts, i);
 		int			kind = first->txn_kind;
 		int			loc = rs->stmt_location;
-		bool		dynamic_ac = (kind == MYS_TXN_SET_AUTOCOMMIT && first->set_autocommit < 0);
+		bool		post_ac_commit = (kind == MYS_TXN_SET_AUTOCOMMIT &&
+									  (first->set_autocommit < 0 ||
+									   (first->set_autocommit == 1 && (autocommit_unknown || !autocommit))));
 		bool		wrap;
 
 		/* implicit commit before */
 		if (autocommit_unknown &&
-			(kind == MYS_TXN_BEGIN || kind == MYS_TXN_IMPLICIT_COMMIT ||
-			 (kind == MYS_TXN_SET_AUTOCOMMIT && first->set_autocommit == 1)))
+			(kind == MYS_TXN_BEGIN || kind == MYS_TXN_IMPLICIT_COMMIT))
 		{
 			emit_txn_op(&out, &out_infos, TRANS_STMT_COMMIT, MYS_TXNOP_COMMIT_IF_BLOCK, loc);
-			if (kind != MYS_TXN_SET_AUTOCOMMIT)
-				in_block = false;
+			in_block = false;
 		}
 		else if (in_block &&
-				 (kind == MYS_TXN_BEGIN || kind == MYS_TXN_IMPLICIT_COMMIT ||
-				  (kind == MYS_TXN_SET_AUTOCOMMIT && first->set_autocommit == 1 && !autocommit)))
+				 (kind == MYS_TXN_BEGIN || kind == MYS_TXN_IMPLICIT_COMMIT))
 		{
 			emit_txn(&out, &out_infos, TRANS_STMT_COMMIT, loc);
 			in_block = false;
@@ -406,8 +408,6 @@ mys_txn_apply(List *stmts, List **infos)
 		{
 			MysStmtInfo *cur = list_nth(*infos, i);
 
-			if (dynamic_ac)
-				cur->suppress_response = true;
 			out = lappend(out, list_nth(stmts, i));
 			out_infos = lappend(out_infos, cur);
 			i++;
@@ -417,19 +417,13 @@ mys_txn_apply(List *stmts, List **infos)
 		if (wrap)
 			emit_txn(&out, &out_infos, TRANS_STMT_RELEASE, loc);
 
-		if (dynamic_ac)
-		{
-			MysStmtInfo *ac_info;
-
+		if (post_ac_commit)
 			emit_txn_op(&out, &out_infos, TRANS_STMT_COMMIT, MYS_TXNOP_COMMIT_AUTOCOMMIT, loc);
-			ac_info = (MysStmtInfo *) llast(out_infos);
-			ac_info->suppress_response = false;
-			ac_info->silent = true;
-		}
 
 		switch (kind)
 		{
 			case MYS_TXN_BEGIN:
+			case MYS_TXN_CHAIN:
 				in_block = true;
 				break;
 			case MYS_TXN_END:
@@ -438,11 +432,15 @@ mys_txn_apply(List *stmts, List **infos)
 			case MYS_TXN_SET_AUTOCOMMIT:
 				if (first->set_autocommit >= 0)
 				{
+					if (first->set_autocommit == 1 && !autocommit_unknown && !autocommit)
+						in_block = false;
 					autocommit = (first->set_autocommit == 1);
 					autocommit_unknown = false;
 				}
 				else
 					autocommit_unknown = true;
+				/* The setter records the evaluated value here during execution. */
+				first->set_autocommit = -1;
 				break;
 			default:
 				break;
@@ -451,7 +449,8 @@ mys_txn_apply(List *stmts, List **infos)
 		/* Runtime table access decides whether the provisional BEGIN stays.
 		 * The next BEGIN/SAVEPOINT is conditional too: a packet can contain
 		 * any mixture of table reads, table-free SELECTs, SET and EXECUTE. */
-		if (!dynamic_ac && (autocommit_unknown || (in_block && !autocommit)))
+		if (!post_ac_commit && kind != MYS_TXN_CHAIN &&
+			(autocommit_unknown || (in_block && !autocommit)))
 			emit_idle_commit(&out, &out_infos, loc);
 
 		/*
@@ -460,9 +459,25 @@ mys_txn_apply(List *stmts, List **infos)
 		 * is set, emit_idle_commit above already commits whenever no active
 		 * transaction block is open.
 		 */
-		if (!dynamic_ac && !autocommit_unknown && !in_block &&
-			group < ngroups && kind != MYS_TXN_END)
+		if (!post_ac_commit && !autocommit_unknown && !in_block &&
+			group < ngroups && kind != MYS_TXN_END && kind != MYS_TXN_CHAIN)
 			emit_txn(&out, &out_infos, TRANS_STMT_COMMIT, loc);
+
+		/* A deferred constraint can still fail in the SET's implicit COMMIT.
+		 * Publish the assignments and send OK after its last control statement. */
+		if (first->set_batch || kind == MYS_TXN_SET_AUTOCOMMIT)
+		{
+			MysStmtInfo *last = llast(out_infos);
+
+			if (last != first)
+			{
+				Assert(last->txn_control);
+				first->suppress_response = true;
+				last->finish_set = first;
+				last->suppress_response = false;
+				last->silent = true;
+			}
+		}
 	}
 
 	*infos = out_infos;
@@ -481,9 +496,8 @@ mys_txn_skip_control(MysStmtInfo *info)
 		return autoCommit != 0 || mys_transaction_has_block();
 	if (info->txn_op == MYS_TXNOP_COMMIT_AUTOCOMMIT)
 	{
-		bool		commit = needCommitTrx;
+		bool		commit = autoCommit == 0 && info->finish_set->set_autocommit == 1;
 
-		needCommitTrx = false;
 		return mys_transaction_has_block() && !commit;
 	}
 	if (info->txn_op == MYS_TXNOP_COMMIT_IF_BLOCK)
@@ -524,6 +538,15 @@ mys_txn_clear_fallback_stmt_timeout(void)
 void
 mys_txn_stmt_done(MysStmtInfo *info, const MysStmtInfo *following)
 {
+	if (!info->suppress_response)
+	{
+		MysStmtInfo *set = info->finish_set ? info->finish_set : info;
+
+		if (set->set_batch)
+			mys_publish_set_batch(set->set_batch);
+		if (set->txn_kind == MYS_TXN_SET_AUTOCOMMIT && set->set_autocommit >= 0)
+			mys_finish_set_autocommit(set->set_autocommit != 0);
+	}
 	if (info->txn_op == MYS_TXNOP_SAVEPOINT)
 	{
 		stmt_savepoint_level = GetCurrentTransactionNestLevel();
@@ -614,7 +637,6 @@ mys_txn_recover(void)
 	MemoryContext oldcxt;
 
 	mys_txn_clear_fallback_stmt_timeout();
-	needCommitTrx = false;
 
 	if (abort_transaction)
 	{

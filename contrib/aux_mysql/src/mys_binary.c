@@ -29,6 +29,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "fmgr.h"
 #include "mb/pg_wchar.h"
@@ -461,11 +462,12 @@ mys_hexlit_varbit(PG_FUNCTION_ARGS)
 	int32		typmod = PG_GETARG_INT32(1);
 	const unsigned char *p = (const unsigned char *) VARDATA_ANY(b);
 	int			len = VARSIZE_ANY_EXHDR(b);
-	int			nbits = len * BITS_PER_BYTE;
-	int			sig = nbits;
-	int			bitlen;
+	int64		nbits = (int64) len * BITS_PER_BYTE;
+	int64		sig = nbits;
+	int64		bitlen;
 	VarBit	   *result;
 	uint8	   *r;
+	const int64 max_bitlen = (int64) 65535 * BITS_PER_BYTE;
 
 	for (int i = 0; i < len; i++)
 	{
@@ -481,21 +483,28 @@ mys_hexlit_varbit(PG_FUNCTION_ARGS)
 		bitlen = nbits;
 	else
 	{
-		if (sig > typmod)
+		if (sig > (int64) typmod)
 			ereport(ERROR,
 					(errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
-					 errmsg("bit string length %d does not match type bit varying(%d)",
+					 errmsg("bit string length " INT64_FORMAT " does not match type bit varying(%d)",
 							sig, typmod)));
 		bitlen = typmod;
 	}
-	result = (VarBit *) palloc0(VARBITTOTALLEN(bitlen));
-	SET_VARSIZE(result, VARBITTOTALLEN(bitlen));
-	VARBITLEN(result) = bitlen;
+	if (bitlen > max_bitlen)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("bit string length " INT64_FORMAT " exceeds maximum allowed (" INT64_FORMAT ")",
+						bitlen, max_bitlen)));
+	result = (VarBit *) palloc0(VARBITTOTALLEN((int) bitlen));
+	SET_VARSIZE(result, VARBITTOTALLEN((int) bitlen));
+	VARBITLEN(result) = (int) bitlen;
 	r = VARBITS(result);
-	for (int i = 0; i < bitlen; i++)
+	for (int64 i = 0; i < bitlen; i++)
 	{
-		int			src = nbits - bitlen + i;	/* bit of the bytes, MSB first */
+		int64		src = nbits - bitlen + i;	/* bit of the bytes, MSB first */
 
+		if ((i & 0x3fff) == 0)
+			CHECK_FOR_INTERRUPTS();
 		if (src >= 0 && (p[src / BITS_PER_BYTE] >> (7 - src % BITS_PER_BYTE)) & 1)
 			r[i / BITS_PER_BYTE] |= 0x80 >> (i % BITS_PER_BYTE);
 	}
@@ -788,11 +797,17 @@ static bytea *
 binary_sized(bytea *b, int32 typmod, bool fixed, bool explicit_cast)
 {
 	int len = VARSIZE_ANY_EXHDR(b);
+	int limit = fixed ? 255 : 65535;
 	int size;
 	bytea *r;
 
 	if (typmod < 0)
 		return b;
+	if (typmod > limit)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("length for %s must be between 0 and %d",
+						fixed ? "binary" : "varbinary", limit)));
 	if (len > typmod && !explicit_cast)
 	{
 		if (binary_strict())
@@ -1428,6 +1443,7 @@ mys_string_replace(PG_FUNCTION_ARGS)
 	initStringInfo(&buf);
 	for (int i = 0; i < len;)
 	{
+		CHECK_FOR_INTERRUPTS();
 		if (n <= len - i && memcmp(s + i, needle, n) == 0)
 		{
 			appendBinaryStringInfo(&buf, VARDATA_ANY(c), r);
@@ -1851,12 +1867,15 @@ string_position(FunctionCallInfo fcinfo, bool instr)
 		return pos;
 	if (!binary)
 	{
-		MysSimpleCollation kind = mys_simple_collation(PG_GET_COLLATION());
+		Oid collid = OidIsValid(PG_GET_COLLATION()) ? PG_GET_COLLATION() : DEFAULT_COLLATION_OID;
+		MysSimpleCollation kind = mys_simple_collation(collid);
 
 		if (kind != MYS_SIMPLE_UNSUPPORTED)
 			return string_weight_position(kind, h, hlen, offset, pos, p, plen);
+		locale = pg_newlocale_from_collation(collid);
 	}
-	locale = binary ? NULL : pg_newlocale_from_collation(PG_GET_COLLATION());
+	else
+		locale = NULL;
 	for (; offset < hlen; pos++)
 	{
 		CHECK_FOR_INTERRUPTS();

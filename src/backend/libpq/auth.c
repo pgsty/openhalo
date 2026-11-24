@@ -5,6 +5,8 @@
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, PGSTY PTE. LTD.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
  *
  *
  * IDENTIFICATION
@@ -402,25 +404,7 @@ ClientAuthentication(Port *port)
 	 * current connection, so perform any verifications based on the hba
 	 * options field that should be done *before* the authentication here.
 	 */
-	if (port->hba->clientcert != clientCertOff)
-	{
-		/* If we haven't loaded a root certificate store, fail */
-		if (!secure_loaded_verify_locations())
-			ereport(FATAL,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("client certificates can only be checked if a root certificate store is available")));
-
-		/*
-		 * If we loaded a root certificate store, and if a certificate is
-		 * present on the client, then it has been verified against our root
-		 * certificate store, and the connection would have been aborted
-		 * already if it didn't verify ok.
-		 */
-		if (!port->peer_cert_valid)
-			ereport(FATAL,
-					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-					 errmsg("connection requires a valid client certificate")));
-	}
+	ClientAuthenticationCheckCertPre(port);
 
 	/*
 	 * Now proceed to do the actual authentication check
@@ -640,11 +624,7 @@ ClientAuthentication(Port *port)
 		 * Make sure we only check the certificate if we use the cert method
 		 * or verify-full option.
 		 */
-#ifdef USE_SSL
-		status = CheckCertAuth(port);
-#else
-		Assert(false);
-#endif
+		status = ClientAuthenticationCheckCertPost(port);
 	}
 
 	if ((log_connections & LOG_CONNECTION_AUTHENTICATION) &&
@@ -676,6 +656,51 @@ ClientAuthentication(Port *port)
 					logdetail);
 }
 
+
+/*
+ * ClientAuthenticationCheckCertPre / ClientAuthenticationCheckCertPost
+ *
+ * Shared pg_hba.conf clientcert verification helpers used by both native
+ * ClientAuthentication() and pluggable protocol extensions.
+ */
+void
+ClientAuthenticationCheckCertPre(Port *port)
+{
+	if (port->hba->clientcert != clientCertOff)
+	{
+		/* If we haven't loaded a root certificate store, fail */
+		if (!secure_loaded_verify_locations())
+			ereport(FATAL,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("client certificates can only be checked if a root certificate store is available")));
+
+		/*
+		 * If we loaded a root certificate store, and if a certificate is
+		 * present on the client, then it has been verified against our root
+		 * certificate store, and the connection would have been aborted
+		 * already if it didn't verify ok.
+		 */
+		if (!port->peer_cert_valid)
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					 errmsg("connection requires a valid client certificate")));
+	}
+}
+
+int
+ClientAuthenticationCheckCertPost(Port *port)
+{
+	if (port->hba->clientcert != clientCertFull &&
+		port->hba->auth_method != uaCert)
+		return STATUS_OK;
+
+#ifdef USE_SSL
+	return CheckCertAuth(port);
+#else
+	Assert(false);
+	return STATUS_ERROR;
+#endif
+}
 
 /*
  * Send an authentication request packet to the frontend.

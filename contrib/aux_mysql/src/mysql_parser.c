@@ -17,6 +17,7 @@
 #include "mb/pg_wchar.h"
 #include "lib/stringinfo.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "mys_gramparse.h"
 
 #include "halo_mysql.h"
@@ -26,7 +27,10 @@
 extern List *mys_raw_parser(const char *str);
 #endif
 
-/* a \0 escape: the only way a valid query text can put a NUL in a string */
+/*
+ * A conservative byte filter. The lexer distinguishes escapes from trail
+ * bytes in client encodings such as SJIS.
+ */
 static bool
 has_nul_escape(const char *query, int len)
 {
@@ -34,12 +38,8 @@ has_nul_escape(const char *query, int len)
 		return false;
 	for (int i = 0; i + 1 < len; i++)
 	{
-		if (query[i] == '\\')
-		{
-			if (query[i + 1] == '0')
-				return true;
-			i++;				/* the escaped character */
-		}
+		if (query[i] == '\\' && query[i + 1] == '0')
+			return true;
 	}
 	return false;
 }
@@ -57,16 +57,20 @@ has_nul_escape(const char *query, int len)
  * keeping one lexer keeps quoting and SQL mode interpretation identical.
  */
 char *
-mys_normalize_query(const char *query, int len)
+mys_normalize_query(const char *query, int len, int encoding)
 {
 	mys_yy_extra_type extra;
 	core_yyscan_t scanner;
 	core_YYSTYPE value;
-	YYLTYPE loc;
+	YYLTYPE loc = 0;
 	StringInfoData out;
 	int copied = 0;
 	int			prev_token = 0;
 	int			end = len;
+
+	/* SQL_ASCII clients leave validation of ordinary text to the database. */
+	if (encoding == PG_SQL_ASCII)
+		encoding = GetDatabaseEncoding();
 
 	/* as in MySQL, a NUL at the end (a C string sent with its terminator) ends the query */
 	while (end > 0 && (query[end - 1] == '\0' || scanner_isspace(query[end - 1])))
@@ -83,12 +87,37 @@ mys_normalize_query(const char *query, int len)
 		return pnstrdup(query, len);
 	}
 	if (memchr(query, '\0', len) == NULL && !has_nul_escape(query, len) &&
-		pg_verify_mbstr(GetDatabaseEncoding(), query, len, true))
+		(encoding == GetDatabaseEncoding() || memchr(query, '_', len) == NULL) &&
+		pg_verify_mbstr(encoding, query, len, true))
 		return pnstrdup(query, len);
 	memset(&extra, 0, sizeof(extra));
 	scanner = mys_scanner_init_len(query, len, &extra.core_yy_extra,
 								   &MysScanKeywords, MysScanKeywordTokens);
 	extra.normalizing = true;
+	extra.literal_encoding = encoding;
+	if (PG_ENCODING_IS_CLIENT_ONLY(encoding))
+	{
+		/*
+		 * The byte-oriented lexer must not interpret an ASCII trail byte
+		 * (e.g. in SJIS) as SQL punctuation. Keep offsets identical and
+		 * use the original bytes when collecting literal contents.
+		 */
+		extra.wire_source = query;
+		for (int i = 0; i < len; i++)
+		{
+			int			width;
+
+			if (!IS_HIGHBIT_SET(query[i]))
+				continue;
+			width = pg_encoding_verifymbchar(encoding, query + i, len - i);
+			for (int j = 1; j < width; j++)
+			{
+				i++;
+				if (!IS_HIGHBIT_SET(query[i]))
+					extra.core_yy_extra.scanbuf[i] = (char) 0x80;
+			}
+		}
+	}
 	initStringInfo(&out);
 	for (;;)
 	{
@@ -105,6 +134,10 @@ mys_normalize_query(const char *query, int len)
 			appendBinaryStringInfo(&out, query + copied, loc - copied);
 			/* The introducer may touch the quote: _binary'...' is valid. */
 			appendStringInfoString(&out, prev_token == UNDERSCORE_BINARY ? " X'" : " _binary X'");
+			if ((Size) n > (MaxAllocSize - 1) / 2)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("binary literal is too large")));
 			enlargeStringInfo(&out, n * 2 + 1);
 			out.len += hex_encode(value.str + 16, n, out.data + out.len);
 			appendStringInfoChar(&out, '\'');

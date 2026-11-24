@@ -53,6 +53,7 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/protocol_extension.h"
 #include "storage/ipc.h"
+#include "tcop/backend_startup.h"
 #include "tcop/dest.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
@@ -391,6 +392,13 @@ mys_maybe_shrink_outbuf(void)
 void
 mys_send_packet(const char *payload, int len)
 {
+	if (outbuf.data == NULL)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+
+		initStringInfo(&outbuf);
+		MemoryContextSwitchTo(oldcxt);
+	}
 	do
 	{
 		int			chunk = Min(len, MYS_MAX_PACKET);
@@ -427,12 +435,14 @@ mys_read_packet(StringInfo buf)
 		Min((Size) halo_mysql_max_allowed_packet, (Size) MYS_MAX_PREAUTH_PACKET);
 
 	resetStringInfo(buf);
+	HOLD_CANCEL_INTERRUPTS();
 	pq_startmsgread();
 	for (;;)
 	{
 		if (pq_getbytes((char *) hdr, 4) == EOF)
 		{
 			pq_endmsgread();
+			RESUME_CANCEL_INTERRUPTS();
 			return EOF;
 		}
 		len = hdr[0] | (hdr[1] << 8) | (hdr[2] << 16);
@@ -441,6 +451,7 @@ mys_read_packet(StringInfo buf)
 			(Size) buf->len + (Size) len >= MaxAllocSize - 1)
 		{
 			pq_endmsgread();
+			RESUME_CANCEL_INTERRUPTS();
 			ereport(FATAL,
 					(errcode(MYS_ERRCODE_PACKET_TOO_LARGE),
 					 errmsg("Got a packet bigger than 'max_allowed_packet' bytes")));
@@ -449,6 +460,7 @@ mys_read_packet(StringInfo buf)
 		if (len > 0 && pq_getbytes(buf->data + buf->len, len) == EOF)
 		{
 			pq_endmsgread();
+			RESUME_CANCEL_INTERRUPTS();
 			return EOF;
 		}
 		buf->len += len;
@@ -457,6 +469,7 @@ mys_read_packet(StringInfo buf)
 			break;
 	}
 	pq_endmsgread();
+	RESUME_CANCEL_INTERRUPTS();
 	buf->cursor = 0;
 	return 0;
 }
@@ -700,7 +713,8 @@ mysql_listen_init(void)
 	ListCell   *lc;
 	int			success = 0;
 
-	addrs = halo_mysql_listen_addresses ? halo_mysql_listen_addresses : ListenAddresses;
+	addrs = (halo_mysql_listen_addresses && halo_mysql_listen_addresses[0] != '\0') ?
+		halo_mysql_listen_addresses : ListenAddresses;
 	if (!halo_mysql_listener_on || halo_mysql_port == 0 || addrs == NULL || addrs[0] == '\0')
 		return;
 
@@ -805,7 +819,7 @@ mys_send_greeting(Port *port)
 }
 
 static char *
-get_cstring(StringInfo b)
+get_cstring(StringInfo b, bool copy)
 {
 	char	   *s;
 	int			avail;
@@ -819,7 +833,15 @@ get_cstring(StringInfo b)
 	if (n >= avail && b->data[b->len] != '\0')
 		return NULL;
 	b->cursor += Min(n + 1, avail);
-	return pnstrdup(s, n);
+	return copy ? pnstrdup(s, n) : s;
+}
+
+static void
+free_auth_packet(StringInfo pkt)
+{
+	/* On EOF pq_getbytes may have copied beyond the last complete chunk. */
+	explicit_bzero(pkt->data, pkt->maxlen);
+	pfree(pkt->data);
 }
 
 static void
@@ -877,11 +899,7 @@ mys_start(Port *port)
 
 	initStringInfo(&pkt);
 	if (mys_read_packet(&pkt) == EOF)
-	{
-		pfree(pkt.data);
-		MemoryContextSwitchTo(oldcxt);
-		return STATUS_ERROR;	/* client went away, e.g. port probe */
-	}
+		goto failed;			/* client went away, e.g. port probe */
 
 	if (!get_uint(&pkt, 4, &v))
 		goto bad_packet;
@@ -892,9 +910,7 @@ mys_start(Port *port)
 		mys_send_err(1251, "08004",
 					 "Client does not support authentication protocol requested by server; consider upgrading MySQL client");
 		mys_flush();
-		pfree(pkt.data);
-		MemoryContextSwitchTo(oldcxt);
-		return STATUS_ERROR;
+		goto failed;
 	}
 
 	if (mys_client_caps & CLIENT_SSL)
@@ -907,19 +923,11 @@ mys_start(Port *port)
 		if (!mys_ssl_available(port) || pkt.len != 32)
 			goto bad_packet;
 		if (secure_open_server(port) != 0)
-		{
-			pfree(pkt.data);
-			MemoryContextSwitchTo(oldcxt);
-			return STATUS_ERROR;	/* TLS alert already sent */
-		}
+			goto failed;		/* TLS alert already sent */
 
 		/* the real HandshakeResponse41 follows, encrypted */
 		if (mys_read_packet(&pkt) == EOF || !get_uint(&pkt, 4, &v))
-		{
-			pfree(pkt.data);
-			MemoryContextSwitchTo(oldcxt);
-			return STATUS_ERROR;
-		}
+			goto failed;
 		mys_client_caps = (uint32) v;
 		if (!(mys_client_caps & CLIENT_PROTOCOL_41))
 			goto bad_packet;
@@ -928,7 +936,7 @@ mys_start(Port *port)
 	/* max packet size(4), charset(1), filler(23) */
 	if (!get_bytes(&pkt, 4 + 1 + 23, &dummy))
 		goto bad_packet;
-	user = get_cstring(&pkt);
+	user = get_cstring(&pkt, true);
 	if (user == NULL)
 		goto bad_packet;
 
@@ -946,34 +954,32 @@ mys_start(Port *port)
 	}
 	else
 	{
-		char	   *s = get_cstring(&pkt);
+		const char *s = get_cstring(&pkt, false);
 
 		if (s == NULL)
 			goto bad_packet;
 		auth_len = (int) strlen(s);
 		dummy = s;
 	}
-	client_auth_resp = palloc((Size) auth_len + 1);
-	memcpy(client_auth_resp, dummy, auth_len);
-	client_auth_resp[auth_len] = '\0';
-	client_auth_resp_len = auth_len;
-
 	if ((mys_client_caps & CLIENT_CONNECT_WITH_DB) && pkt.cursor < pkt.len)
-		initial_db = get_cstring(&pkt);
+		initial_db = get_cstring(&pkt, true);
 	if ((mys_client_caps & CLIENT_PLUGIN_AUTH) && pkt.cursor < pkt.len)
-		client_plugin = get_cstring(&pkt);
+		client_plugin = get_cstring(&pkt, true);
 	if ((mys_client_caps & CLIENT_CONNECT_ATTRS) && pkt.cursor < pkt.len)
 		mys_parse_connect_attrs(&pkt, port);
-
-	pfree(pkt.data);
 
 	if (user[0] == '\0')
 	{
 		mys_send_err(1045, "28000", "Access denied: empty user name");
 		mys_flush();
-		MemoryContextSwitchTo(oldcxt);
-		return STATUS_ERROR;
+		goto failed;
 	}
+
+	client_auth_resp = palloc((Size) auth_len + 1);
+	memcpy(client_auth_resp, dummy, auth_len);
+	client_auth_resp[auth_len] = '\0';
+	client_auth_resp_len = auth_len;
+	free_auth_packet(&pkt);
 
 	port->user_name = user;
 	port->database_name = pstrdup(halo_mysql_database);
@@ -988,9 +994,10 @@ mys_start(Port *port)
 	return STATUS_OK;
 
 bad_packet:
-	pfree(pkt.data);
 	mys_send_err(1043, "08S01", "Bad handshake");
 	mys_flush();
+failed:
+	free_auth_packet(&pkt);
 	MemoryContextSwitchTo(oldcxt);
 	return STATUS_ERROR;
 }
@@ -1003,9 +1010,12 @@ static void
 mys_read_auth_packet(StringInfo buf)
 {
 	if (mys_read_packet(buf) == EOF)
+	{
+		free_auth_packet(buf);
 		ereport(FATAL,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("client disconnected during authentication")));
+	}
 }
 
 /* AuthMoreData: 0x01 followed by plugin data */
@@ -1020,6 +1030,19 @@ mys_send_auth_more_data(const char *data, int len)
 	mys_send_packet(b.data, b.len);
 	mys_flush();
 	pfree(b.data);
+}
+
+static void
+mys_clear_auth_resp(void)
+{
+	if (client_auth_resp)
+	{
+		if (client_auth_resp_len > 0)
+			explicit_bzero(client_auth_resp, client_auth_resp_len);
+		pfree(client_auth_resp);
+		client_auth_resp = NULL;
+		client_auth_resp_len = 0;
+	}
 }
 
 /*
@@ -1049,8 +1072,7 @@ mys_auth_switch(const char *plugin)
 	mys_read_auth_packet(&resp);
 	if (client_plugin)
 		pfree(client_plugin);
-	if (client_auth_resp)
-		pfree(client_auth_resp);
+	mys_clear_auth_resp();
 	client_plugin = pstrdup(plugin);
 	client_auth_resp = resp.data;
 	client_auth_resp_len = resp.len;
@@ -1059,6 +1081,9 @@ mys_auth_switch(const char *plugin)
 static pg_noreturn void
 mys_auth_failed(Port *port, bool with_password, const char *logdetail)
 {
+	mys_clear_auth_resp();
+	if (ClientAuthentication_hook)
+		(*ClientAuthentication_hook) (port, STATUS_ERROR);
 	ereport(FATAL,
 			(errcode(ERRCODE_INVALID_PASSWORD),
 			 errmsg("Access denied for user '%s'@'%s' (using password: %s)",
@@ -1084,8 +1109,7 @@ mys_sha2_full_auth(Port *port)
 	if (port->ssl_in_use)
 	{
 		passwd = pnstrdup(pkt.data, strnlen(pkt.data, pkt.len));
-		explicit_bzero(pkt.data, pkt.len);
-		pfree(pkt.data);
+		free_auth_packet(&pkt);
 		return passwd;
 	}
 
@@ -1096,7 +1120,10 @@ mys_sha2_full_auth(Port *port)
 
 		if (pem == NULL)
 		{
-			pfree(pkt.data);
+			free_auth_packet(&pkt);
+			mys_clear_auth_resp();
+			if (ClientAuthentication_hook)
+				(*ClientAuthentication_hook) (port, STATUS_ERROR);
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("Authentication requires secure connection."),
@@ -1108,7 +1135,7 @@ mys_sha2_full_auth(Port *port)
 
 	passwd = mys_rsa_decrypt_password((uint8 *) pkt.data, pkt.len,
 									  scramble, MYS_SCRAMBLE_LEN);
-	pfree(pkt.data);
+	free_auth_packet(&pkt);
 	if (passwd == NULL)
 		mys_auth_failed(port, true, "could not decrypt the RSA encrypted password");
 	return passwd;
@@ -1141,14 +1168,21 @@ mys_password_auth(Port *port)
 		shadow_pass = NULL;
 	}
 
-	if ((client_plugin && strcmp(client_plugin, AUTH_CLEAR) == 0) ||
-		halo_mysql_auth_plugin == MYS_AUTH_CLEARTEXT)
+	if (halo_mysql_auth_plugin == MYS_AUTH_CLEARTEXT ||
+		(port->ssl_in_use && client_plugin && strcmp(client_plugin, AUTH_CLEAR) == 0))
 	{
-		/* the client chose clear text, or the server is in legacy mode */
+		/*
+		 * Accept mysql_clear_password when explicitly configured by the
+		 * administrator, or when the client requests it over TLS.  When the
+		 * default caching_sha2_password plugin is active on a plaintext link,
+		 * force AuthSwitch to caching_sha2_password instead of accepting a
+		 * cleartext downgrade.
+		 */
 		if (client_plugin == NULL || strcmp(client_plugin, AUTH_CLEAR) != 0)
 			mys_auth_switch(AUTH_CLEAR);
 		passwd = pnstrdup(client_auth_resp,
 						  strnlen(client_auth_resp, client_auth_resp_len));
+		mys_clear_auth_resp();
 	}
 	else
 	{
@@ -1166,6 +1200,7 @@ mys_password_auth(Port *port)
 							   scramble, MYS_SCRAMBLE_LEN,
 							   (uint8 *) client_auth_resp, client_auth_resp_len))
 		{
+			mys_clear_auth_resp();
 			mys_send_auth_more_data(&fast_ok, 1);
 			return;
 		}
@@ -1174,6 +1209,7 @@ mys_password_auth(Port *port)
 		 * Cache miss (or wrong password): ask for the password itself.  Also
 		 * done for unknown roles, so they cannot be told apart.
 		 */
+		mys_clear_auth_resp();
 		mys_send_auth_more_data(&full_auth, 1);
 		passwd = mys_sha2_full_auth(port);
 	}
@@ -1211,10 +1247,18 @@ mys_authenticate(Port *port)
 {
 	hba_getauthmethod(port);
 
+	CHECK_FOR_INTERRUPTS();
+
+	/* Enforce pg_hba.conf clientcert=verify-ca / verify-full / cert */
+	ClientAuthenticationCheckCertPre(port);
+
 	switch (port->hba->auth_method)
 	{
 		case uaReject:
 		case uaImplicitReject:
+			mys_clear_auth_resp();
+			if (ClientAuthentication_hook)
+				(*ClientAuthentication_hook) (port, STATUS_ERROR);
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("Access denied for user '%s'@'%s' (rejected by pg_hba.conf for database \"%s\")",
@@ -1222,23 +1266,49 @@ mys_authenticate(Port *port)
 							port->database_name)));
 			break;
 
+		case uaCert:
 		case uaTrust:
+			mys_clear_auth_resp();
 			break;
 
 		case uaPassword:
 		case uaMD5:
 		case uaSCRAM:
 			mys_password_auth(port);
+			set_authn_id(port, port->user_name);
 			break;
 
 		default:
+			mys_clear_auth_resp();
+			if (ClientAuthentication_hook)
+				(*ClientAuthentication_hook) (port, STATUS_ERROR);
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("authentication method \"%s\" is not supported by the MySQL protocol",
 							hba_authname(port->hba->auth_method))));
 	}
 
-	set_authn_id(port, port->user_name);
+	if (ClientAuthenticationCheckCertPost(port) != STATUS_OK)
+	{
+		if (ClientAuthentication_hook)
+			(*ClientAuthentication_hook) (port, STATUS_ERROR);
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+				 errmsg("certificate authentication failed for user \"%s\"",
+						port->user_name)));
+	}
+
+	if ((log_connections & LOG_CONNECTION_AUTHENTICATION) &&
+		!MyClientConnectionInfo.authn_id)
+	{
+		ereport(LOG,
+				errmsg("connection authenticated: user=\"%s\" method=%s (%s:%d)",
+					   port->user_name, hba_authname(port->hba->auth_method),
+					   port->hba->sourcefile, port->hba->linenumber));
+	}
+
+	if (ClientAuthentication_hook)
+		(*ClientAuthentication_hook) (port, STATUS_OK);
 }
 
 /* ----------------------------------------------------------------
@@ -1525,6 +1595,7 @@ mys_send_ready_for_query(CommandDest dest)
 	}
 	if (pending_err_active)
 	{
+		mys_statement_failed();
 		mys_send_err(pending_err_code, pending_err_sqlstate, pending_err_msg);
 		clear_pending_err();
 	}
@@ -1541,7 +1612,7 @@ mys_send_ready_for_query(CommandDest dest)
  * An error raised while decoding a command inside read_command is reported
  * from process_command, i.e. from the main loop proper.
  */
-#define MYS_DEFERRED_ERROR		0xff
+#define MYS_DEFERRED_ERROR		(PG_UINT8_MAX + 1) /* outside the wire command space */
 static ErrorData *deferred_error = NULL;
 static bool pending_stmt_execute = false;
 
@@ -1561,9 +1632,20 @@ mys_read_command(StringInfo inBuf)
 	{
 		/* the next part of the current command (see mys_queue_query) */
 		MysQueuedQuery *q = linitial(queued_queries);
+		int			qlen = strlen(q->query);
+		char	   *wire = q->query;
+		int			wire_len = qlen;
 
+		if (pg_get_client_encoding() != GetDatabaseEncoding())
+		{
+			wire = pg_server_to_client(q->query, qlen);
+			if (wire != q->query)
+				wire_len = strlen(wire);
+		}
 		resetStringInfo(inBuf);
-		appendBinaryStringInfo(inBuf, q->query, strlen(q->query) + 1);	/* with the NUL */
+		appendBinaryStringInfo(inBuf, wire, wire_len + 1);	/* with the NUL */
+		if (wire != q->query)
+			pfree(wire);
 		if (q->map)
 			mys_text_map = copy_text_map(q->map);
 		queued_queries = list_delete_first(queued_queries);
@@ -1613,7 +1695,8 @@ mys_read_command(StringInfo inBuf)
 
 				PG_TRY();
 				{
-					char	   *query = mys_normalize_query(inBuf->data + 1, inBuf->len - 1);
+					char	   *query = mys_normalize_query(inBuf->data + 1, inBuf->len - 1,
+															  pg_get_client_encoding());
 
 					resetStringInfo(inBuf);
 					appendBinaryStringInfo(inBuf, query, strlen(query) + 1);
@@ -1621,8 +1704,9 @@ mys_read_command(StringInfo inBuf)
 				}
 				PG_CATCH();
 				{
-					MemoryContextSwitchTo(cxt);
+					MemoryContextSwitchTo(TopMemoryContext);
 					deferred_error = CopyErrorData();
+					MemoryContextSwitchTo(cxt);
 					FlushErrorState();
 					mys_stmt_query_done();
 					ok = false;
@@ -1671,7 +1755,7 @@ mys_proto_abort_fast_exec(void)
 static bool
 mys_process_command(int firstchar, StringInfo inBuf)
 {
-	uint8		cmd;
+	int			cmd;
 
 	if (firstchar == PqMsg_Query && pending_stmt_execute)
 	{
@@ -1681,7 +1765,7 @@ mys_process_command(int firstchar, StringInfo inBuf)
 	}
 	if (firstchar < MYS_MSG_BASE)
 		return false;
-	cmd = (uint8) (firstchar - MYS_MSG_BASE);
+	cmd = firstchar - MYS_MSG_BASE;
 
 	switch (cmd)
 	{
@@ -1754,7 +1838,9 @@ mys_process_command(int firstchar, StringInfo inBuf)
 						   "The statement has no open cursor.");
 			break;
 		case MYS_DEFERRED_ERROR:
-			/* COM_STMT_EXECUTE could not be decoded: nothing ran */
+			/* COM_QUERY normalization failed before execution. */
+			if (deferred_error == NULL)
+				elog(ERROR, "missing deferred MySQL command error");
 			mys_clear_diagnostics();
 			mys_send_error(deferred_error->sqlerrcode, deferred_error->message);
 			FreeErrorData(deferred_error);
@@ -1787,7 +1873,7 @@ mys_process_command(int firstchar, StringInfo inBuf)
 								   "Unknown option to COM_SET_OPTION.");
 					break;
 				}
-				mys_send_eof(false);
+				mys_send_resultset_end(false);
 				break;
 			}
 		case COM_STATISTICS:
@@ -1832,6 +1918,7 @@ mys_parse_query(const char *query_string)
 	{
 		mys_sync_session_state();
 		mys_sync_selected_database();
+		mys_binary_session_init();
 	}
 
 	if (halo_mysql_parser == MYS_PARSER_POSTGRES)
@@ -1987,6 +2074,8 @@ end_statement(const QueryCompletion *qc)
 	following = stmt_index < list_length(stmt_infos) ?
 		(MysStmtInfo *) list_nth(stmt_infos, stmt_index) : NULL;
 	mys_txn_stmt_done(info, following);
+	if (qc->commandTag == CMDTAG_ROLLBACK || qc->commandTag == CMDTAG_COMMIT)
+		mys_finish_timezone_transaction(qc->commandTag == CMDTAG_ROLLBACK);
 	/* SET TRANSACTION's one-shot values; the next transaction's defaults */
 	mys_statement_done(info->txn_kind == MYS_TXN_END && !info->txn_control,
 					   following != NULL && following->txn_kind == MYS_TXN_IMPLICIT_COMMIT);
@@ -2077,13 +2166,18 @@ mys_end_command(const QueryCompletion *qc, CommandDest dest)
 		mys_clear_diagnostics();
 		mys_send_ok(0, 0, false, false);
 	}
+	if (stmt_index >= list_length(stmt_infos))
+	{
+		stmt_infos = NIL;
+		stmt_index = 0;
+	}
 }
 
 static void
 mys_null_command(CommandDest dest)
 {
 	mys_txn_clear_fallback_stmt_timeout();
-	mys_send_ok(0, 0, false, false);
+	mys_send_ok(0, 0, false, queued_queries != NIL || trailing_comment_ok);
 }
 
 /*
@@ -2178,6 +2272,11 @@ static void
 mys_comm_reset(void)
 {
 	clear_pending_err();
+	if (deferred_error != NULL)
+	{
+		FreeErrorData(deferred_error);
+		deferred_error = NULL;
+	}
 	fastpath_probe_active = false;
 	fastpath_probe_saw_warning = false;
 	mys_discard_rewrite_warnings();
@@ -2186,6 +2285,9 @@ mys_comm_reset(void)
 	memset(upsert_rows, 0, sizeof(upsert_rows));
 	upsert_deleted = 0;
 	resultset_active = false;
+	stmt_infos = NIL;
+	stmt_index = 0;
+	trailing_comment_ok = false;
 	discard_queued_queries();
 	mys_stmt_query_done();
 	mys_txn_reset_deferred_error();
@@ -2212,6 +2314,7 @@ typedef struct
 	bool		capture;		/* remember first value as LAST_INSERT_ID */
 	bool		captured;
 	bool		upsert;			/* count the last column's MysUpsertRow */
+	MysSetBatch *set_batch;
 	int			natts;
 	MysColumn  *cols;
 	StringInfoData row;
@@ -2424,6 +2527,7 @@ mys_dr_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 		dr->discard = info->silent || info->capture_insert_id ||
 			info->upsert != MYS_UPSERT_NONE || info->suppress_response;
 		dr->capture = info->capture_insert_id;
+		dr->set_batch = info->set_batch;
 		dr->captured = false;
 		dr->upsert = info->upsert != MYS_UPSERT_NONE;
 	}
@@ -2688,6 +2792,8 @@ mys_dr_receive(TupleTableSlot *slot, DestReceiver *self)
 
 	if (dr->discard)
 	{
+		if (dr->set_batch)
+			mys_prepare_set_batch(dr->set_batch);
 		if (dr->capture && !dr->captured && dr->natts > 0 && !slot->tts_isnull[0])
 		{
 			char	   *s = OutputFunctionCall(&dr->cols[0].finfo, slot->tts_values[0]);
@@ -2792,6 +2898,7 @@ const ProtocolExtensionConfig mysql_protocol_config = {
 	.foreign_key_checks = mys_foreign_key_checks,
 	.foreign_key_insert = mys_pending_fk_check_insert,
 	.sequence_write = mys_sequence_write,
+	.check_read_only = mys_check_read_only,
 	.on_conflict_row = mys_record_upsert_row,
 	.prepare_for_query = mys_txn_recover,
 };

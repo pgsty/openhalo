@@ -188,6 +188,11 @@ explicit product choice.
   compatibility is still partial.
 - A key name longer than 54 bytes (18 CJK characters) is shortened to that length (PostgreSQL index
   names hold 63 bytes, and the suffix takes 9); key names compare case-insensitively in ASCII only.
+- `mysql.part_list_columns()` supports character and binary strings, numeric and temporal
+  scalars, booleans, UUIDs, OIDs, names, and domains over those types. It encodes dates in
+  ISO format and timestamps with time zone in UTC. Numeric scale, fixed-width character
+  padding, signed floating-point zero, and equivalent interval representations produce
+  the same key. Other non-null types raise an error.
 - Native ENUM/SET, negative and long-duration TIME, and direct PG14 physical upgrades remain unsupported;
   [migration checks and explicit conversion examples](MIGRATION.md) describe the supported path.
 - Statement-level rollback uses a subtransaction per statement inside a transaction block: more than 64
@@ -228,6 +233,13 @@ explicit product choice.
 - Deferred DML forms: `DELETE target FROM ... JOIN ...` (including comma joins and orphan
   cleanup with LEFT JOIN) and true multi-target UPDATE/DELETE. The supported single-target
   `DELETE FROM target USING ...` form does not imply support for those spellings.
+- `LOCK TABLES` / `UNLOCK TABLES` are accepted as compatibility no-ops (no table-level lock
+  is held and no implicit commit is triggered) to avoid breaking dump scripts and legacy tools.
+- Plain `UPDATE` reports matched-row counts (`CLIENT_FOUND_ROWS` style) rather than changed-row
+  counts to avoid the extra full-row comparison overhead on OLTP updates.
+- When upgrading via `pg_upgrade` across PostgreSQL major versions, run
+  `ALTER EXTENSION aux_mysql UPDATE TO '2.0'` (or reapply the extension `pg_cast` updates)
+  so MySQL's `int4`/`bool` cast contexts are restored in the new cluster.
 - Accepted 1.9 differences: with PAD_CHAR_TO_FULL_LENGTH, some search/string-function inputs
   still lose CHAR padding, although stored bytes are unchanged; binary numeric CAST may reject
   extreme exponents such as `1e1000000`/`1e-1000000` and negative SIGNED overflow; empty-needle
@@ -284,11 +296,11 @@ explicit product choice.
 
 ## openHalo upstream
 
-The grammar (`src/parser/mys_gram.y`) and the SQL layer (`sql/aux_mysql.sql`) are generated from openHalo's
-PG14 sources (branch `pg14` of this repository) by `tools/port_grammar.py` and `tools/port_aux_sql.py`; each
-replacement asserts its match count, so upstream changes fail loudly. C code from openHalo lives in
-`src/mysm`, with its original copyright headers. `UPSTREAM.md` records how each upstream commit up to
-`90fc8d7` was ported.
+The grammar (`src/parser/mys_gram.y`), the SQL layer (`sql/aux_mysql--2.0.sql`, with upgrade
+path `sql/aux_mysql--1.9--2.0.sql`), and the C helpers in `src/mysm` were originally ported
+from openHalo's PostgreSQL 14 sources (branch `pg14` of this repository) and are now
+maintained directly on the PostgreSQL 19 tree with their original copyright headers preserved.
+`UPSTREAM.md` records how each upstream commit up to `90fc8d7` was ported.
 
 ## Tests
 

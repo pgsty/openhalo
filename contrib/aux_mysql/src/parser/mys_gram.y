@@ -61,6 +61,7 @@
 #include "catalog/pg_trigger.h"
 #include "commands/defrem.h"
 #include "commands/trigger.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 
@@ -204,6 +205,8 @@ static Node *makeStringConst(char *str, int location);
 static Node *makeStringConstCast(char *str, int location, TypeName *typename);
 static Node *makeIntConst(int val, int location);
 static TypeName *makeMysqlDecimalType(List *mods, int location, bool column);
+static Node *makeMysqlSystemVarTarget(char *name, Node *value, bool global, int location);
+static List *makeMysqlSetTargets(List *items);
 static Node *makeMysqlDropIndex(ObjectType type, List *names, RangeVar *table,
 								int location, core_yyscan_t yyscanner);
 static Node *makeFloatConst(char *str, int location);
@@ -261,8 +264,9 @@ static char *currentMysqlDatabaseForParse(core_yyscan_t yyscanner);
 static void validateMysqlDbOptions(List *options);
 static bool isMysqlAlterDbOptions(List *options);
 static Node *makeMysqlAlterDbStmt(char *dbname, List *options, int location);
-static void checkJoinOn(JoinExpr *joinExpr, bool *hasNotOn);
+static void checkJoinOn(JoinExpr *joinExpr, bool *hasNotOn, bool *pureInner);
 static void makeOnClause(Node **expr, JoinExpr *joinExpr);
+static void checkDeleteOption(const char *opt, int loc, core_yyscan_t yyscanner);
 
 %}
 
@@ -398,7 +402,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 %type <list>	utility_option_list
 %type <node>	utility_option_arg
 %type <defelt>	drop_option
-%type <boolean>	opt_or_replace opt_no
+%type <boolean>	opt_or_replace opt_no view_sql_security_opt
 				opt_grant_grant_option opt_grant_admin_option
 				opt_nowait opt_if_exists opt_with_data
 				opt_transaction_chain
@@ -711,10 +715,11 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
  * DOT_DOT is unused in the core SQL grammar, and so will always provoke
  * parse errors.  It is needed by PL/pgSQL.
  */
-%token <str>	IDENT UIDENT FCONST SCONST USCONST BCONST XCONST Op MysqlUserVariableName MysSysVarName
+%token <str>	IDENT UIDENT FCONST SCONST USCONST BCONST XCONST Op
 %token <ival>	ICONST PARAM
 %token			TYPECAST DOT_DOT COLON_EQUALS EQUALS_GREATER
 %token			LESS_EQUALS GREATER_EQUALS NOT_EQUALS
+%token <str>	MysqlUserVariableName MysSysVarName
 %token          UNDERSCORE_BINARY MysParam Op_And Op_Or
 
 /*
@@ -1618,7 +1623,7 @@ VariableSetStmt:
                 {
                     MysVariableSetStmt *rt = makeNode(MysVariableSetStmt);
                     SelectStmt *result = makeNode(SelectStmt);
-                    result->targetList = $2;
+					result->targetList = makeMysqlSetTargets($2);
 
                     rt->varSetStmt = (Node *)result;
 
@@ -1796,280 +1801,29 @@ mysql_set_variable_name:
 
 mysql_system_variable:
 			mysql_set_variable_name plassign_equals on_a_expr
-                {
-                    ResTarget *result;
-                    List *funcName;
-                    List *argList;
-                    Node *funcCall;
-                    result = makeNode(ResTarget);
-                    funcName = list_make2(makeString(pstrdup("mysql")),
-                                          makeString(pstrdup("set_system_session_variable")));
-                    argList = NIL;
-                    if (IsA($3, ColumnRef))
-                    {
-                        ListCell   *lc;
-                        ColumnRef *c = castNode(ColumnRef, $3);
-                        foreach(lc, c->fields)
-                        {
-							Node *v = (Node *) lfirst(lc);
-							if (strncasecmp(strVal(v), "off", 3) != 0)
-                            {
-								argList = list_make2(makeStringConst($1, @1), makeStringConst(strVal(v), -1));
-                            }
-                            else
-                            {
-                                argList = list_make2(makeStringConst($1, @1), 
-                                                     makeIntConst(0, -1));
-
-                            }
-                            break;
-                        }
-                    }
-                    else
-                    {
-                        argList = list_make2(makeStringConst($1, @1), $3);
-                    }
-                    funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
-                    result->name = NULL;
-                    result->indirection = NIL;
-                    result->val = funcCall;
-                    result->location = @1;
-                    $$ = (Node *) result;
-                }
+				{ $$ = (Node *) makeDefElem($1, $3, @1); }
 			| LOCAL mysql_set_variable_name plassign_equals on_a_expr
-				{
-					ResTarget  *result = makeNode(ResTarget);
-					List	   *funcName = list_make2(makeString(pstrdup("mysql")),
-													  makeString(pstrdup("set_system_session_variable")));
-					List	   *argList = NIL;
-					Node	   *funcCall;
-
-					if (IsA($4, ColumnRef))
-					{
-						ListCell   *lc;
-						ColumnRef  *c = castNode(ColumnRef, $4);
-
-						foreach(lc, c->fields)
-						{
-							Node	   *v = (Node *) lfirst(lc);
-
-							if (strncasecmp(strVal(v), "off", 3) != 0)
-								argList = list_make2(makeStringConst($2, @2),
-													 makeStringConst(strVal(v), -1));
-							else
-								argList = list_make2(makeStringConst($2, @2),
-													 makeIntConst(0, -1));
-							break;
-						}
-					}
-					else
-						argList = list_make2(makeStringConst($2, @2), $4);
-					funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
-					result->name = NULL;
-					result->indirection = NIL;
-					result->val = funcCall;
-					result->location = @1;
-					$$ = (Node *) result;
-				}
+				{ $$ = (Node *) makeDefElemExtended("session", $2, $4, DEFELEM_UNSPEC, @2); }
 			| SESSION mysql_set_variable_name plassign_equals on_a_expr
-				{
-					ResTarget  *result = makeNode(ResTarget);
-					List	   *funcName = list_make2(makeString(pstrdup("mysql")),
-													  makeString(pstrdup("set_system_session_variable")));
-					List	   *argList = NIL;
-					Node	   *funcCall;
-
-					if (IsA($4, ColumnRef))
-					{
-						ListCell   *lc;
-						ColumnRef  *c = castNode(ColumnRef, $4);
-
-						foreach(lc, c->fields)
-						{
-							Node	   *v = (Node *) lfirst(lc);
-
-							if (strncasecmp(strVal(v), "off", 3) != 0)
-								argList = list_make2(makeStringConst($2, @2),
-													 makeStringConst(strVal(v), -1));
-							else
-								argList = list_make2(makeStringConst($2, @2),
-													 makeIntConst(0, -1));
-							break;
-						}
-					}
-					else
-						argList = list_make2(makeStringConst($2, @2), $4);
-					funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
-					result->name = NULL;
-					result->indirection = NIL;
-					result->val = funcCall;
-					result->location = @1;
-					$$ = (Node *) result;
-				}
+				{ $$ = (Node *) makeDefElemExtended("session", $2, $4, DEFELEM_UNSPEC, @2); }
 			| GLOBAL mysql_set_variable_name plassign_equals on_a_expr
+				{ $$ = (Node *) makeDefElemExtended("global", $2, $4, DEFELEM_UNSPEC, @2); }
+			| MysSysVarName plassign_equals on_a_expr
 				{
-					ResTarget  *result = makeNode(ResTarget);
-					List	   *funcName = list_make2(makeString(pstrdup("mysql")),
-													  makeString(pstrdup("set_system_global_variable")));
-					List	   *argList = NIL;
-					Node	   *funcCall;
+					char	   *name = $1;
+					bool		global = false;
 
-					if (IsA($4, ColumnRef))
+					if (pg_strncasecmp(name, "global.", 7) == 0)
 					{
-						ListCell   *lc;
-						ColumnRef  *c = castNode(ColumnRef, $4);
-
-						foreach(lc, c->fields)
-						{
-							Node	   *v = (Node *) lfirst(lc);
-
-							if (strncasecmp(strVal(v), "off", 3) != 0)
-								argList = list_make2(makeStringConst($2, @2),
-													 makeStringConst(strVal(v), -1));
-							else
-								argList = list_make2(makeStringConst($2, @2),
-													 makeIntConst(0, -1));
-							break;
-						}
+						global = true;
+						name += 7;
 					}
-					else
-						argList = list_make2(makeStringConst($2, @2), $4);
-					funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
-					result->name = NULL;
-					result->indirection = NIL;
-					result->val = funcCall;
-					result->location = @1;
-					$$ = (Node *) result;
+					else if (pg_strncasecmp(name, "session.", 8) == 0)
+						name += 8;
+					else if (pg_strncasecmp(name, "local.", 6) == 0)
+						name += 6;
+					$$ = makeMysqlSystemVarTarget(name, $3, global, @1);
 				}
-            | MysSysVarName plassign_equals on_a_expr
-                {
-                    ResTarget *result;
-                    List *funcName;
-                    List *argList;
-                    Node *funcCall;
-
-                    result = makeNode(ResTarget);
-                    argList = NIL;
-                    if (strncasecmp($1, "local.", 6) == 0)
-                    {
-                        funcName = list_make2(makeString(pstrdup("mysql")),
-                                              makeString(pstrdup("set_system_session_variable")));
-                        if (IsA($3, ColumnRef))
-                        {
-                            ListCell   *lc;
-                            ColumnRef *c = castNode(ColumnRef, $3);
-                            foreach(lc, c->fields)
-                            {
-								Node *v = (Node *) lfirst(lc);
-								if (strncasecmp(strVal(v), "off", 3) != 0)
-                                {
-									argList = list_make2(makeStringConst(($1 + 6), @1), makeStringConst(strVal(v), -1));
-                                }
-                                else
-                                {
-                                    argList = list_make2(makeStringConst(($1 + 6), @1), 
-                                                         makeIntConst(0, -1));
-                                }
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            argList = list_make2(makeStringConst(($1 + 6), @1), $3);
-                        }
-                    }
-                    else if (strncasecmp($1, "session.", 8) == 0)
-                    {
-                        funcName = list_make2(makeString(pstrdup("mysql")),
-                                              makeString(pstrdup("set_system_session_variable")));
-                        if (IsA($3, ColumnRef))
-                        {
-                            ListCell   *lc;
-                            ColumnRef *c = castNode(ColumnRef, $3);
-                            foreach(lc, c->fields)
-                            {
-								Node *v = (Node *) lfirst(lc);
-								if (strncasecmp(strVal(v), "off", 3) != 0)
-                                {
-									argList = list_make2(makeStringConst(($1 + 8), @1), makeStringConst(strVal(v), -1));
-                                }
-                                else
-                                {
-                                    argList = list_make2(makeStringConst(($1 + 8), @1), 
-                                                         makeIntConst(0, -1));
-                                }
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            argList = list_make2(makeStringConst(($1 + 8), @1), $3);
-                        }
-                    }
-                    else if (strncasecmp($1, "global.", 7) == 0)
-                    {
-                        funcName = list_make2(makeString(pstrdup("mysql")),
-                                              makeString(pstrdup("set_system_global_variable")));
-                        if (IsA($3, ColumnRef))
-                        {
-                            ListCell   *lc;
-                            ColumnRef *c = castNode(ColumnRef, $3);
-                            foreach(lc, c->fields)
-                            {
-								Node *v = (Node *) lfirst(lc);
-								if (strncasecmp(strVal(v), "off", 3) != 0)
-                                {
-									argList = list_make2(makeStringConst(($1 + 7), @1), makeStringConst(strVal(v), -1));
-                                }
-                                else
-                                {
-                                    argList = list_make2(makeStringConst(($1 + 7), @1), 
-                                                         makeIntConst(0, -1));
-                                }
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            argList = list_make2(makeStringConst(($1 + 7), @1), $3);
-                        }
-                    }
-                    else
-                    {
-                        funcName = list_make2(makeString(pstrdup("mysql")),
-                                              makeString(pstrdup("set_system_session_variable")));
-                        if (IsA($3, ColumnRef))
-                        {
-                            ListCell   *lc;
-                            ColumnRef *c = castNode(ColumnRef, $3);
-                            foreach(lc, c->fields)
-                            {
-								Node *v = (Node *) lfirst(lc);
-								if (strncasecmp(strVal(v), "off", 3) != 0)
-                                {
-									argList = list_make2(makeStringConst($1, @1), makeStringConst(strVal(v), -1));
-                                }
-                                else
-                                {
-                                    argList = list_make2(makeStringConst($1, @1), 
-                                                         makeIntConst(0, -1));
-                                }
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            argList = list_make2(makeStringConst($1, @1), $3);
-                        }
-                    }
-                    funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
-                    result->name = NULL;
-					result->indirection = NIL;
-					result->val = funcCall;
-					result->location = @1;
-                    $$ = (Node *) result;
-                }
-
 			| NAMES mysql_set_charset mysql_set_collation
                 {
                     ResTarget *result = makeNode(ResTarget);
@@ -2858,7 +2612,6 @@ DBTableInfoShowStmt:
 					SelectStmt *selectStmt;
                     char tableNameAlias[1024];
 					SelectStmt *selectStmtTables;
-					SelectStmt *selectStmtViews;
 					SortBy *order;
 
 					selectStmt = makeNode(SelectStmt);
@@ -2919,51 +2672,8 @@ DBTableInfoShowStmt:
                                             -1);
                     }
 
-					selectStmtViews = makeNode(SelectStmt);
-                    selectStmtViews->targetList = NIL;
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithColumn(tableNameAlias, "table_name", yyscanner));
-                    selectStmtViews->fromClause = list_make1(createRangeVar("mys_informa_schema", "views"));
-                    if ($3 != NULL)
-                    {
-                        selectStmtViews->whereClause = 
-                                (Node *)makeSimpleA_Expr(AEXPR_OP, 
-                                                         "=", 
-                                                         (Node *)makeColumnRef("table_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst($3->relname, -1), 
-                                                         -1); 
-                    }
-                    else
-                    {
-                        selectStmtViews->whereClause = 
-                                (Node *)makeSimpleA_Expr(AEXPR_OP, 
-                                                         "=", 
-                                                         (Node *)makeColumnRef("table_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst(currentMysqlDatabaseForParse(yyscanner), -1), 
-                                                         -1); 
-                    }
-                    if ($4 != NULL)
-                    {
-                        selectStmtViews->whereClause = 
-                                makeAndExpr(selectStmtViews->whereClause, 
-                                            (Node *) makeSimpleA_Expr(AEXPR_OP, 
-                                                                      "~~", 
-                                                                      makeColumnRef("table_name", NIL, -1, yyscanner), 
-                                                                      makeStringConst($4, -1), 
-                                                                      -1), 
-                                            -1);
-                    }
-                    else if ($5 != NULL)
-                    {
-                        selectStmtViews->whereClause = 
-                                makeAndExpr(selectStmtViews->whereClause, 
-                                            copyObject($5), 
-                                            -1);
-                    }
-
-					selectStmt = (SelectStmt *)makeSetOp(SETOP_UNION, 
-                                                         true, 
-                                                         (Node *)selectStmtTables, 
-                                                         (Node *)selectStmtViews);
+					/* mys_informa_schema.tables already contains both BASE TABLE and VIEW */
+					selectStmt = selectStmtTables;
 
 					order = (SortBy *) makeNode(SortBy);
 					order->node = makeIntConst(1, -1);
@@ -2990,7 +2700,6 @@ DBTableInfoShowStmt:
 					SelectStmt *selectStmt;
                     char tableNameAlias[1024];
 					SelectStmt *selectStmtTables;
-					SelectStmt *selectStmtViews;
 					SortBy *order;
 
 					selectStmt = makeNode(SelectStmt);
@@ -3052,52 +2761,8 @@ DBTableInfoShowStmt:
                                             -1);
                     }
 
-					selectStmtViews = makeNode(SelectStmt);
-                    selectStmtViews->targetList = NIL;
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithColumn(tableNameAlias, "table_name", yyscanner));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithColumn(NULL, "table_type", yyscanner));
-                    selectStmtViews->fromClause = list_make1(createRangeVar("mys_informa_schema", "views"));
-                    if ($4 != NULL)
-                    {
-                        selectStmtViews->whereClause = 
-                                (Node *)makeSimpleA_Expr(AEXPR_OP, 
-                                                         "=", 
-                                                         (Node *)makeColumnRef("table_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst($4->relname, -1), 
-                                                         -1); 
-                    }
-                    else
-                    {
-                        selectStmtViews->whereClause = 
-                                (Node *)makeSimpleA_Expr(AEXPR_OP, 
-                                                         "=", 
-                                                         (Node *)makeColumnRef("table_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst(currentMysqlDatabaseForParse(yyscanner), -1), 
-                                                         -1); 
-                    }
-                    if ($5 != NULL)
-                    {
-                        selectStmtViews->whereClause = 
-                                makeAndExpr(selectStmtViews->whereClause, 
-                                            (Node *) makeSimpleA_Expr(AEXPR_OP, 
-                                                                      "~~", 
-                                                                      makeColumnRef("table_name", NIL, -1, yyscanner), 
-                                                                      makeStringConst($5, -1), 
-                                                                      -1), 
-                                            -1);
-                    }
-                    else if ($6 != NULL)
-                    {
-                        selectStmtViews->whereClause = 
-                                makeAndExpr(selectStmtViews->whereClause, 
-                                            copyObject($6), 
-                                            -1);
-                    }
-
-					selectStmt = (SelectStmt *)makeSetOp(SETOP_UNION, 
-                                                         true, 
-                                                         (Node *)selectStmtTables, 
-                                                         (Node *)selectStmtViews);
+					/* mys_informa_schema.tables already contains both BASE TABLE and VIEW */
+					selectStmt = selectStmtTables;
 
 					order = (SortBy *) makeNode(SortBy);
 					order->node = makeIntConst(1, -1);
@@ -3134,7 +2799,6 @@ DBTableInfoShowStmt:
                      */
 					SelectStmt *selectStmt;
 					SelectStmt *selectStmtTables;
-					SelectStmt *selectStmtViews;
 
 					selectStmt = makeNode(SelectStmt);
 
@@ -3196,68 +2860,8 @@ DBTableInfoShowStmt:
                                             -1);
                     }
 
-					selectStmtViews = makeNode(SelectStmt);
-                    selectStmtViews->targetList = NIL;
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithColumn("Name", "table_name", yyscanner));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Engine", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Version", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Row_format", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Rows", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Avg_row_length", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Data_length", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Max_data_length", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Index_length", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Data_free", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Auto_increment", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Create_time", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Update_time", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Check_time", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Collation", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Checksum", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Create_options", NULL));
-                    selectStmtViews->targetList = lappend(selectStmtViews->targetList, createResTargetWithString("Comment", NULL));
-                    selectStmtViews->fromClause = list_make1(createRangeVar("mys_informa_schema", "views"));
-                    if ($4 != NULL)
-                    {
-                        selectStmtViews->whereClause = 
-                                (Node *)makeSimpleA_Expr(AEXPR_OP, 
-                                                         "=", 
-                                                         (Node *)makeColumnRef("table_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst($4->relname, -1), 
-                                                         -1); 
-                    }
-                    else
-                    {
-                        selectStmtViews->whereClause = 
-                                (Node *)makeSimpleA_Expr(AEXPR_OP, 
-                                                         "=", 
-                                                         (Node *)makeColumnRef("table_schema", NIL, -1, yyscanner), 
-                                                         (Node *)makeStringConst(currentMysqlDatabaseForParse(yyscanner), -1), 
-                                                         -1); 
-                    }
-                    if ($5 != NULL)
-                    {
-                        selectStmtViews->whereClause = 
-                                makeAndExpr(selectStmtViews->whereClause, 
-                                            (Node *) makeSimpleA_Expr(AEXPR_OP, 
-                                                                      "~~", 
-                                                                      makeColumnRef("table_name", NIL, -1, yyscanner), 
-                                                                      makeStringConst($5, -1), 
-                                                                      -1), 
-                                            -1);
-                    }
-                    else if ($6 != NULL)
-                    {
-                        selectStmtViews->whereClause = 
-                                makeAndExpr(selectStmtViews->whereClause, 
-                                            copyObject($6), 
-                                            -1);
-                    }
-
-					selectStmt = (SelectStmt *)makeSetOp(SETOP_UNION, 
-                                                         true, 
-                                                         (Node *)selectStmtTables, 
-                                                         (Node *)selectStmtViews);
+					/* mys_informa_schema.tables already includes views with Comment='VIEW' */
+					selectStmt = selectStmtTables;
 
 					$$ = (Node *)selectStmt;
 				}
@@ -9880,7 +9484,7 @@ TruncateStmt:
 opt_restart_seqs:
 			CONTINUE_P IDENTITY_P		{ $$ = false; }
 			| RESTART IDENTITY_P		{ $$ = true; }
-			| /* EMPTY */				{ $$ = false; }
+			| /* EMPTY */				{ $$ = true; }
 		;
 
 /*****************************************************************************
@@ -13794,6 +13398,10 @@ ViewStmt:
 					n->query = $11;
 					n->replace = $2;
 					n->options = $9;
+					if ($5)
+						n->options = lappend(n->options,
+											 makeDefElem("security_invoker",
+														 (Node *) makeString("true"), -1));
 					n->withCheckOption = $12;
 					$$ = (Node *) n;
 				}
@@ -13807,6 +13415,10 @@ ViewStmt:
 					n->query = $10;
 					n->replace = $2;
 					n->options = $8;
+					if ($4)
+						n->options = lappend(n->options,
+											 makeDefElem("security_invoker",
+														 (Node *) makeString("true"), -1));
 					n->withCheckOption = $11;
 					$$ = (Node *) n;
 				}
@@ -13819,9 +13431,9 @@ view_algorithm_opt:
         ;
 
 view_sql_security_opt:
-              /* empty */
-            | SQL_P SECURITY DEFINER
-            | SQL_P SECURITY INVOKER
+              /* empty */				{ $$ = false; }
+            | SQL_P SECURITY DEFINER	{ $$ = false; }
+            | SQL_P SECURITY INVOKER	{ $$ = true; }
         ;
 
 opt_check_option:
@@ -15437,19 +15049,19 @@ DeleteStmt: with_clause DELETE_P delete_options FROM relation_expr_opt_alias usi
 
 delete_options:
             /* empty */                 { $$ = false; }
-            | ColId                     { $$ = false; }
+            | ColId                     { checkDeleteOption($1, @1, yyscanner); $$ = false; }
             | IGNORE                    { $$ = true; }
             | LOW_PRIORITY              { $$ = false; }
-            | ColId IGNORE              { $$ = true; }
+            | ColId IGNORE              { checkDeleteOption($1, @1, yyscanner); $$ = true; }
             | LOW_PRIORITY IGNORE       { $$ = true; }
-            | IGNORE ColId              { $$ = true; }
+            | IGNORE ColId              { checkDeleteOption($2, @2, yyscanner); $$ = true; }
             | IGNORE LOW_PRIORITY       { $$ = true; }
-            | LOW_PRIORITY ColId        { $$ = false; }
-            | ColId ColId               { $$ = false; }
-            | LOW_PRIORITY IGNORE ColId { $$ = true; }
-            | IGNORE LOW_PRIORITY ColId { $$ = true; }
-            | IGNORE ColId ColId        { $$ = true; }
-            | ColId IGNORE ColId        { $$ = true; }
+            | LOW_PRIORITY ColId        { checkDeleteOption($2, @2, yyscanner); $$ = false; }
+            | ColId ColId               { checkDeleteOption($1, @1, yyscanner); checkDeleteOption($2, @2, yyscanner); $$ = false; }
+            | LOW_PRIORITY IGNORE ColId { checkDeleteOption($3, @3, yyscanner); $$ = true; }
+            | IGNORE LOW_PRIORITY ColId { checkDeleteOption($3, @3, yyscanner); $$ = true; }
+            | IGNORE ColId ColId        { checkDeleteOption($2, @2, yyscanner); checkDeleteOption($3, @3, yyscanner); $$ = true; }
+            | ColId IGNORE ColId        { checkDeleteOption($1, @1, yyscanner); checkDeleteOption($3, @3, yyscanner); $$ = true; }
         ;
 
 using_clause:
@@ -16193,8 +15805,9 @@ simple_select:
                             if ((IsA(joinExpr->larg, JoinExpr)) || (IsA(joinExpr->rarg, JoinExpr)))
                             {
                                 bool hasNotOn = false;
-                                checkJoinOn(joinExpr, &hasNotOn);
-                                if (hasNotOn)
+                                bool pureInner = true;
+                                checkJoinOn(joinExpr, &hasNotOn, &pureInner);
+                                if (pureInner && hasNotOn)
                                 {
                                     Node *expr;
                                     expr = NULL;
@@ -23809,6 +23422,7 @@ rectifyColumnsName(Node *node)
     /* 将字段名首字母改为大写 */
     if (node != NULL)
     {
+        check_stack_depth();
         if (IsA(node, ColumnRef))
         {
             ListCell *lc;
@@ -24118,15 +23732,31 @@ createRangeVar(char *schemaName, char *tableName)
 }
 
 static void
-checkJoinOn(JoinExpr *joinExpr, bool *hasNotOn)
+checkDeleteOption(const char *opt, int loc, core_yyscan_t yyscanner)
 {
+	if (pg_strcasecmp(opt, "quick") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("syntax error at or near \"%s\"", opt),
+				 parser_errposition(loc)));
+}
+
+static void
+checkJoinOn(JoinExpr *joinExpr, bool *hasNotOn, bool *pureInner)
+{
+	check_stack_depth();
+	if (joinExpr->jointype != JOIN_INNER || joinExpr->isNatural || joinExpr->usingClause != NIL)
+	{
+		*pureInner = false;
+		return;
+	}
     if (IsA(joinExpr->larg, JoinExpr))
     {
-        checkJoinOn(castNode(JoinExpr, joinExpr->larg), hasNotOn);
+        checkJoinOn(castNode(JoinExpr, joinExpr->larg), hasNotOn, pureInner);
     }
-    if (IsA(joinExpr->rarg, JoinExpr))
+    if (*pureInner && IsA(joinExpr->rarg, JoinExpr))
     {
-        checkJoinOn(castNode(JoinExpr, joinExpr->rarg), hasNotOn);
+        checkJoinOn(castNode(JoinExpr, joinExpr->rarg), hasNotOn, pureInner);
     }
 
     if (joinExpr->quals == NULL)
@@ -24138,6 +23768,7 @@ checkJoinOn(JoinExpr *joinExpr, bool *hasNotOn)
 static void
 makeOnClause(Node **expr, JoinExpr *joinExpr)
 {
+	check_stack_depth();
     if (IsA(joinExpr->larg, JoinExpr))
     {
         makeOnClause(expr, castNode(JoinExpr, joinExpr->larg));
@@ -24222,6 +23853,55 @@ makeUserVarRefCall(char *name, int location)
 	return (Node *) makeFuncCall(list_make2(makeString("mysql"), makeString("get_user_var")),
 								 list_make1(makeStringConst(name, location)),
 								 COERCE_EXPLICIT_CALL, location);
+}
+
+static Node *
+makeMysqlSystemVarTarget(char *name, Node *value, bool global, int location)
+{
+	ResTarget  *target = makeNode(ResTarget);
+	List	   *funcname = list_make2(makeString("mysql"),
+									  makeString(global ? "set_system_global_variable" :
+												 "set_system_session_variable"));
+	List	   *args;
+
+	if (IsA(value, ColumnRef))
+	{
+		Node	   *field = linitial(castNode(ColumnRef, value)->fields);
+
+		if (IsA(field, String))
+			value = pg_strcasecmp(strVal(field), "off") == 0 ?
+				makeIntConst(0, -1) : makeStringConst(strVal(field), -1);
+	}
+	args = list_make2(makeStringConst(name, location), value);
+	target->val = (Node *) makeFuncCall(funcname, args, COERCE_EXPLICIT_CALL, location);
+	target->location = location;
+	return (Node *) target;
+}
+
+/*
+ * A scope keyword applies to subsequent bare system variable names in this
+ * SET. An explicit @@scope.name applies only to its own assignment.
+ */
+static List *
+makeMysqlSetTargets(List *items)
+{
+	bool		global = false;
+	ListCell   *lc;
+
+	foreach(lc, items)
+	{
+		Node	   *item = lfirst(lc);
+
+		if (IsA(item, DefElem))
+		{
+			DefElem    *var = castNode(DefElem, item);
+
+			if (var->defnamespace)
+				global = strcmp(var->defnamespace, "global") == 0;
+			lfirst(lc) = makeMysqlSystemVarTarget(var->defname, var->arg, global, var->location);
+		}
+	}
+	return items;
 }
 
 /* @name := expr  ==>  mysql.set_user_var_in_expr('name', expr) */
@@ -24358,6 +24038,7 @@ makeMysqlDropIndex(ObjectType type, List *names, RangeVar *table, int location,
 static RangeVar *
 mysqlDeleteSource(Node *node, const char *name, const char *schema)
 {
+	check_stack_depth();
 	if (IsA(node, RangeVar))
 	{
 		RangeVar *r = (RangeVar *) node;

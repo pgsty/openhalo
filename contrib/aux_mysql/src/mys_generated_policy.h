@@ -343,8 +343,10 @@ gen_policy_walk(Node *node, GenPolicy *policy)
 	if (!node) return false;
 	check_stack_depth();
 	if (IsA(node, SQLValueFunction) || IsA(node, NextValueExpr) || IsA(node, SubLink) ||
-		IsA(node, Query) || IsA(node, Aggref) || IsA(node, WindowFunc))
-		gen_policy_error("current time/user, sequence, subquery or aggregate");
+		IsA(node, Query) || IsA(node, Aggref) || IsA(node, WindowFunc) ||
+		IsA(node, XmlExpr) || IsA(node, JsonExpr) || IsA(node, JsonConstructorExpr) ||
+		IsA(node, JsonValueExpr))
+		gen_policy_error("current time/user, sequence, subquery, aggregate, or XML/JSON expression");
 	if (IsA(node, FuncExpr)) gen_policy_function(((FuncExpr *) node)->funcid, node, policy);
 	else (void) check_functions_in_node(node, gen_policy_function_cb, policy);
 	if (IsA(node, MinMaxExpr))

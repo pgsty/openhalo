@@ -212,9 +212,9 @@ procedures, no multi-target `UPDATE` / `DELETE`, `BIGINT UNSIGNED` limited to th
 
 ### Verification
 
-[`contrib/aux_mysql/ROUTE_A_RECHECK.md`](contrib/aux_mysql/ROUTE_A_RECHECK.md) records the
-release checks and their results; [`contrib/aux_mysql/TESTING.md`](contrib/aux_mysql/TESTING.md)
-has the commands to repeat them, including the upgrade of a real `v18.6` data directory.
+[`contrib/aux_mysql/TESTING.md`](contrib/aux_mysql/TESTING.md) records the release test
+suites and commands to repeat them, including isolated-instance checks and extension
+upgrade parity verification.
 
 ---
 

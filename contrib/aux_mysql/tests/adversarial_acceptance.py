@@ -38,6 +38,7 @@ from tier1_optimizations import (
     my_conn,
     pg_conn,
     query,
+    wait_blocked,
 )
 
 COM_PING = 0x0E
@@ -865,6 +866,17 @@ def test_autocommit_default_and_dynamic_expr(schema):
         query(c1, 'INSERT INTO ac_t VALUES (5); SET autocommit = 0 + 1; INSERT INTO ac_t VALUES (6); ROLLBACK')
         assert query(c2, 'SELECT id FROM ac_t WHERE id IN (5, 6) ORDER BY id') == [(5,), (6,)]
 
+        # DEFAULT must see an earlier SET GLOBAL in the same packet.
+        old_default = int(query(c2, 'SELECT @@global.autocommit')[0][0])
+        try:
+            query(c2, 'SET GLOBAL autocommit=0')
+            query(c1, 'SET autocommit=0')
+            query(c1, 'INSERT INTO ac_t VALUES (8)')
+            query(c1, 'SET GLOBAL autocommit=1; SET autocommit=DEFAULT')
+            assert query(c2, 'SELECT id FROM ac_t WHERE id=8') == [(8,)]
+        finally:
+            query(c2, f'SET GLOBAL autocommit={old_default}')
+
         # 5) Dynamic autocommit=0 batch preserves one-shot SET TRANSACTION READ ONLY (1792)
         try:
             query(c1, 'SET autocommit = 1 - 1; SELECT 1; SET TRANSACTION READ ONLY; INSERT INTO ac_t VALUES (7)')
@@ -1030,6 +1042,573 @@ def test_replace_view_wco_and_cross_partition_update_ignore(pg, schema):
         c.close()
 
 
+def test_ga_release_audit_fixes(pg, schema):
+    """Regression coverage for the OpenHalo 19.0.0 GA release audit blockers."""
+    c = my_conn(database=schema)
+    role_u = f'ga_u_{uuid.uuid4().hex[:8]}'
+    role_r = f'ga_r_{uuid.uuid4().hex[:8]}'
+    cu = None
+    try:
+        # 1) CHAR(n) COLLATE "C" mysql_prefix trailing-space lookup (M1)
+        query(pg, f'CREATE TABLE {schema}.ch_c (id int PRIMARY KEY, k char(8) COLLATE "C")')
+        query(pg, f'CREATE INDEX ch_c_k_idx ON {schema}.ch_c USING mysql_prefix (k) WITH (prefix_lengths = \'4\')')
+        query(pg, f"INSERT INTO {schema}.ch_c VALUES (1, 'a'), (2, 'ab'), (3, 'abcd'), (4, 'abcde')")
+        query(pg, 'SET enable_seqscan = off')
+        try:
+            assert query(pg, f"SELECT id FROM {schema}.ch_c WHERE k = 'a'::bpchar ORDER BY id") == [(1,)]
+            assert query(pg, f"SELECT id FROM {schema}.ch_c WHERE k = 'a   '::bpchar ORDER BY id") == [(1,)]
+            assert query(pg, f"SELECT id FROM {schema}.ch_c WHERE k = 'abcde'::bpchar ORDER BY id") == [(4,)]
+        finally:
+            query(pg, 'SET enable_seqscan = on')
+
+        # 2) SUBTIME / ADDTIME / TIMEDIFF negative & >24h MySQL TIME values (P0-13)
+        assert query(c, "SELECT SUBTIME('01:00:00', '02:00:00')") == [('-01:00:00',)]
+        assert query(c, "SELECT SUBTIME('100:00:00', '200:00:00')") == [('-100:00:00',)]
+        assert query(c, "SELECT ADDTIME('01:00:00', '100:30:15.5')") == [('101:30:15.5',)]
+        assert query(c, "SELECT ADDTIME('2024-01-01 00:00:00', '100:00:00')") == [('2024-01-05 04:00:00',)]
+        assert query(c, "SELECT TIMEDIFF('01:00:00', '02:30:00')") == [('-01:30:00',)]
+        assert query(c, "SELECT TIMEDIFF('2024-01-01 00:00:00', '2024-01-03 00:00:00')") == [('-48:00:00',)]
+
+        # 3) Parallel scan with text_locate2 / text_locate3 / text_instr on nondeterministic collation (P0-14)
+        query(c, 'CREATE TABLE par_loc(id INT PRIMARY KEY, s VARCHAR(32) COLLATE utf8mb4_general_ci)')
+        query(c, "INSERT INTO par_loc VALUES (1, 'HelloWorld'), (2, 'FOOBAR')")
+        query(pg, 'SET debug_parallel_query = regress')
+        try:
+            r_loc = query(pg, f"""
+                SELECT id, mysql.text_locate2('world', s), mysql.text_locate3('o', s, 6), mysql.text_instr(s, 'bar')
+                FROM {schema}.par_loc ORDER BY id
+            """)
+            assert r_loc == [(1, 6, 7, 0), (2, 0, 0, 4)], r_loc
+        finally:
+            query(pg, 'SET debug_parallel_query = off')
+
+        # 4) SHOW TABLES / SHOW FULL TABLES / SHOW TABLE STATUS view dedup & SQL SECURITY INVOKER
+        query(c, 'CREATE TABLE st_base(id INT AUTO_INCREMENT PRIMARY KEY, v INT)')
+        query(c, 'INSERT INTO st_base(v) VALUES (10), (20)')
+        query(c, 'CREATE SQL SECURITY INVOKER VIEW st_v AS SELECT id, v FROM st_base')
+        st_rows = [r[0] for r in query(c, "SHOW TABLES LIKE 'st_%'")]
+        assert st_rows.count('st_v') == 1, st_rows
+        sft_rows = query(c, "SHOW FULL TABLES LIKE 'st_%'")
+        assert sft_rows.count(('st_v', 'VIEW')) == 1, sft_rows
+        scv = query(c, 'SHOW CREATE VIEW st_v')[0][1]
+        assert 'SQL SECURITY INVOKER' in scv, scv
+
+        # 5) TRUNCATE resets AUTO_INCREMENT
+        query(c, 'TRUNCATE TABLE st_base')
+        query(c, 'INSERT INTO st_base(v) VALUES (99)')
+        assert query(c, 'SELECT id FROM st_base') == [(1,)]
+
+        # 6) LEFT JOIN + JOIN USING does not drop USING or outer join
+        query(c, 'CREATE TABLE j1(id INT PRIMARY KEY, a INT)')
+        query(c, 'CREATE TABLE j2(j2_id INT PRIMARY KEY, b INT)')
+        query(c, 'CREATE TABLE j3(id INT PRIMARY KEY, c INT)')
+        query(c, 'INSERT INTO j1 VALUES (1, 10), (2, 20)')
+        query(c, 'INSERT INTO j2 VALUES (1, 100)')
+        query(c, 'INSERT INTO j3 VALUES (1, 1000), (2, 2000)')
+        jr = query(c, 'SELECT j1.id, j2.b, j3.c FROM j1 LEFT JOIN j2 ON j1.id = j2.j2_id JOIN j3 USING (id) ORDER BY j1.id')
+        assert jr == [(1, 100, 1000), (2, None, 2000)], jr
+
+        # 7) DELETE options validation
+        query(c, 'DELETE QUICK FROM j2 WHERE j2_id = 999')
+        try:
+            query(c, 'DELETE BOGUS_OPT FROM j2 WHERE j2_id = 999')
+            raise AssertionError('DELETE accepted unknown option!')
+        except pymysql.MySQLError:
+            pass
+
+        # 8) COMMIT AND CHAIN / ROLLBACK AND CHAIN & SET autocommit=1 atomicity
+        query(c, 'CREATE TABLE tx_ch(id INT PRIMARY KEY)')
+        query(c, 'BEGIN')
+        query(c, 'INSERT INTO tx_ch VALUES (1)')
+        query(c, 'COMMIT AND CHAIN')
+        query(c, 'INSERT INTO tx_ch VALUES (2)')
+        query(c, 'ROLLBACK AND CHAIN')
+        query(c, 'INSERT INTO tx_ch VALUES (3)')
+        query(c, 'COMMIT')
+        assert query(c, 'SELECT id FROM tx_ch ORDER BY id') == [(1,), (3,)]
+
+        query(c, 'SET autocommit = 0')
+        query(c, 'INSERT INTO tx_ch VALUES (10)')
+        try:
+            query(c, "SET autocommit = 1, time_zone = 'Invalid/Zone'")
+            raise AssertionError('invalid multi-SET succeeded!')
+        except pymysql.MySQLError:
+            pass
+        query(c, 'ROLLBACK')
+        assert query(c, 'SELECT id FROM tx_ch WHERE id = 10') == []
+        query(c, 'SET autocommit = 1')
+
+        # 9) SET GLOBAL validation before shmem mutation
+        old_tz = query(c, 'SELECT @@global.time_zone')[0][0]
+        try:
+            query(c, "SET GLOBAL time_zone = 'Not/A_Real_Zone'")
+            raise AssertionError('invalid SET GLOBAL time_zone succeeded!')
+        except pymysql.MySQLError:
+            pass
+        assert query(c, 'SELECT @@global.time_zone')[0][0] == old_tz
+
+        # 10) ALTER INDEX SET (prefix_lengths) rejected & BINARY/VARBINARY bounds
+        try:
+            query(pg, f"ALTER INDEX {schema}.ch_c_k_idx SET (prefix_lengths = '2')")
+            raise AssertionError('ALTER INDEX prefix_lengths succeeded!')
+        except psycopg2.Error:
+            pass
+        for bad_ddl in (
+            'CREATE TABLE bad_bin(b BINARY(300))',
+            'CREATE TABLE bad_vbin(b VARBINARY(70000))',
+            'CREATE TABLE bad_ga(id INT AUTO_INCREMENT PRIMARY KEY, g INT GENERATED ALWAYS AS (id + 1) STORED)',
+        ):
+            if 'bad_ga' in bad_ddl:
+                query(c, 'CREATE TABLE mod_ga(id INT PRIMARY KEY, x INT)')
+                try:
+                    query(c, 'ALTER TABLE mod_ga MODIFY COLUMN x INT AUTO_INCREMENT GENERATED ALWAYS AS (id + 1) STORED')
+                    raise AssertionError('AUTO_INCREMENT + GENERATED succeeded!')
+                except pymysql.MySQLError:
+                    pass
+                continue
+            try:
+                query(c, bad_ddl)
+                raise AssertionError(f'{bad_ddl} succeeded!')
+            except pymysql.MySQLError:
+                pass
+
+        # 11) COPY client stream rejected & NOTIFY does not desync MySQL wire
+        try:
+            query(c, 'COPY tx_ch TO STDOUT')
+            raise AssertionError('COPY TO STDOUT succeeded on MySQL protocol!')
+        except pymysql.MySQLError:
+            pass
+        query(c, 'LISTEN ga_chan')
+        query(c, "NOTIFY ga_chan, 'hello'")
+        assert query(c, 'SELECT 42') == [(42,)]
+        query(c, 'UNLISTEN ga_chan')
+
+        # 12) Lexer leading || and @@ error safety
+        for bad_sql in ('||', 'SELECT @@'):
+            try:
+                query(c, bad_sql)
+            except pymysql.MySQLError:
+                pass
+        assert query(c, 'SELECT 1') == [(1,)]
+
+        # 13) CREATE TABLE IF NOT EXISTS does not alter existing table
+        query(c, 'CREATE TABLE ine_t(id INT AUTO_INCREMENT PRIMARY KEY, v INT)')
+        query(c, 'INSERT INTO ine_t(v) VALUES (1)')
+        query(c, 'CREATE TABLE IF NOT EXISTS ine_t(id INT AUTO_INCREMENT PRIMARY KEY, v INT) AUTO_INCREMENT = 500')
+        query(c, 'INSERT INTO ine_t(v) VALUES (2)')
+        assert query(c, 'SELECT id FROM ine_t ORDER BY id') == [(1,), (2,)]
+
+        # 14) mysql.space, part_list_columns, SHOW CREATE TABLE backtick escaping, SHOW CREATE FUNCTION
+        assert query(c, 'SELECT SPACE(5), SPACE(-3), SPACE(1000000000)') == [('     ', '', None)]
+        assert query(pg, "SELECT mysql.part_list_columns('a,b', 'c') <> mysql.part_list_columns('a', 'b,c')")[0][0] is True
+        assert query(pg, "SELECT mysql.part_list_columns(NULL::text, 'a') <> mysql.part_list_columns('', 'a')")[0][0] is True
+        assert query(pg, r"SELECT mysql.part_list_columns('\x80ff'::bytea)")[0][0] is not None
+        query(c, 'CREATE TABLE `bt``tbl`(`c``1` INT PRIMARY KEY, `c``2` VARCHAR(16), KEY `k``1` (`c``2`(4)))')
+        sct = query(c, 'SHOW CREATE TABLE `bt``tbl`')[0][1]
+        assert '`bt``tbl`' in sct and '`c``1`' in sct and '`k``1`' in sct, sct
+
+        # 15) Partitioned self-referencing FK UPDATE/DELETE
+        query(pg, f"""
+            CREATE TABLE {schema}.pself (
+                p int NOT NULL,
+                id int NOT NULL,
+                parent_p int,
+                parent_id int,
+                PRIMARY KEY (p, id),
+                FOREIGN KEY (parent_p, parent_id) REFERENCES {schema}.pself(p, id)
+            ) PARTITION BY LIST (p);
+            CREATE TABLE {schema}.pself_1 PARTITION OF {schema}.pself FOR VALUES IN (1);
+            CREATE TABLE {schema}.pself_2 PARTITION OF {schema}.pself FOR VALUES IN (2);
+        """)
+        query(c, 'INSERT INTO pself VALUES (1, 1, 1, 1)')
+        query(c, 'UPDATE pself SET id = 10, parent_id = 10 WHERE p = 1 AND id = 1')
+        query(c, 'DELETE FROM pself WHERE p = 1 AND id = 10')
+        assert query(c, 'SELECT COUNT(*) FROM pself') == [(0,)]
+
+        # 16) Non-superuser security checks: ODKU SELECT ACL/RLS, SECURITY DEFINER FK, read_only LO,
+        #     current_user() STABLE, INFORMATION_SCHEMA.PARTITIONS, SHOW CREATE FUNCTION, pending_fk_guard ownership
+        query(pg, f"CREATE ROLE {role_r} NOLOGIN")
+        query(pg, f"CREATE ROLE {role_u} LOGIN PASSWORD 'ga_pass_1' IN ROLE {role_r}")
+        query(pg, f"GRANT USAGE ON SCHEMA {schema} TO {role_u}")
+        query(pg, f"CREATE TABLE {schema}.sec_odku(id int PRIMARY KEY, pub int, secret text)")
+        query(pg, f"INSERT INTO {schema}.sec_odku VALUES (1, 10, 'topsecret')")
+        query(pg, f"GRANT INSERT, UPDATE (pub) ON {schema}.sec_odku TO {role_u}")
+        query(pg, f"GRANT SELECT (id, pub) ON {schema}.sec_odku TO {role_u}")
+
+        query(pg, f"CREATE TABLE {schema}.fk_p(id int PRIMARY KEY)")
+        query(pg, f"CREATE TABLE {schema}.fk_c(id int PRIMARY KEY, pid int REFERENCES {schema}.fk_p(id))")
+        query(pg, f"""
+            CREATE FUNCTION {schema}.sd_ins_fk(x int) RETURNS void
+            LANGUAGE plpgsql SECURITY DEFINER AS $$
+            BEGIN INSERT INTO {schema}.fk_c VALUES (x, x); END $$;
+            GRANT EXECUTE ON FUNCTION {schema}.sd_ins_fk(int) TO {role_u};
+        """)
+
+        cu = my_conn(user=role_u, password='ga_pass_1', database=schema)
+        # current_user() reflects role changes (STABLE, not IMMUTABLE)
+        assert query(cu, 'SELECT CURRENT_USER()')[0][0].startswith(role_u)
+        query(cu, f"SELECT pg_catalog.set_config('role', '{role_r}', false)")
+        assert query(cu, 'SELECT CURRENT_USER()')[0][0].startswith(role_r)
+        query(cu, "SELECT pg_catalog.set_config('role', 'none', false)")
+
+        # ODKU cannot read ungranted column `secret`
+        try:
+            query(cu, "INSERT INTO sec_odku(id, pub) VALUES (1, 20) ON DUPLICATE KEY UPDATE pub = CASE WHEN secret = 'topsecret' THEN 99 ELSE 0 END")
+            raise AssertionError('ODKU bypassed column SELECT ACL!')
+        except pymysql.MySQLError:
+            pass
+
+        # FOREIGN_KEY_CHECKS=0 cannot bypass RI inside SECURITY DEFINER
+        query(cu, 'SET FOREIGN_KEY_CHECKS = 0')
+        try:
+            query(cu, f'SELECT {schema}.sd_ins_fk(999)')
+            raise AssertionError('FOREIGN_KEY_CHECKS=0 bypassed RI inside SECURITY DEFINER!')
+        except pymysql.MySQLError:
+            pass
+        query(cu, 'SET FOREIGN_KEY_CHECKS = 1')
+
+        # Non-superuser cannot attach pending_fk_guard trigger to unowned table
+        try:
+            query(cu, "CREATE TRIGGER evil_fk BEFORE INSERT ON sec_odku FOR EACH ROW EXECUTE FUNCTION mysql.pending_fk_guard('x')")
+            raise AssertionError('Non-owner attached pending_fk_guard trigger!')
+        except pymysql.MySQLError:
+            pass
+
+        # Non-superuser can query INFORMATION_SCHEMA.PARTITIONS and SHOW CREATE FUNCTION
+        query(cu, 'SELECT COUNT(*) FROM information_schema.partitions')
+        scf = query(cu, f'SHOW CREATE FUNCTION {schema}.sd_ins_fk')
+        assert len(scf) == 1 and 'sd_ins_fk' in scf[0][2], scf
+
+        # GLOBAL read_only blocks lo_from_bytea for non-superusers
+        query(c, 'SET GLOBAL read_only = 1')
+        try:
+            try:
+                query(cu, "SELECT pg_catalog.lo_from_bytea(0, 'abc'::bytea)")
+                raise AssertionError('lo_from_bytea bypassed GLOBAL read_only!')
+            except pymysql.MySQLError:
+                pass
+        finally:
+            query(c, 'SET GLOBAL read_only = 0')
+
+        print('PASS OpenHalo 19.0.0 GA release audit regression suite', flush=True)
+    finally:
+        if cu:
+            cu.close()
+        c.close()
+        if query(pg, f"SELECT 1 FROM pg_roles WHERE rolname = '{role_u}'"):
+            query(pg, f'DROP OWNED BY {role_u} CASCADE')
+            query(pg, f'DROP ROLE IF EXISTS {role_u}')
+        query(pg, f'DROP ROLE IF EXISTS {role_r}')
+
+
+def test_runtime_keys_and_transactions(pg, schema):
+    c = my_conn(database=schema)
+    observer = my_conn(database=schema)
+    try:
+        query(c, 'CREATE TABLE ac_retry(id INT PRIMARY KEY)')
+        query(c, 'SET autocommit=0')
+        query(c, 'INSERT INTO ac_retry VALUES (1)')
+        try:
+            query(c, "SET autocommit=1, time_zone='Invalid/Zone'")
+        except pymysql.MySQLError:
+            pass
+        else:
+            raise AssertionError('invalid multi-SET succeeded')
+        assert int(query(c, 'SELECT @@autocommit')[0][0]) == 0
+        assert query(observer, 'SELECT id FROM ac_retry') == []
+        query(c, 'SET autocommit=1')
+        assert query(observer, 'SELECT id FROM ac_retry') == [(1,)]
+
+        query(pg, f'CREATE TABLE {schema}.like_pad(id int, k char(8) COLLATE "C")')
+        query(pg, f"CREATE INDEX pad_key ON {schema}.like_pad USING mysql_prefix (k) WITH (prefix_lengths='4')")
+        query(pg, f"INSERT INTO {schema}.like_pad VALUES (1,'a'),(2,'a b'),(3,'ab'),(4,'a  c'),(5,'')")
+        for pattern in ('a %', 'a  %', ' %', 'a _%', 'a   ', 'a  c%'):
+            sql = f'SELECT id FROM {schema}.like_pad WHERE k LIKE %s ORDER BY id'
+            query(pg, 'SET enable_seqscan=on')
+            query(pg, 'SET enable_indexscan=off')
+            query(pg, 'SET enable_bitmapscan=off')
+            expected = query(pg, sql, (pattern,))
+            query(pg, 'SET enable_seqscan=off')
+            query(pg, 'SET enable_bitmapscan=on')
+            query(pg, 'SET enable_indexscan=on')
+            plan = query(pg, 'EXPLAIN (COSTS OFF) ' + sql, (pattern,))
+            assert any('pad_key' in line for line, in plan), plan
+            assert query(pg, sql, (pattern,)) == expected, pattern
+
+        query(pg, f'CREATE TABLE {schema}.list_date(d date, i int) PARTITION BY LIST (mysql.part_list_columns(d,i))')
+        query(pg, f"""CREATE TABLE {schema}.list_day PARTITION OF {schema}.list_date
+                      FOR VALUES IN (mysql.part_list_columns(DATE '2026-03-12', 42))""")
+        query(pg, "SET DateStyle='SQL, DMY'")
+        query(pg, f"INSERT INTO {schema}.list_date VALUES ('2026-03-12',42)")
+        assert query(pg, f'SELECT count(*) FROM {schema}.list_day') == [(1,)]
+        assert query(pg, """SELECT mysql.timediff(timestamp '2026-03-11 00:00:00',
+                                                 timestamp '2026-03-12 01:00:00.123')""") == [('-25:00:00.123',)]
+        key = """SELECT mysql.part_list_columns(timestamptz '2026-03-12 00:00:00+00',
+                     0.12345678912345::float8, interval '3 days 2 hours')"""
+        expected = query(pg, key)
+        query(pg, "SET TIME ZONE 'America/New_York'")
+        query(pg, 'SET extra_float_digits=-10')
+        query(pg, "SET IntervalStyle='sql_standard'")
+        assert query(pg, key) == expected
+        query(pg, f"""CREATE TABLE {schema}.list_values
+                  (n numeric(8,2), c char(4), f float4, d float8, i interval)
+                  PARTITION BY LIST (mysql.part_list_columns(n,c,f,d,i))""")
+        query(pg, f"""CREATE TABLE {schema}.list_match PARTITION OF {schema}.list_values
+                  FOR VALUES IN (mysql.part_list_columns(1::numeric, 'x'::char(1),
+                      0::float4, 0::float8, interval '30 days -1 microsecond'))""")
+        query(pg, f"""CREATE TABLE {schema}.list_other PARTITION OF {schema}.list_values DEFAULT""")
+        query(pg, f"""INSERT INTO {schema}.list_values VALUES
+                  (1.00,'x','-0','-0',interval '1 month -1 microsecond'),
+                  (1.00,'x',0,0,interval '29 days 23:59:59.999999'),
+                  (1.01,'x',0,0,interval '30 days -1 microsecond')""")
+        assert query(pg, f'SELECT count(*) FROM {schema}.list_match') == [(2,)]
+        assert query(pg, f'SELECT n = 1.01 FROM {schema}.list_other') == [(True,)]
+
+        for name, partition in [('self_flat', ''), ('self_partition', ' PARTITION BY RANGE(id)')]:
+            table = f'{schema}.{name}'
+            query(pg, f'CREATE TABLE {table}(id bigint PRIMARY KEY, parent int REFERENCES {table}(id)){partition}')
+            if partition:
+                query(pg, f'CREATE TABLE {table}_all PARTITION OF {table} DEFAULT')
+            assert query(c, f'INSERT IGNORE INTO {name} VALUES (1,1)') == 1
+            assert query(c, f'INSERT IGNORE INTO {name} VALUES (2,9)') == 0
+            assert query(c, f'UPDATE IGNORE {name} SET id=3 WHERE id=1') == 0
+            assert query(c, 'SHOW WARNINGS')[0][1] == 1451
+            assert query(c, f'UPDATE IGNORE {name} SET id=3,parent=3 WHERE id=1') == 1
+            assert query(c, f'DELETE IGNORE FROM {name} WHERE id=3') == 1
+
+        query(c, 'INSERT INTO self_flat VALUES (1,1)')
+        query(c, 'SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE')
+        query(c, 'BEGIN')
+        query(c, 'SELECT id FROM self_flat WHERE id=1')
+        query(observer, 'INSERT INTO self_flat VALUES (2,1)')
+        assert query(c, 'DELETE IGNORE FROM self_flat WHERE id=1') == 0
+        assert query(c, 'SHOW WARNINGS')[0][1] == 1451
+        query(c, 'COMMIT')
+        assert query(observer, 'SELECT id FROM self_flat ORDER BY id') == [(1,), (2,)]
+    finally:
+        observer.close()
+        c.close()
+        query(pg, 'RESET ALL')
+
+
+def test_multi_set_atomicity(pg, schema):
+    c = my_conn(database=schema, client_flag=pymysql.constants.CLIENT.MULTI_STATEMENTS)
+    other = my_conn(database=schema)
+    raw = RawStmtClient(c)
+    previous = query(other, 'SELECT @@global.default_week_format')[0][0]
+    try:
+        query(c, "SET sql_mode='NO_BACKSLASH_ESCAPES', default_week_format=2, @a=13")
+        state = 'SELECT @@sql_mode, @@foreign_key_checks, @@default_week_format, @@time_zone, @a'
+        before = query(c, state)
+        for tail, message in [("time_zone='Invalid/Zone'", 'Invalid/Zone'),
+                              ('@b=(SELECT i FROM (SELECT 1 AS i UNION ALL SELECT 2) s)', 'more than one row')]:
+            try:
+                query(c, "SET sql_mode='', foreign_key_checks=0, default_week_format=4, @a=18, " + tail)
+            except pymysql.MySQLError as exc:
+                assert message in str(exc), exc
+            else:
+                raise AssertionError(tail)
+            assert query(c, state) == before
+            assert query(c, r"SELECT HEX('a\0')") == [('615C30',)]
+
+        query(c, "SET optimizer_switch='index_merge=off,index_merge_union=off'")
+        query(c, "SET optimizer_switch='index_merge=on', optimizer_switch='index_merge_union=on'")
+        assert query(c, 'SELECT @@optimizer_switch')[0][0].startswith('index_merge=off,index_merge_union=on,')
+
+        # All RHSs see the old values. DEFAULT inherits the preceding GLOBAL update.
+        query(c, 'SET GLOBAL default_week_format=3')
+        query(c, 'SET GLOBAL default_week_format=5, SESSION default_week_format=DEFAULT, '
+                 '@g=@@global.default_week_format, @s=@@default_week_format, @a=17, @b=@a')
+        assert query(c, 'SELECT @@default_week_format, @g, @s, @a, @b') == [
+            ('5', b'3', b'2', b'17', b'13')]
+        query(c, 'SET GLOBAL default_week_format=3, @@session.default_week_format=2, default_week_format=5')
+        assert query(c, 'SELECT @@global.default_week_format,@@default_week_format') == [('5', '2')]
+        query(c, 'SET @@global.default_week_format=5, default_week_format=4; SET default_week_format=3')
+        assert query(c, 'SELECT @@global.default_week_format,@@default_week_format') == [('5', '3')]
+        query(c, 'SET autocommit=0; SET autocommit=1, @x=@@autocommit')
+        assert query(c, 'SELECT @@autocommit,@x') == [('1', b'0')]
+
+        # A second writer can commit while the first is still evaluating an RHS.
+        pid = c.thread_id()
+        query(pg, f"""CREATE FUNCTION {schema}.wait_set(integer) RETURNS integer LANGUAGE plpgsql
+                      AS $$BEGIN PERFORM pg_advisory_xact_lock($1); RETURN 1; END$$""")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            query(pg, 'SELECT pg_advisory_lock(%s)', (pid,))
+            try:
+                future = pool.submit(query, c, f'SET GLOBAL default_week_format=6, @a=wait_set({pid}), '
+                                               "time_zone='Invalid/Zone'")
+                wait_blocked(pg, pid, future)
+                assert query(other, 'SELECT @@global.default_week_format') == [('5',)]
+                query(other, 'SET GLOBAL default_week_format=7')
+            finally:
+                query(pg, 'SELECT pg_advisory_unlock(%s)', (pid,))
+            try:
+                future.result(timeout=5)
+            except pymysql.MySQLError as exc:
+                assert 'Invalid/Zone' in str(exc), exc
+            else:
+                raise AssertionError('invalid SET succeeded')
+        assert query(other, 'SELECT @@global.default_week_format') == [('7',)]
+        assert query(c, 'SELECT @a') == [(b'17',)]
+
+        stmt = raw.prepare('SET @a=?, @bytes=0x410042, @empty=NULL, tx_isolation=?')
+        assert stmt.get('nparams') == 2, stmt
+        args = [(T_LONG, struct.pack('<i', 42)), (T_VARCHAR, lenenc_bytes(b'bad-level'))]
+        assert 'errno' in raw.execute(stmt['id'], args)
+        assert query(c, 'SELECT @a,@bytes') == [(b'17', None)]
+        args[1] = (T_VARCHAR, lenenc_bytes(b'READ-COMMITTED'))
+        assert raw.execute(stmt['id'], args).get('ok')
+        assert query(c, 'SELECT @a+1,@bytes,@empty,@@transaction_isolation,@@tx_isolation') == [
+            (43, b'A\x00B', None, 'READ-COMMITTED', 'READ-COMMITTED')]
+        raw.close_stmt(stmt['id'])
+
+        query(pg, f'CREATE TABLE {schema}.deferred_set(i int UNIQUE DEFERRABLE INITIALLY DEFERRED)')
+        query(pg, f'INSERT INTO {schema}.deferred_set VALUES (1)')
+        query(pg, f"""CREATE FUNCTION {schema}.duplicate_at_commit() RETURNS int LANGUAGE plpgsql
+                      AS $$BEGIN INSERT INTO {schema}.deferred_set VALUES (1); RETURN 1; END$$""")
+        before = query(c, "SELECT @a,@@global.default_week_format,@@time_zone,current_setting('TimeZone')")
+        for suffix in ('', '; SELECT 1'):
+            try:
+                query(c, "SET @a=duplicate_at_commit(), GLOBAL default_week_format=6, SESSION time_zone='+02:00'"
+                      + suffix)
+            except pymysql.MySQLError as exc:
+                assert exc.args[0] == 1062, exc
+            else:
+                raise AssertionError('deferred uniqueness check did not fail')
+            assert query(c, "SELECT @a,@@global.default_week_format,@@time_zone,current_setting('TimeZone')") == before
+
+        query(c, 'SET autocommit=0')
+        query(c, 'INSERT INTO deferred_set VALUES (1)')
+        try:
+            query(c, 'SET autocommit=1, @a=99, GLOBAL default_week_format=6')
+        except pymysql.MySQLError as exc:
+            assert exc.args[0] == 1062, exc
+        else:
+            raise AssertionError('implicit COMMIT did not reject the duplicate')
+        assert query(c, 'SELECT @@autocommit,@a,@@global.default_week_format') == [('0', b'42', '7')]
+        query(c, 'SET autocommit=1')
+
+        query(c, 'BEGIN')
+        query(c, 'SAVEPOINT tzpoint')
+        query(c, "SET time_zone='+05:30', default_week_format=1")
+        tz = query(c, "SELECT @@time_zone, current_setting('TimeZone'), @@default_week_format")
+        assert tz[0][0] == '+05:30' and tz[0][2] == '1', tz
+        assert query(c, "SELECT pg_catalog.date_part('timezone', pg_catalog.now())") == [(19800.0,)]
+        # An already-enabled, dynamic autocommit must leave this block open.
+        query(c, 'SET @ac=1')
+        query(c, 'SET autocommit=@ac')
+        query(c, 'ROLLBACK TO SAVEPOINT tzpoint')
+        assert query(c, "SELECT @@time_zone, current_setting('TimeZone'), @@default_week_format") == tz
+        query(c, 'ROLLBACK')
+        assert query(c, "SELECT @@time_zone, current_setting('TimeZone'), @@default_week_format") == tz
+        query(c, 'BEGIN')
+        query(c, "SET time_zone='+03:00', @a=33")
+        query(c, 'SELECT duplicate_at_commit()')
+        try:
+            query(c, 'COMMIT')
+        except pymysql.MySQLError as exc:
+            assert exc.args[0] == 1062, exc
+        else:
+            raise AssertionError('deferred uniqueness check did not fail')
+        assert query(c, "SELECT pg_catalog.date_part('timezone',pg_catalog.now()),@a") == [(10800.0, b'33')]
+    finally:
+        try:
+            query(other, 'SET GLOBAL default_week_format=%s', (previous,))
+        finally:
+            raw.close()
+            other.close()
+
+
+def test_time_arithmetic_datestyle(pg):
+    sql = """SELECT mysql.addtime(timestamp '2026-03-11 23:59:59.999999', time '00:00:00.000001')
+                         = timestamp '2026-03-12',
+                    mysql.subtime(timestamp '2026-03-12', time '01:00:00') = timestamp '2026-03-11 23:00',
+                    mysql.addtime(timestamp '2026-03-12','-25:00:00.1'::text)
+                         = timestamp '2026-03-10 22:59:59.9',
+                    mysql.subtime(timestamp '2026-03-12','-25:00:00.1'::text)
+                         = timestamp '2026-03-13 01:00:00.1',
+                    mysql.addtime(timestamp '2026-03-12','2026-03-11 00:00:00'::text) IS NULL,
+                    mysql.addtime(timestamp '9999-12-31 23:59:59.999999',time '00:00:00.000001') IS NULL,
+                    mysql.subtime('2026-03-12 01:02:03.456'::text,'25:00:00'::text)"""
+    try:
+        for style in ('ISO, YMD', 'SQL, DMY', 'Postgres, MDY', 'German, DMY'):
+            query(pg, 'SET DateStyle=%s', (style,))
+            assert query(pg, sql) == [(True, True, True, True, True, True, '2026-03-11 00:02:03.456')], style
+    finally:
+        query(pg, 'RESET DateStyle')
+
+
+def test_prepared_encoding_and_pg_operators(pg, schema):
+    raw = RawStmtClient(my_conn(database=schema))
+    try:
+        c = raw.conn
+        query(c, 'CREATE TABLE wire_charset(id INT PRIMARY KEY, b BLOB, s VARCHAR(16))')
+        for enc, word, codec in [('LATIN1', 'café', 'latin1'), ('SJIS', 'ソ', 'shift_jis')]:
+            query(c, "SELECT pg_catalog.set_config('client_encoding',%s,false)", (enc,))
+            values = f",_binary '{word}','{word}')".encode(codec)
+            query(c, b'INSERT INTO wire_charset VALUES (1' + values)
+            stmt = raw.prepare(b'INSERT INTO wire_charset VALUES (?' + values)
+            assert stmt['nparams'] == 1, stmt
+            activity = query(pg, 'SELECT query FROM pg_stat_activity WHERE pid=%s', (c.thread_id(),))
+            assert word in activity[0][0], activity
+            assert raw.execute(stmt['id'], [(T_LONG, struct.pack('<i', 2))])['affected'] == 1
+            expected = (word.encode(codec).hex().upper(), word.encode('utf8').hex().upper())
+            assert query(c, 'SELECT HEX(b), HEX(s) FROM wire_charset ORDER BY id') == [expected] * 2
+            raw.close_stmt(stmt['id'])
+            query(c, 'DELETE FROM wire_charset')
+        # SJIS ソ ends in 0x5c. Only the following backslash introduces the NUL.
+        for mode, escape, expected in [
+                ('', r'\0', ('835C00', '835C00')),
+                ('', r'\\0', ('E382BD5C30', '835C5C30')),
+                ('NO_BACKSLASH_ESCAPES', r'\0', ('E382BD5C30', '835C5C30'))]:
+            query(c, 'SET sql_mode=%s', (mode,))
+            sql = f"SELECT HEX('ソ{escape}'),HEX(_binary'ソ{escape}')".encode('shift_jis')
+            assert query(c, sql) == [expected]
+            stmt = raw.prepare(sql)
+            assert raw.execute(stmt['id'], [])['rows'] == [expected]
+            raw.close_stmt(stmt['id'])
+        query(c, 'SET sql_mode=DEFAULT')
+        query(c, "SELECT pg_catalog.set_config('client_encoding','UTF8',false)")
+
+        stmt = raw.prepare('SELECT LENGTH(?)')
+        stream_contexts = """SELECT count(*) FROM pg_catalog.pg_backend_memory_contexts
+                             WHERE name='aux_mysql long data'"""
+        raw.send_long_data(stmt['id'], 0, b'partial')
+        assert query(c, stream_contexts) == [(1,)]
+        raw.reset_stmt(stmt['id'])
+        assert query(c, stream_contexts) == [(0,)]
+        for data in ([b'abc', b'def'], [b''], [b'x' * 1024, b'y' * 2048]):
+            for chunk in data:
+                raw.send_long_data(stmt['id'], 0, chunk)
+            res = raw.execute(stmt['id'], [(T_BLOB, ...)])
+            assert res['rows'] == [(sum(map(len, data)),)], res
+        assert query(c, stream_contexts) == [(0,)]
+        raw.close_stmt(stmt['id'])
+
+        query(c, "SELECT pg_catalog.set_config('mysql.parser','postgres',false)")
+        for sql, values, expected in [
+                ('SELECT ?+? WHERE 1=?', [2, 3, 1], 5),
+                ('SELECT (?::int BETWEEN ? AND ?)::int', [3, 1, 4], 1),
+                ('SELECT count(*) OVER (ROWS ? PRECEDING)', [2], 1),
+                ('''SELECT (first ? ?)::int FROM (VALUES ('{"k":1}'::jsonb)) v(first)''', ['k'], 1),
+                ("""SELECT ('{"k":1}'::jsonb ? ?)::int""", ['k'], 1),
+                ("""SELECT ('{"k":1}'::jsonb OPERATOR(pg_catalog.?) ?)::int""", ['k'], 1),
+                ("""SELECT ('{"k":1}'::jsonb ?| array[?])::int""", ['k'], 1),
+                ("""SELECT ('{"k":1}'::jsonb @? '$.k')::int""", [], 1),
+                ("SELECT length($tag$?$tag$) + ? /* ? */", [4], 5)]:
+            stmt = raw.prepare(sql)
+            assert stmt.get('nparams') == len(values), (sql, stmt)
+            args = [(T_LONG, struct.pack('<i', v)) if isinstance(v, int)
+                    else (T_VARCHAR, lenenc_bytes(v.encode())) for v in values]
+            res = raw.execute(stmt['id'], args)
+            assert res.get('rows') == [(expected,)], (sql, res)
+            raw.close_stmt(stmt['id'])
+        mixed = raw.prepare('SELECT ?::int + $1')
+        assert 'errno' in mixed, mixed
+    finally:
+        raw.close()
+
+
 def main():
     pgbin = os.environ.get('PGBIN')
     if not pgbin:
@@ -1049,6 +1628,11 @@ def main():
         test_autocommit_default_and_dynamic_expr(schema)
         test_generator_acl_and_pending_fk_isolation(pg, schema)
         test_replace_view_wco_and_cross_partition_update_ignore(pg, schema)
+        test_ga_release_audit_fixes(pg, schema)
+        test_runtime_keys_and_transactions(pg, schema)
+        test_multi_set_atomicity(pg, schema)
+        test_time_arithmetic_datestyle(pg)
+        test_prepared_encoding_and_pg_operators(pg, schema)
         test_hot_standby_streaming_replication_and_promotion(pg, schema, pgbin)
         print('ALL ADVERSARIAL ACCEPTANCE CHECKS PASSED', flush=True)
     finally:

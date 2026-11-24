@@ -100,8 +100,12 @@ typedef struct MysPrepStmt
 	char	   *query;			/* statement text with '?' markers */
 	int			nparams;
 	int		   *param_loc;		/* byte offset of each marker */
+	uint64		prepare_lex_mode;	/* NO_BACKSLASH_ESCAPES bit at PREPARE */
+	int			prepare_parser; /* halo_mysql_parser at PREPARE */
+	bool		has_pg_param;	/* query contained $N token in MySQL mode */
 	uint16	   *param_types;	/* type | flags << 8, from the last bind */
 	bool		types_bound;
+	MemoryContext long_data_cxt;	/* owns all stream buffers until reset or execute */
 	StringInfo *long_data;		/* COM_STMT_SEND_LONG_DATA, per parameter */
 	Size		long_data_bytes;
 	bool		long_data_error;
@@ -111,6 +115,7 @@ typedef struct MysPrepStmt
 	Oid		   *cached_sig_oids;
 	Oid		   *cached_deduced_oids;
 	uint64		cached_sql_mode;
+	uint64		cached_temp_gen;
 	char	   *cached_db;
 	char	   *cached_version;
 	Oid			cached_role;
@@ -125,6 +130,7 @@ typedef struct MysPrepStmt
 
 static HTAB *stmt_hash = NULL;
 static uint32 next_stmt_id = 1;
+static Size total_long_data_space = 0;
 
 /* SQL PREPARE: statements by name (see the end of this file) */
 static HTAB *sql_stmt_hash = NULL;
@@ -169,15 +175,12 @@ lookup_stmt(uint32 id, const char *where, bool missing_ok)
 static void
 clear_stmt_long_data(MysPrepStmt *stmt)
 {
-	for (int i = 0; i < stmt->nparams; i++)
-	{
-		if (stmt->long_data[i])
-		{
-			pfree(stmt->long_data[i]->data);
-			pfree(stmt->long_data[i]);
-			stmt->long_data[i] = NULL;
-		}
-	}
+	if (stmt->long_data_cxt == NULL)
+		return;
+	total_long_data_space -= MemoryContextMemAllocated(stmt->long_data_cxt, false);
+	MemoryContextDelete(stmt->long_data_cxt);
+	stmt->long_data_cxt = NULL;
+	memset(stmt->long_data, 0, stmt->nparams * sizeof(*stmt->long_data));
 	stmt->long_data_bytes = 0;
 }
 
@@ -213,6 +216,7 @@ drop_stmt(MysPrepStmt *stmt)
 	MemoryContext cxt = stmt->cxt;
 	uint32		id = stmt->id;
 
+	clear_stmt_long_data(stmt);
 	drop_stmt_cached_plan(stmt);
 	hash_search(stmt_hash, &id, HASH_REMOVE, NULL);
 	MemoryContextDelete(cxt);
@@ -242,10 +246,12 @@ mys_stmt_close_all(void)
 		MemoryContext cxt = stmt->cxt;
 		uint32		id = stmt->id;
 
+		clear_stmt_long_data(stmt);
 		drop_stmt_cached_plan(stmt);
 		hash_search(stmt_hash, &id, HASH_REMOVE, NULL);
 		MemoryContextDelete(cxt);
 	}
+	total_long_data_space = 0;
 }
 
 /* end of a COM_QUERY / COM_STMT_EXECUTE cycle */
@@ -261,36 +267,162 @@ mys_stmt_query_done(void)
  * ----------------------------------------------------------------
  */
 
-/* Byte offsets of the '?' markers, found with the MySQL scanner itself */
-static int
-find_markers(const char *query, int **locs)
+/* A bare infix '?' belongs to PostgreSQL (notably jsonb existence). */
+static bool
+pg_token_ends_operand(int tok, const core_YYSTYPE *val, int prev,
+					  const char *prevkw, bool left, bool window_start)
 {
-	mys_yy_extra_type yyextra;
+	if (tok > NOT_EQUALS)		/* keyword from the PostgreSQL scanner */
+	{
+		const char *kw = val->keyword;
+		int			k = ScanKeywordLookup(kw, &ScanKeywords);
+
+		if (prev == '.' || prev == TYPECAST)
+			return true;
+		if (ScanKeywordCategories[k] <= COL_NAME_KEYWORD)
+		{
+			/* Nonreserved clause words can also be column names. */
+			if (strcmp(kw, "by") == 0)
+				return strcmp(prevkw, "order") && strcmp(prevkw, "group") &&
+					strcmp(prevkw, "partition");
+			if (strcmp(kw, "first") == 0 || strcmp(kw, "next") == 0)
+				return strcmp(prevkw, "fetch") != 0;
+			if (strcmp(kw, "zone") == 0)
+				return strcmp(prevkw, "time") != 0;
+			if (strcmp(kw, "between") == 0 || strcmp(kw, "escape") == 0)
+				return !left && strcmp(prevkw, "not") && strcmp(prevkw, "rows") &&
+					strcmp(prevkw, "range") && strcmp(prevkw, "groups");
+			if (strcmp(kw, "rows") == 0 || strcmp(kw, "range") == 0 || strcmp(kw, "groups") == 0)
+				return !left && !window_start && strcmp(prevkw, "asc") && strcmp(prevkw, "desc");
+			return true;
+		}
+		return strcmp(kw, "null") == 0 || strcmp(kw, "true") == 0 ||
+			strcmp(kw, "false") == 0 || strcmp(kw, "end") == 0 ||
+			strncmp(kw, "current_", 8) == 0 || strcmp(kw, "user") == 0 ||
+			strcmp(kw, "session_user") == 0 || strcmp(kw, "localtime") == 0 ||
+			strcmp(kw, "localtimestamp") == 0;
+	}
+	return (tok >= IDENT && tok <= XCONST) || tok == ICONST || tok == PARAM ||
+		tok == ')' || tok == ']';
+}
+
+static void
+record_marker(int offset, int **locs, int *n, int *cap)
+{
+	if (*n == PG_UINT16_MAX)
+		ereport(ERROR,
+				(errcode(MYS_ERRCODE_PS_MANY_PARAM),
+				 errmsg("Prepared statement contains too many placeholders")));
+	if (*n == *cap)
+	{
+		*cap *= 2;
+		*locs = repalloc(*locs, *cap * sizeof(int));
+	}
+	(*locs)[(*n)++] = offset;
+}
+
+/* Byte offsets in server encoding, using the active dialect's scanner. */
+static int
+find_markers(const char *query, int **locs, int parser_mode, bool *has_pg_param)
+{
 	core_yyscan_t yyscanner;
 	core_YYSTYPE yylval;
-	YYLTYPE		yylloc;
+	YYLTYPE		yylloc = 0;
 	int			tok;
 	int			n = 0;
 	int			cap = 8;
-	int		   *loc = palloc(cap * sizeof(int));
 
-	memset(&yyextra, 0, sizeof(yyextra));
-	yyscanner = mys_scanner_init(query, &yyextra.core_yy_extra,
-								 &MysScanKeywords, MysScanKeywordTokens);
-	while ((tok = mys_core_yylex(&yylval, &yylloc, yyscanner)) != 0)
+	*locs = palloc(cap * sizeof(int));
+	if (has_pg_param)
+		*has_pg_param = false;
+
+	if (parser_mode == MYS_PARSER_POSTGRES)
 	{
-		if (tok != MysParam)
-			continue;
-		if (n == cap)
+		core_yy_extra_type extra = {0};
+		bool		left_operand = false;
+		bool		operator_name = false;
+		const char *prevkw = "";
+		bool		window_start = false;
+		int			previous = 0;
+
+		yyscanner = scanner_init(query, &extra, &ScanKeywords, ScanKeywordTokens);
+		while ((tok = core_yylex(&yylval, &yylloc, yyscanner)) != 0)
 		{
-			cap *= 2;
-			loc = repalloc(loc, cap * sizeof(int));
+			if (tok == '(' && strcmp(prevkw, "operator") == 0)
+				operator_name = true;
+			if (tok == PARAM && has_pg_param)
+				*has_pg_param = true;
+			if (tok == Op && !operator_name)
+			{
+				/* Flex groups adjacent operators, including =? and ?+?. */
+				const char *op = yylval.str;
+
+				for (int i = 0; op[i]; i++)
+				{
+					if (op[i] == '@' && op[i + 1] == '?')
+						i++;	/* native jsonpath operator */
+					else if (op[i] == '?' && !left_operand)
+					{
+						record_marker(yylloc + i, locs, &n, &cap);
+						left_operand = true;
+						continue;
+					}
+					left_operand = false;
+				}
+			}
+			else if (tok == ')' && operator_name)
+			{
+				operator_name = false;
+				left_operand = false;
+			}
+			else
+				left_operand = pg_token_ends_operand(tok, &yylval, previous, prevkw, left_operand, window_start);
+			window_start = (tok == '(' && (strcmp(prevkw, "over") == 0 || strcmp(prevkw, "as") == 0));
+			prevkw = (tok > NOT_EQUALS && previous != '.') ? yylval.keyword : "";
+			previous = tok;
 		}
-		loc[n++] = yylloc;
+		scanner_finish(yyscanner);
 	}
-	mys_scanner_finish(yyscanner);
-	*locs = loc;
+	else
+	{
+		mys_yy_extra_type yyextra = {0};
+
+		yyscanner = mys_scanner_init(query, &yyextra.core_yy_extra,
+									 &MysScanKeywords, MysScanKeywordTokens);
+		while ((tok = mys_core_yylex(&yylval, &yylloc, yyscanner)) != 0)
+		{
+			if (tok == PARAM && has_pg_param)
+				*has_pg_param = true;
+			if (tok == MysParam)
+				record_marker(yylloc, locs, &n, &cap);
+		}
+		mys_scanner_finish(yyscanner);
+	}
 	return n;
+}
+
+/*
+ * Verify that lexical state changes (NO_BACKSLASH_ESCAPES or mysql.parser)
+ * since PREPARE have not shifted parameter marker boundaries.
+ */
+static void
+verify_markers_for_exec(const char *query, int nparams, const int *param_loc,
+						uint64 prepare_lex_mode, int prepare_parser)
+{
+	uint64		cur_lex_mode = mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES;
+	int		   *cur_locs = NULL;
+	int			cur_n;
+
+	if (cur_lex_mode == prepare_lex_mode && halo_mysql_parser == prepare_parser)
+		return;
+
+	cur_n = find_markers(query, &cur_locs, halo_mysql_parser, NULL);
+	if (cur_n != nparams ||
+		(nparams > 0 && memcmp(cur_locs, param_loc, sizeof(int) * nparams) != 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("Prepared statement needs to be re-prepared after SQL mode or parser change")));
+	pfree(cur_locs);
 }
 
 /* ----------------------------------------------------------------
@@ -302,19 +434,32 @@ append_hex_literal(StringInfo buf, const char *s, int len)
 {
 	static const char hex[] = "0123456789abcdef";
 
-	appendStringInfoString(buf, "(_binary X'");
-	enlargeStringInfo(buf, len * 2 + 3);
+	if (len < 0 || (int64) len > (int64) ((MaxAllocSize - 32) / 2))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("binary parameter too large")));
+
+	if (halo_mysql_parser == MYS_PARSER_POSTGRES)
+		appendStringInfoString(buf, "('\\x");
+	else
+		appendStringInfoString(buf, "(_binary X'");
+	enlargeStringInfo(buf, len * 2 + 12);
 	for (int i = 0; i < len; i++)
 	{
 		appendStringInfoChar(buf, hex[((uint8) s[i]) >> 4]);
 		appendStringInfoChar(buf, hex[((uint8) s[i]) & 0x0f]);
 	}
-	appendStringInfoString(buf, "')");
+	if (halo_mysql_parser == MYS_PARSER_POSTGRES)
+		appendStringInfoString(buf, "'::bytea)");
+	else
+		appendStringInfoString(buf, "')");
 }
 
 static void
 append_string_literal(StringInfo buf, const char *s, int len, bool binary)
 {
+	bool		escape_backslash;
+
 	if (binary || memchr(s, '\0', len) != NULL ||
 		!pg_verify_mbstr(GetDatabaseEncoding(), s, len, true))
 	{
@@ -322,12 +467,16 @@ append_string_literal(StringInfo buf, const char *s, int len, bool binary)
 		return;
 	}
 
+	/* PG19 always uses standard_conforming_strings; never escape '\' there. */
+	escape_backslash = (halo_mysql_parser != MYS_PARSER_POSTGRES) &&
+		!(mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES);
+
 	appendStringInfoString(buf, "('");
 	for (int i = 0; i < len; i++)
 	{
 		if (s[i] == '\'')
 			appendStringInfoString(buf, "''");
-		else if (s[i] == '\\' && !(mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES))
+		else if (s[i] == '\\' && escape_backslash)
 			appendStringInfoString(buf, "\\\\");
 		else
 			appendStringInfoChar(buf, s[i]);
@@ -500,10 +649,13 @@ prepare_time_error(int sqlerrcode)
 		case MYS_ERRCODE_NO_DB_ERROR:
 		case ERRCODE_INSUFFICIENT_PRIVILEGE:
 		case ERRCODE_FEATURE_NOT_SUPPORTED:
+		case ERRCODE_UNDEFINED_PARAMETER:
 		case ERRCODE_INVALID_PSTATEMENT_DEFINITION:
 		case ERRCODE_QUERY_CANCELED:
 		case ERRCODE_LOCK_NOT_AVAILABLE:
 		case ERRCODE_T_R_DEADLOCK_DETECTED:
+		case ERRCODE_T_R_SERIALIZATION_FAILURE:
+		case ERRCODE_TRANSACTION_TIMEOUT:
 		case ERRCODE_OUT_OF_MEMORY:
 		case ERRCODE_ADMIN_SHUTDOWN:
 		case ERRCODE_CRASH_SHUTDOWN:
@@ -556,6 +708,7 @@ describe_statement(const char *query, int nparams, const int *locs,
 	ResourceOwner oldowner = CurrentResourceOwner;
 	MysTextMap *saved_map = mys_text_map;
 	bool		result = false;
+	volatile bool snapshot_set = false;
 
 	initStringInfo(&text);
 	for (int i = 0; i < nparams; i++)
@@ -626,12 +779,23 @@ describe_statement(const char *query, int nparams, const int *locs,
 
 		if (last && !last_info->silent && !last_info->capture_insert_id)
 		{
-			List	   *qlist = pg_analyze_and_rewrite_fixedparams(last, text.data,
-																   NULL, 0, NULL);
+			List	   *qlist;
 			Query	   *q = NULL;
 			TupleDesc	inner_desc = NULL;
 			List	   *inner_tlist = NIL;
 
+			if (!ActiveSnapshotSet() && analyze_requires_snapshot(last))
+			{
+				PushActiveSnapshot(GetTransactionSnapshot());
+				snapshot_set = true;
+			}
+			qlist = pg_analyze_and_rewrite_fixedparams(last, text.data,
+													   NULL, 0, NULL);
+			if (snapshot_set)
+			{
+				PopActiveSnapshot();
+				snapshot_set = false;
+			}
 			foreach(lc, qlist)
 			{
 				if (lfirst_node(Query, lc)->canSetTag)
@@ -679,6 +843,11 @@ describe_statement(const char *query, int nparams, const int *locs,
 	{
 		ErrorData  *edata;
 
+		if (snapshot_set)
+		{
+			PopActiveSnapshot();
+			snapshot_set = false;
+		}
 		mys_text_map = saved_map;
 		(void) mys_end_fastpath_probe();
 		mys_discard_rewrite_warnings();
@@ -728,14 +897,21 @@ send_param_def(void)
 void
 mys_stmt_prepare(StringInfo pkt)
 {
-	char	   *volatile query = pnstrdup(pkt->data + 1, pkt->len - 1);
+	char	   *volatile query = NULL;
 	int		   *volatile locs = NULL;
 	volatile int nparams = 0;
+	volatile bool has_pg_param = false;
 	TupleDesc	tupdesc = NULL;
 	List	   *tlist = NIL;
 	int			ncols = 0;
 	MysPrepStmt *stmt;
 	MemoryContext cxt;
+	char	   *stmt_query;
+	int		   *stmt_param_loc;
+	uint16	   *stmt_param_types;
+	StringInfo *stmt_long_data;
+	Oid		   *stmt_cached_sig_oids;
+	Oid		   *stmt_cached_deduced_oids;
 	StringInfoData b;
 	uint32		id;
 	bool		found;
@@ -758,27 +934,32 @@ mys_stmt_prepare(StringInfo pkt)
 		return;
 	}
 
-	debug_query_string = query;
-	pgstat_report_activity(STATE_RUNNING, query);
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	/* as exec_simple_query: work in MessageContext, not the transaction */
 	MemoryContextSwitchTo(MessageContext);
-	PushActiveSnapshot(GetTransactionSnapshot());
+	mys_sync_session_state();
+	mys_sync_selected_database();
+	mys_binary_session_init();
 
 	/* scanner errors (e.g. unterminated string) are syntax errors */
 	PG_TRY();
 	{
+		char	   *normalized;
 		int		   *found_locs;
+		bool		pg_param = false;
 
-		/* as for COM_QUERY, string literals that are not text become X'hex' */
-		query = mys_normalize_query(pkt->data + 1, pkt->len - 1);
-		nparams = find_markers(query, &found_locs);
-		if (nparams > PG_UINT16_MAX)
-			ereport(ERROR,
-					(errcode(MYS_ERRCODE_PS_MANY_PARAM),
-					 errmsg("Prepared statement contains too many placeholders")));
+		/* Protect raw binary literals before transcoding SQL text, as in COM_QUERY. */
+		normalized = mys_normalize_query(pkt->data + 1, pkt->len - 1,
+										 pg_get_client_encoding());
+		query = pg_client_to_server(normalized, strlen(normalized));
+		if (query != normalized)
+			pfree(normalized);
+		debug_query_string = query;
+		pgstat_report_activity(STATE_RUNNING, query);
+		nparams = find_markers(query, &found_locs, halo_mysql_parser, &pg_param);
 		locs = found_locs;
+		has_pg_param = pg_param;
 	}
 	PG_CATCH();
 	{
@@ -800,7 +981,6 @@ mys_stmt_prepare(StringInfo pkt)
 	if (error)
 	{
 		/* MySQL: a failed PREPARE leaves the transaction alone */
-		PopActiveSnapshot();
 		CommitTransactionCommand();
 		debug_query_string = NULL;
 		mys_send_error(error->sqlerrcode, error->message);
@@ -816,23 +996,37 @@ mys_stmt_prepare(StringInfo pkt)
 			next_stmt_id = 1;
 	} while (hash_search(stmt_hash, &id, HASH_FIND, NULL) != NULL);
 
-	cxt = AllocSetContextCreate(TopMemoryContext, "aux_mysql prepared statement",
+	/* Allocate everything into cxt BEFORE inserting into stmt_hash so an OOM
+	 * cannot leave a half-initialized hash entry behind. */
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "aux_mysql prepared statement",
 								ALLOCSET_SMALL_SIZES);
+	stmt_query = MemoryContextStrdup(cxt, query);
+	stmt_param_loc = MemoryContextAlloc(cxt, sizeof(int) * Max(nparams, 1));
+	if (nparams > 0)
+		memcpy(stmt_param_loc, locs, sizeof(int) * nparams);
+	stmt_param_types = MemoryContextAllocZero(cxt, sizeof(uint16) * Max(nparams, 1));
+	stmt_long_data = MemoryContextAllocZero(cxt, sizeof(*stmt_long_data) * Max(nparams, 1));
+	stmt_cached_sig_oids = MemoryContextAllocZero(cxt, sizeof(Oid) * Max(nparams, 1));
+	stmt_cached_deduced_oids = MemoryContextAllocZero(cxt, sizeof(Oid) * Max(nparams, 1));
+
 	stmt = hash_search(stmt_hash, &id, HASH_ENTER, &found);
+	MemoryContextSetParent(cxt, TopMemoryContext);
 	memset(((char *) stmt) + sizeof(uint32), 0, sizeof(MysPrepStmt) - sizeof(uint32));
 	stmt->id = id;
 	stmt->cxt = cxt;
-	stmt->query = MemoryContextStrdup(cxt, query);
+	stmt->query = stmt_query;
 	stmt->nparams = nparams;
-	stmt->param_loc = MemoryContextAlloc(cxt, sizeof(int) * Max(nparams, 1));
-	memcpy(stmt->param_loc, locs, sizeof(int) * nparams);
-	stmt->param_types = MemoryContextAllocZero(cxt, sizeof(uint16) * Max(nparams, 1));
+	stmt->param_loc = stmt_param_loc;
+	stmt->prepare_lex_mode = mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES;
+	stmt->prepare_parser = halo_mysql_parser;
+	stmt->has_pg_param = has_pg_param;
+	stmt->param_types = stmt_param_types;
 	stmt->types_bound = false;
-	stmt->long_data = MemoryContextAllocZero(cxt, sizeof(StringInfo) * Max(nparams, 1));
+	stmt->long_data = stmt_long_data;
 	stmt->long_data_bytes = 0;
 	stmt->long_data_error = false;
-	stmt->cached_sig_oids = MemoryContextAllocZero(cxt, sizeof(Oid) * Max(nparams, 1));
-	stmt->cached_deduced_oids = MemoryContextAllocZero(cxt, sizeof(Oid) * Max(nparams, 1));
+	stmt->cached_sig_oids = stmt_cached_sig_oids;
+	stmt->cached_deduced_oids = stmt_cached_deduced_oids;
 
 	/* COM_STMT_PREPARE_OK */
 	initStringInfo(&b);
@@ -871,7 +1065,6 @@ mys_stmt_prepare(StringInfo pkt)
 			mys_send_eof(false);
 	}
 
-	PopActiveSnapshot();
 	CommitTransactionCommand();
 	debug_query_string = NULL;
 }
@@ -898,6 +1091,8 @@ decode_execute_packet(StringInfo inBuf, MysPrepStmt **stmt_out,
 	MysPrepStmt *stmt;
 	MysDecodedParam *dparams;
 	const char *nullmap = NULL;
+	uint16	   *new_types = NULL;
+	const uint16 *active_types = NULL;
 	uint32		id;
 
 	inBuf->cursor = 1;			/* command byte */
@@ -919,17 +1114,20 @@ decode_execute_packet(StringInfo inBuf, MysPrepStmt **stmt_out,
 				malformed();
 			if (need_uint(inBuf, 1))
 			{
+				new_types = palloc(sizeof(uint16) * stmt->nparams);
 				for (int i = 0; i < stmt->nparams; i++)
-					stmt->param_types[i] = (uint16) need_uint(inBuf, 2);
-				stmt->types_bound = true;
+					new_types[i] = (uint16) need_uint(inBuf, 2);
+				active_types = new_types;
 			}
 			else if (!stmt->types_bound)
 				malformed();
+			else
+				active_types = stmt->param_types;
 		}
 
 		for (int i = 0; i < stmt->nparams; i++)
 		{
-			uint16		ptype = stmt->param_types[i];
+			uint16		ptype = active_types[i];
 			uint8		type = ptype & 0xff;
 
 			dparams[i].ptype = ptype;
@@ -1033,6 +1231,11 @@ decode_execute_packet(StringInfo inBuf, MysPrepStmt **stmt_out,
 				}
 			}
 		}
+		if (new_types != NULL)
+		{
+			memcpy(stmt->param_types, new_types, sizeof(uint16) * stmt->nparams);
+			stmt->types_bound = true;
+		}
 	}
 	PG_FINALLY();
 	{
@@ -1046,6 +1249,25 @@ decode_execute_packet(StringInfo inBuf, MysPrepStmt **stmt_out,
 }
 
 static void
+append_client_string_literal(StringInfo buf, const char *s, int len, bool binary)
+{
+	if (!binary && len > 0 &&
+		pg_get_client_encoding() != GetDatabaseEncoding() &&
+		memchr(s, '\0', len) == NULL)
+	{
+		char	   *conv = pg_client_to_server(s, len);
+
+		if (conv != s)
+		{
+			append_string_literal(buf, conv, strlen(conv), false);
+			pfree(conv);
+			return;
+		}
+	}
+	append_string_literal(buf, s, len, binary);
+}
+
+static void
 append_decoded_param(StringInfo buf, const MysDecodedParam *dp)
 {
 	uint8		type = dp->ptype & 0xff;
@@ -1053,7 +1275,7 @@ append_decoded_param(StringInfo buf, const MysDecodedParam *dp)
 
 	if (dp->has_long_data)
 	{
-		append_string_literal(buf, dp->bytes, dp->len, param_type_is_binary(dp->ptype));
+		append_client_string_literal(buf, dp->bytes, dp->len, param_type_is_binary(dp->ptype));
 		return;
 	}
 	if (dp->is_null)
@@ -1108,7 +1330,7 @@ append_decoded_param(StringInfo buf, const MysDecodedParam *dp)
 				appendStringInfoChar(buf, ')');
 			}
 			else
-				append_string_literal(buf, dp->bytes, dp->len, false);
+				append_client_string_literal(buf, dp->bytes, dp->len, false);
 			break;
 		case MYSQL_TYPE_VARCHAR:
 		case MYSQL_TYPE_VAR_STRING:
@@ -1116,7 +1338,7 @@ append_decoded_param(StringInfo buf, const MysDecodedParam *dp)
 		case MYSQL_TYPE_ENUM:
 		case MYSQL_TYPE_SET:
 		case MYSQL_TYPE_JSON:
-			append_string_literal(buf, dp->bytes, dp->len, false);
+			append_client_string_literal(buf, dp->bytes, dp->len, false);
 			break;
 		case MYSQL_TYPE_TINY_BLOB:
 		case MYSQL_TYPE_MEDIUM_BLOB:
@@ -1140,6 +1362,11 @@ render_decoded_execute_query(StringInfo inBuf, MysPrepStmt *stmt,
 	int		   *new_loc = palloc(sizeof(int) * Max(stmt->nparams, 1));
 	int		   *new_len = palloc(sizeof(int) * Max(stmt->nparams, 1));
 	int			prev = 0;
+	char	   *wire;
+	int			wire_len;
+
+	verify_markers_for_exec(stmt->query, stmt->nparams, stmt->param_loc,
+							stmt->prepare_lex_mode, stmt->prepare_parser);
 
 	initStringInfo(&q);
 	for (int i = 0; i < stmt->nparams; i++)
@@ -1159,9 +1386,20 @@ render_decoded_execute_query(StringInfo inBuf, MysPrepStmt *stmt,
 	map->new_loc = new_loc;
 	map->new_len = new_len;
 
+	wire = q.data;
+	wire_len = q.len;
+	if (pg_get_client_encoding() != GetDatabaseEncoding())
+	{
+		wire = pg_server_to_client(q.data, q.len);
+		if (wire != q.data)
+			wire_len = strlen(wire);
+	}
+
 	resetStringInfo(inBuf);
-	appendBinaryStringInfo(inBuf, q.data, q.len + 1);
+	appendBinaryStringInfo(inBuf, wire, wire_len + 1);
 	inBuf->cursor = 0;
+	if (wire != q.data)
+		pfree(wire);
 	pfree(q.data);
 
 	mys_text_map = map;
@@ -1397,6 +1635,7 @@ fastpath_env_matches(const MysPrepStmt *stmt, const Oid *sig_oids)
 		memcmp(stmt->cached_sig_oids, sig_oids, sizeof(Oid) * stmt->nparams) != 0)
 		return false;
 	if (stmt->cached_sql_mode != mys_sqlMode ||
+		stmt->cached_temp_gen != mys_temp_table_gen() ||
 		stmt->cached_role != GetUserId() ||
 		stmt->cached_session_role != GetSessionUserId() ||
 		stmt->cached_row_security != row_security)
@@ -1453,6 +1692,12 @@ build_fastpath_plansource(MysPrepStmt *stmt, const Oid *sig_oids)
 	volatile bool ok = false;
 
 	drop_stmt_cached_plan(stmt);
+
+	if (stmt->has_pg_param)
+	{
+		stmt->fastpath_state = -1;
+		return false;
+	}
 
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(oldcxt);
@@ -1606,6 +1851,7 @@ build_fastpath_plansource(MysPrepStmt *stmt, const Oid *sig_oids)
 												   sizeof(Oid) * stmt->nparams);
 										}
 										stmt->cached_sql_mode = mys_sqlMode;
+										stmt->cached_temp_gen = mys_temp_table_gen();
 										stmt->cached_hexlit = mys_hexlit_available;
 										stmt->cached_role = GetUserId();
 										stmt->cached_session_role = GetSessionUserId();
@@ -1848,6 +2094,7 @@ mys_stmt_try_execute(StringInfo inBuf)
 
 	if (decode_err != NULL)
 	{
+		mys_clear_diagnostics();
 		mys_send_error(decode_err->sqlerrcode, decode_err->message);
 		FreeErrorData(decode_err);
 		return true;
@@ -1855,6 +2102,9 @@ mys_stmt_try_execute(StringInfo inBuf)
 
 	sig_oids = palloc0(sizeof(Oid) * Max(stmt->nparams, 1));
 	if (halo_mysql_parser != MYS_PARSER_MYSQL ||
+		stmt->prepare_parser != MYS_PARSER_MYSQL ||
+		stmt->prepare_lex_mode != (mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES) ||
+		stmt->has_pg_param ||
 		stmt->fastpath_state < 0 ||
 		Transform_null_equals ||
 		(mys_sqlMode & (MYS_MODE_STRICT_TRANS_TABLES | MYS_MODE_STRICT_ALL_TABLES)) == 0 ||
@@ -1870,8 +2120,6 @@ mys_stmt_try_execute(StringInfo inBuf)
 	SetCurrentStatementStartTimestamp();
 	if (save_log_statement_stats)
 		ResetUsage();
-	mys_sync_session_state();
-	mys_sync_selected_database();
 
 	wrap_savepoint = mys_transaction_active() && halo_mysql_statement_rollback;
 	if (wrap_savepoint)
@@ -1881,6 +2129,8 @@ mys_stmt_try_execute(StringInfo inBuf)
 	pgstat_report_activity(STATE_RUNNING, stmt->query);
 
 	StartTransactionCommand();
+	mys_sync_session_state();
+	mys_sync_selected_database();
 	enable_fast_stmt_timeout();
 	if (!IsTransactionBlock())
 		mys_start_implicit_transaction(false);
@@ -2127,31 +2377,61 @@ mys_stmt_send_long_data(StringInfo pkt)
 	uint64		id;
 	uint64		param;
 	Size		chunk_len;
-	MemoryContext oldcxt;
+	Size		stmt_limit;
+	Size		session_limit;
+	Size		oldspace;
+	Size		other;
+	MemoryContext oldcxt = CurrentMemoryContext;
 
 	pkt->cursor = 1;
-	/* no response; MySQL reports problems at EXECUTE time */
+	/* No response; MySQL reports problems at EXECUTE time. */
 	if (!get_uint(pkt, 4, &id) || !get_uint(pkt, 2, &param))
 		return;
 	stmt = lookup_stmt((uint32) id, "mysqld_stmt_send_long_data", true);
-	if (stmt == NULL || param >= (uint64) stmt->nparams)
+	if (stmt == NULL || param >= (uint64) stmt->nparams || stmt->long_data_error)
 		return;
-	chunk_len = (Size) (pkt->len - pkt->cursor);
-	if (stmt->long_data_error ||
-		chunk_len > (Size) halo_mysql_max_allowed_packet ||
-		stmt->long_data_bytes > (Size) halo_mysql_max_allowed_packet - chunk_len)
+
+	chunk_len = pkt->len - pkt->cursor;
+	stmt_limit = Min((Size) halo_mysql_max_allowed_packet, MaxAllocSize - 1);
+	session_limit = Max(stmt_limit * 4, (Size) 256 * 1024 * 1024);
+	oldspace = stmt->long_data_cxt ? MemoryContextMemAllocated(stmt->long_data_cxt, false) : 0;
+	other = total_long_data_space - oldspace;
+	if (chunk_len > stmt_limit || stmt->long_data_bytes > stmt_limit - chunk_len ||
+		other >= session_limit || stmt->long_data_bytes + chunk_len > session_limit - other)
 	{
+		clear_stmt_long_data(stmt);
 		stmt->long_data_error = true;
 		return;
 	}
-	stmt->long_data_bytes += chunk_len;
 
-	oldcxt = MemoryContextSwitchTo(stmt->cxt);
-	if (stmt->long_data[param] == NULL)
-		stmt->long_data[param] = makeStringInfo();
-	appendBinaryStringInfo(stmt->long_data[param], pkt->data + pkt->cursor,
-						   (int) chunk_len);
-	MemoryContextSwitchTo(oldcxt);
+	PG_TRY();
+	{
+		if (stmt->long_data_cxt == NULL)
+			stmt->long_data_cxt = AllocSetContextCreate(stmt->cxt, "aux_mysql long data",
+														ALLOCSET_SMALL_SIZES);
+		MemoryContextSwitchTo(stmt->long_data_cxt);
+		if (stmt->long_data[param] == NULL)
+			stmt->long_data[param] = makeStringInfoExt((int) chunk_len + 1);
+		appendBinaryStringInfo(stmt->long_data[param], pkt->data + pkt->cursor, (int) chunk_len);
+		stmt->long_data_bytes += chunk_len;
+		MemoryContextSwitchTo(oldcxt);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcxt);
+		FlushErrorState();
+		stmt->long_data_error = true;
+	}
+	PG_END_TRY();
+
+	/* Charge allocator blocks, including geometric growth and free space. */
+	if (stmt->long_data_cxt)
+		total_long_data_space = other + MemoryContextMemAllocated(stmt->long_data_cxt, false);
+	if (stmt->long_data_error || total_long_data_space > session_limit)
+	{
+		clear_stmt_long_data(stmt);
+		stmt->long_data_error = true;
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -2178,6 +2458,8 @@ typedef struct MysSqlStmt
 	char	   *query;			/* text with '?' markers */
 	int			nparams;
 	int		   *param_loc;		/* byte offset of each marker */
+	uint64		prepare_lex_mode;
+	int			prepare_parser;
 } MysSqlStmt;
 
 /* statement names are case-insensitive in MySQL */
@@ -2256,19 +2538,22 @@ sql_stmt_store(const char *name, const char *query, int nparams, const int *locs
 	}
 	sql_stmt_key(name, key);
 
-	cxt = AllocSetContextCreate(TopMemoryContext, "aux_mysql SQL prepared statement",
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "aux_mysql SQL prepared statement",
 								ALLOCSET_SMALL_SIZES);
 	text = MemoryContextStrdup(cxt, query);
 	loc = MemoryContextAlloc(cxt, sizeof(int) * Max(nparams, 1));
 	memcpy(loc, locs, sizeof(int) * nparams);
 
 	stmt = hash_search(sql_stmt_hash, key, HASH_ENTER, &found);
+	MemoryContextSetParent(cxt, TopMemoryContext);
 	if (found)
 		MemoryContextDelete(stmt->cxt);
 	stmt->cxt = cxt;
 	stmt->query = text;
 	stmt->nparams = nparams;
 	stmt->param_loc = loc;
+	stmt->prepare_lex_mode = mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES;
+	stmt->prepare_parser = halo_mysql_parser;
 }
 
 /* the marker statement's kind, or NULL if it is no such marker */
@@ -2380,12 +2665,8 @@ sql_prepare(DoStmt *d)
 				 errmsg("Can't create more than max_prepared_stmt_count statements (current value: %d)",
 						MYS_MAX_PREPARED_STMTS)));
 
-	query = mys_normalize_query(text, len);
-	nparams = find_markers(query, &locs);
-	if (nparams > PG_UINT16_MAX)
-		ereport(ERROR,
-				(errcode(MYS_ERRCODE_PS_MANY_PARAM),
-				 errmsg("Prepared statement contains too many placeholders")));
+	query = mys_normalize_query(text, len, GetDatabaseEncoding());
+	nparams = find_markers(query, &locs, halo_mysql_parser, NULL);
 	(void) describe_statement(query, nparams, locs, &tupdesc, &tlist, &error);
 	if (error)
 		ReThrowError(error);
@@ -2515,6 +2796,9 @@ sql_execute(DoStmt *d, const char *queryString)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_PARAMETER),
 				 errmsg("Incorrect arguments to EXECUTE")));
+
+	verify_markers_for_exec(stmt->query, stmt->nparams, stmt->param_loc,
+							stmt->prepare_lex_mode, stmt->prepare_parser);
 
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;

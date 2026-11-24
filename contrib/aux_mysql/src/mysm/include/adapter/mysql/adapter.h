@@ -25,8 +25,6 @@ extern long long affectedRows;
 extern unsigned long lastInsertID;
 extern bool isStrictTransTablesOn;
 extern Oid	caseInsensitiveId;
-extern bool needCommitTrx;
-extern bool needStartNewTrx;
 
 extern Oid	getCaseInsensitiveId(void);
 

@@ -873,6 +873,9 @@ PGAC_ARG_BOOL(with, icu, yes, [build without ICU support],
 AC_MSG_RESULT([$with_icu])
 AC_SUBST(with_icu)
 
+if test "$with_icu" != yes; then
+  AC_MSG_ERROR([OpenHalo requires ICU support (--with-icu); do not pass --without-icu])
+fi
 if test "$with_icu" = yes; then
   PKG_CHECK_MODULES(ICU, icu-uc icu-i18n)
 fi
@@ -1447,6 +1450,8 @@ if test "$with_ssl" = openssl ; then
   AC_DEFINE([USE_OPENSSL], 1, [Define to 1 to build with OpenSSL support. (--with-ssl=openssl)])
 elif test "$with_ssl" != no ; then
   AC_MSG_ERROR([--with-ssl must specify openssl])
+else
+  AC_MSG_WARN([building without OpenSSL disables TLS and RSA key exchange for MySQL caching_sha2_password])
 fi
 AC_SUBST(with_ssl)
 

@@ -53,6 +53,7 @@
 #include "parser/parse_func.h"
 #include "parser/parse_type.h"
 #include "parser/parser.h"
+#include "storage/lmgr.h"
 #include "tcop/utility.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -79,6 +80,14 @@ static planner_hook_type prev_planner = NULL;
 /* utility commands aux_mysql runs itself to implement a MySQL statement */
 static int	internal_utility_depth = 0;
 static bool collation_provider_registered = false;
+static bool skip_create_side_stmts = false;
+static uint64 mys_temp_table_gen_val = 0;
+
+uint64
+mys_temp_table_gen(void)
+{
+	return mys_temp_table_gen_val;
+}
 
 /* row triggers maintained by mysql_table_setup() */
 #define ON_UPDATE_TRIGGER	"aux_mysql_on_update"
@@ -401,6 +410,16 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 			*after = lappend(*after, make_column_comment(relid, colname,
 														  ((CommentStmt *) n)->comment));
 	}
+	if (generated && identity)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot specify both AUTO_INCREMENT and GENERATED ALWAYS for column \"%s\"",
+						colname)));
+	if (generated && defexpr)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot specify both DEFAULT and GENERATED ALWAYS for column \"%s\"",
+						colname)));
 	if (identity)
 	{
 		notnull = true;			/* AUTO_INCREMENT columns are NOT NULL */
@@ -455,17 +474,23 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 			{
 				char *name = constr->check[i].ccname;
 				HeapTuple tuple;
-				ArrayType *keys;
+				Datum conkey_datum;
+				bool isnull;
 
 				if (strncmp(name, "aux_mysql_domain_", 17) != 0)
 					continue;
 				tuple = SearchSysCache1(CONSTROID,
 						ObjectIdGetDatum(get_relation_constraint_oid(relid, name, false)));
-				keys = DatumGetArrayTypeP(SysCacheGetAttrNotNull(CONSTROID, tuple,
-												Anum_pg_constraint_conkey));
-				if (ARR_NDIM(keys) == 1 && ARR_DIMS(keys)[0] == 1 &&
-					*((int16 *) ARR_DATA_PTR(keys)) == attnum)
-					*cmds = lappend(*cmds, make_cmd(AT_DropConstraint, pstrdup(name), NULL));
+				conkey_datum = SysCacheGetAttr(CONSTROID, tuple,
+											   Anum_pg_constraint_conkey, &isnull);
+				if (!isnull)
+				{
+					ArrayType *keys = DatumGetArrayTypeP(conkey_datum);
+
+					if (ARR_NDIM(keys) == 1 && ARR_DIMS(keys)[0] == 1 &&
+						*((int16 *) ARR_DATA_PTR(keys)) == attnum)
+						*cmds = lappend(*cmds, make_cmd(AT_DropConstraint, pstrdup(name), NULL));
+				}
 				ReleaseSysCache(tuple);
 			}
 		relation_close(rel, NoLock);
@@ -881,8 +906,23 @@ generated_ref_name(Node *node)
  * before (mysql.generated_column) is read again, or becomes a plain
  * reference when the column is no longer generated.
  */
+#define MYS_GENERATED_INLINE_BUDGET 4096
+
+/* Charge an already-expanded expression before copying any of it. */
+static bool
+charge_generated_node(Node *node, int *budget)
+{
+	if (node == NULL)
+		return false;
+	if (--(*budget) < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("generated column expression exceeds maximum expansion complexity")));
+	return raw_expression_tree_walker(node, charge_generated_node, budget);
+}
+
 static Node *
-inline_generated(Node *node, List *columns)
+inline_generated_impl(Node *node, List *columns, int *budget)
 {
 	ListCell   *lc;
 	char	   *name = NULL;
@@ -890,6 +930,11 @@ inline_generated(Node *node, List *columns)
 
 	if (node == NULL)
 		return NULL;
+	check_stack_depth();
+	if (--(*budget) < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("generated column expression exceeds maximum expansion complexity")));
 	if (IsA(node, ColumnRef) && list_length(((ColumnRef *) node)->fields) == 1 &&
 		IsA(linitial(((ColumnRef *) node)->fields), String))
 		name = strVal(linitial(((ColumnRef *) node)->fields));
@@ -899,6 +944,7 @@ inline_generated(Node *node, List *columns)
 	{
 		TypeCast   *tc;
 		A_Const    *ref;
+		FuncCall   *call;
 
 		if (!c->generated || gen_column_expression(c) == NULL)
 		{
@@ -911,15 +957,20 @@ inline_generated(Node *node, List *columns)
 			return (Node *) cr;
 		}
 		tc = makeNode(TypeCast);
-		tc->arg = copyObject(c->generation);
-		tc->typeName = copyObject(c->type);
+		tc->arg = c->generation;
+		tc->typeName = c->type;
 		tc->location = -1;
 		ref = makeNode(A_Const);
 		ref->val.sval.type = T_String;
 		ref->val.sval.sval = pstrdup(name);
 		ref->location = -1;
-		return (Node *) makeFuncCall(list_make2(makeString("mysql"), makeString(MYS_GENERATED_REF)),
-									 list_make2(ref, tc), COERCE_EXPLICIT_CALL, -1);
+		call = makeFuncCall(list_make2(makeString("mysql"), makeString(MYS_GENERATED_REF)),
+							list_make2(ref, tc), COERCE_EXPLICIT_CALL, -1);
+		/* The replacement root is already charged. Count its complete subtree. */
+		(void) raw_expression_tree_walker((Node *) call, charge_generated_node, budget);
+		tc->arg = copyObject(tc->arg);
+		tc->typeName = copyObject(tc->typeName);
+		return (Node *) call;
 	}
 	if (name)
 		return node;			/* a column of another kind of reference */
@@ -927,53 +978,61 @@ inline_generated(Node *node, List *columns)
 	{
 		case T_List:
 			foreach(lc, (List *) node)
-				lfirst(lc) = inline_generated(lfirst(lc), columns);
+				lfirst(lc) = inline_generated_impl(lfirst(lc), columns, budget);
 			break;
 		case T_A_Expr:
-			((A_Expr *) node)->lexpr = inline_generated(((A_Expr *) node)->lexpr, columns);
-			((A_Expr *) node)->rexpr = inline_generated(((A_Expr *) node)->rexpr, columns);
+			((A_Expr *) node)->lexpr = inline_generated_impl(((A_Expr *) node)->lexpr, columns, budget);
+			((A_Expr *) node)->rexpr = inline_generated_impl(((A_Expr *) node)->rexpr, columns, budget);
 			break;
 		case T_FuncCall:
-			((FuncCall *) node)->args = (List *) inline_generated((Node *) ((FuncCall *) node)->args, columns);
+			((FuncCall *) node)->args = (List *) inline_generated_impl((Node *) ((FuncCall *) node)->args, columns, budget);
 			break;
 		case T_TypeCast:
-			((TypeCast *) node)->arg = inline_generated(((TypeCast *) node)->arg, columns);
+			((TypeCast *) node)->arg = inline_generated_impl(((TypeCast *) node)->arg, columns, budget);
 			break;
 		case T_CollateClause:
-			((CollateClause *) node)->arg = inline_generated(((CollateClause *) node)->arg, columns);
+			((CollateClause *) node)->arg = inline_generated_impl(((CollateClause *) node)->arg, columns, budget);
 			break;
 		case T_BoolExpr:
-			((BoolExpr *) node)->args = (List *) inline_generated((Node *) ((BoolExpr *) node)->args, columns);
+			((BoolExpr *) node)->args = (List *) inline_generated_impl((Node *) ((BoolExpr *) node)->args, columns, budget);
 			break;
 		case T_NullTest:
-			((NullTest *) node)->arg = (Expr *) inline_generated((Node *) ((NullTest *) node)->arg, columns);
+			((NullTest *) node)->arg = (Expr *) inline_generated_impl((Node *) ((NullTest *) node)->arg, columns, budget);
 			break;
 		case T_BooleanTest:
-			((BooleanTest *) node)->arg = (Expr *) inline_generated((Node *) ((BooleanTest *) node)->arg, columns);
+			((BooleanTest *) node)->arg = (Expr *) inline_generated_impl((Node *) ((BooleanTest *) node)->arg, columns, budget);
 			break;
 		case T_CaseExpr:
-			((CaseExpr *) node)->arg = (Expr *) inline_generated((Node *) ((CaseExpr *) node)->arg, columns);
-			((CaseExpr *) node)->args = (List *) inline_generated((Node *) ((CaseExpr *) node)->args, columns);
-			((CaseExpr *) node)->defresult = (Expr *) inline_generated((Node *) ((CaseExpr *) node)->defresult, columns);
+			((CaseExpr *) node)->arg = (Expr *) inline_generated_impl((Node *) ((CaseExpr *) node)->arg, columns, budget);
+			((CaseExpr *) node)->args = (List *) inline_generated_impl((Node *) ((CaseExpr *) node)->args, columns, budget);
+			((CaseExpr *) node)->defresult = (Expr *) inline_generated_impl((Node *) ((CaseExpr *) node)->defresult, columns, budget);
 			break;
 		case T_CaseWhen:
-			((CaseWhen *) node)->expr = (Expr *) inline_generated((Node *) ((CaseWhen *) node)->expr, columns);
-			((CaseWhen *) node)->result = (Expr *) inline_generated((Node *) ((CaseWhen *) node)->result, columns);
+			((CaseWhen *) node)->expr = (Expr *) inline_generated_impl((Node *) ((CaseWhen *) node)->expr, columns, budget);
+			((CaseWhen *) node)->result = (Expr *) inline_generated_impl((Node *) ((CaseWhen *) node)->result, columns, budget);
 			break;
 		case T_CoalesceExpr:
-			((CoalesceExpr *) node)->args = (List *) inline_generated((Node *) ((CoalesceExpr *) node)->args, columns);
+			((CoalesceExpr *) node)->args = (List *) inline_generated_impl((Node *) ((CoalesceExpr *) node)->args, columns, budget);
 			break;
 		case T_MinMaxExpr:
-			((MinMaxExpr *) node)->args = (List *) inline_generated((Node *) ((MinMaxExpr *) node)->args, columns);
+			((MinMaxExpr *) node)->args = (List *) inline_generated_impl((Node *) ((MinMaxExpr *) node)->args, columns, budget);
 			break;
 		case T_NamedArgExpr:
-			((NamedArgExpr *) node)->arg = (Expr *) inline_generated((Node *) ((NamedArgExpr *) node)->arg, columns);
+			((NamedArgExpr *) node)->arg = (Expr *) inline_generated_impl((Node *) ((NamedArgExpr *) node)->arg, columns, budget);
 			break;
 		default:
 			/* other nodes keep their references; PostgreSQL reports them */
 			break;
 	}
 	return node;
+}
+
+static Node *
+inline_generated(Node *node, List *columns)
+{
+	int			budget = MYS_GENERATED_INLINE_BUDGET;
+
+	return inline_generated_impl(node, columns, &budget);
 }
 
 /* names of the columns an expression reads, in order */
@@ -1006,6 +1065,7 @@ collate_params(Node *node, List *columns)
 
 	if (node == NULL)
 		return NULL;
+	check_stack_depth();
 	if (IsA(node, ColumnRef))
 	{
 		ColumnRef  *cr = (ColumnRef *) node;
@@ -1127,6 +1187,9 @@ generation_expression(Node *raw, TypeName *type, List *columns, Oid nspid,
 	gen_policy_check(expr, false);
 	typenameTypeIdAndMod(NULL, type, &target, &typmod);
 	base = getBaseTypeAndTypmod(target, &typmod);
+	if (target != base &&
+		getExtensionOfObject(TypeRelationId, target) != get_extension_oid("aux_mysql", false))
+		gen_policy_error("user-defined domain constraint");
 	/* MySQL stores a predicate as 1/0 in a string column, never true/false
 	 * (mys_assign_bool_as_int); the wrapper keeps SHOW's original text. */
 	bool_string = exprType(expr) == BOOLOID &&
@@ -1235,6 +1298,16 @@ generation_expression(Node *raw, TypeName *type, List *columns, Oid nspid,
 
 	{
 		Oid			existing_fn = LookupFuncName(funcname, n, argtypes, true);
+
+		if (OidIsValid(existing_fn))
+		{
+			LockDatabaseObject(ProcedureRelationId, existing_fn, 0, AccessShareLock);
+			if (!SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(existing_fn)))
+			{
+				UnlockDatabaseObject(ProcedureRelationId, existing_fn, 0, AccessShareLock);
+				existing_fn = InvalidOid;
+			}
+		}
 
 		if (OidIsValid(existing_fn))
 		{
@@ -1426,7 +1499,9 @@ table_generators(Oid relid, List *result)
 	{
 		Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tup);
 
-		if (dep->classid == AttrDefaultRelationId)
+		if (dep->classid == AttrDefaultRelationId &&
+			dep->refobjsubid > 0 &&
+			get_attgenerated(relid, dep->refobjsubid) != '\0')
 			attrdefs = list_append_unique_oid(attrdefs, dep->objid);
 	}
 	systable_endscan(scan);
@@ -1441,13 +1516,22 @@ table_generators(Oid relid, List *result)
 		while (HeapTupleIsValid(tup = systable_getnext(scan)))
 		{
 			Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tup);
-			char	   *name;
+			HeapTuple	ptup;
 
 			if (dep->refclassid != ProcedureRelationId)
 				continue;
-			name = get_func_name(dep->refobjid);
-			if (name && strncmp(name, MYS_GENERATOR_PREFIX, strlen(MYS_GENERATOR_PREFIX)) == 0)
-				result = list_append_unique_oid(result, dep->refobjid);
+			ptup = SearchSysCache1(PROCOID, ObjectIdGetDatum(dep->refobjid));
+			if (HeapTupleIsValid(ptup))
+			{
+				Form_pg_proc proc = (Form_pg_proc) GETSTRUCT(ptup);
+
+				if (proc->prolang == SQLlanguageId &&
+					strncmp(NameStr(proc->proname), MYS_GENERATOR_PREFIX,
+							strlen(MYS_GENERATOR_PREFIX)) == 0 &&
+					object_ownercheck(ProcedureRelationId, dep->refobjid, GetUserId()))
+					result = list_append_unique_oid(result, dep->refobjid);
+				ReleaseSysCache(ptup);
+			}
 		}
 		systable_endscan(scan);
 	}
@@ -1495,8 +1579,16 @@ drop_unused_generators(List *generators)
 			bool		used;
 			ObjectAddress object;
 
-			if (!SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(func)))
+			if (!SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(func)) ||
+				!object_ownercheck(ProcedureRelationId, func, GetUserId()))
 				continue;
+			LockDatabaseObject(ProcedureRelationId, func, 0, AccessExclusiveLock);
+			if (!SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(func)) ||
+				!object_ownercheck(ProcedureRelationId, func, GetUserId()))
+			{
+				UnlockDatabaseObject(ProcedureRelationId, func, 0, AccessExclusiveLock);
+				continue;
+			}
 			depRel = table_open(DependRelationId, AccessShareLock);
 			ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ,
 						ObjectIdGetDatum(ProcedureRelationId));
@@ -1507,7 +1599,10 @@ drop_unused_generators(List *generators)
 			systable_endscan(scan);
 			table_close(depRel, AccessShareLock);
 			if (used)
+			{
+				UnlockDatabaseObject(ProcedureRelationId, func, 0, AccessExclusiveLock);
 				continue;
+			}
 			ObjectAddressSet(object, ProcedureRelationId, func);
 			performDeletion(&object, DROP_RESTRICT,
 							PERFORM_DELETION_INTERNAL | PERFORM_DELETION_QUIETLY);
@@ -2219,10 +2314,14 @@ temp_table_utility(Node *stmt)
 			foreach_node(List, name, ((DropStmt *) stmt)->objects)
 			{
 				RangeVar   *rv = makeRangeVarFromNameList(name);
-				Oid			relid = RangeVarGetRelid(rv, NoLock, true);
+				Oid			relid = RangeVarGetRelid(rv, AccessShareLock, true);
 
-				if (OidIsValid(relid) && !isTempNamespace(get_rel_namespace(relid)))
+				if (!OidIsValid(relid) || !isTempNamespace(get_rel_namespace(relid)))
+				{
+					if (OidIsValid(relid))
+						UnlockRelationOid(relid, AccessShareLock);
 					return false;
+				}
 			}
 			return true;
 		case T_DoStmt:
@@ -2603,6 +2702,18 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 		return;
 	}
 
+	if (context == PROCESS_UTILITY_TOPLEVEL && internal_utility_depth == 0)
+	{
+		if (info == NULL || info->group_start || info->txn_control)
+			skip_create_side_stmts = false;
+		else if (skip_create_side_stmts)
+		{
+			if (qc)
+				SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
+			return;
+		}
+	}
+
 	/* Do not change bare SECURITY LABEL semantics in ordinary PG sessions. */
 	if (IsA(parsetree, SecLabelStmt) &&
 		((SecLabelStmt *) parsetree)->provider &&
@@ -2625,6 +2736,62 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 	{
 		mysql_alter_db((DoStmt *) parsetree, qc);
 		return;
+	}
+
+	if (mys_is_mysql_session() && IsA(parsetree, CopyStmt) &&
+		((CopyStmt *) parsetree)->filename == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("COPY TO STDOUT / FROM STDIN is not supported over the MySQL protocol")));
+
+	/* Prevent mutating prefix_lengths on an existing mysql_prefix index. */
+	if (!IsAbortedTransactionBlockState() && IsA(parsetree, AlterTableStmt) &&
+		((AlterTableStmt *) parsetree)->objtype == OBJECT_INDEX)
+	{
+		AlterTableStmt *idx_alter = (AlterTableStmt *) parsetree;
+		bool		touches_prefix = false;
+
+		foreach_node(AlterTableCmd, cmd, idx_alter->cmds)
+		{
+			if (cmd->subtype == AT_SetRelOptions || cmd->subtype == AT_ResetRelOptions)
+			{
+				if (cmd->def == NULL)
+					touches_prefix = true;
+				else if (IsA(cmd->def, List))
+				{
+					foreach_node(DefElem, opt, (List *) cmd->def)
+					{
+						if (pg_strcasecmp(opt->defname, "prefix_lengths") == 0)
+						{
+							touches_prefix = true;
+							break;
+						}
+					}
+				}
+			}
+			if (touches_prefix)
+				break;
+		}
+		if (touches_prefix)
+		{
+			Oid			idxoid = RangeVarGetRelid(idx_alter->relation, AccessShareLock, true);
+
+			if (OidIsValid(idxoid))
+			{
+				HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(idxoid));
+
+				if (HeapTupleIsValid(tup))
+				{
+					char	   *amname = get_am_name(((Form_pg_class) GETSTRUCT(tup))->relam);
+
+					ReleaseSysCache(tup);
+					if (amname && strcmp(amname, "mysql_prefix") == 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("cannot change prefix_lengths of an existing mysql_prefix index; recreate the index instead")));
+				}
+			}
+		}
 	}
 
 	if (mys_is_mysql_session() && !IsAbortedTransactionBlockState())
@@ -2796,30 +2963,36 @@ process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 		IsA(parsetree, CreateStmt))
 	{
 		CreateStmt *create = (CreateStmt *) parsetree;
+		Oid			nspid = RangeVarGetCreationNamespace(create->relation);
+		bool		existed = create->if_not_exists &&
+			OidIsValid(get_relname_relid(create->relation->relname, nspid));
 		List	   *defs = NIL;
 
-		foreach_ptr(Node, elt, create->tableElts)
-			if (IsA(elt, TableLikeClause) &&
-				(((TableLikeClause *) elt)->options & CREATE_TABLE_LIKE_GENERATED))
-				gen_policy_table(RangeVarGetRelid(((TableLikeClause *) elt)->relation,
-												AccessShareLock, false), NIL);
-		foreach_ptr(Node, elt, create->tableElts)
-			if (IsA(elt, ColumnDef) && generated_constraint((ColumnDef *) elt))
-				defs = lappend(defs, elt);
-		if (defs != NIL &&
-			!(create->if_not_exists &&
-			  OidIsValid(RangeVarGetRelid(create->relation, NoLock, true))))
+		if (existed && context == PROCESS_UTILITY_TOPLEVEL && internal_utility_depth == 0)
+			skip_create_side_stmts = true;
+
+		if (!existed)
 		{
-			create = copyObject(create);
-			defs = NIL;
 			foreach_ptr(Node, elt, create->tableElts)
-				if (IsA(elt, ColumnDef))
+				if (IsA(elt, TableLikeClause) &&
+					(((TableLikeClause *) elt)->options & CREATE_TABLE_LIKE_GENERATED))
+					gen_policy_table(RangeVarGetRelid(((TableLikeClause *) elt)->relation,
+													AccessShareLock, false), NIL);
+			foreach_ptr(Node, elt, create->tableElts)
+				if (IsA(elt, ColumnDef) && generated_constraint((ColumnDef *) elt))
 					defs = lappend(defs, elt);
-			mysql_generated_columns(defs, InvalidOid,
-									RangeVarGetCreationNamespace(create->relation),
-									pstmt, queryString, params, queryEnv);
-			pstmt = copyObject(pstmt);
-			pstmt->utilityStmt = parsetree = (Node *) create;
+			if (defs != NIL)
+			{
+				create = copyObject(create);
+				defs = NIL;
+				foreach_ptr(Node, elt, create->tableElts)
+					if (IsA(elt, ColumnDef))
+						defs = lappend(defs, elt);
+				mysql_generated_columns(defs, InvalidOid, nspid,
+										pstmt, queryString, params, queryEnv);
+				pstmt = copyObject(pstmt);
+				pstmt->utilityStmt = parsetree = (Node *) create;
+			}
 		}
 	}
 
@@ -3012,6 +3185,22 @@ mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		IsA(pstmt->utilityStmt, CreateStmt) &&
 		((CreateStmt *) pstmt->utilityStmt)->relation->relpersistence == RELPERSISTENCE_TEMP)
 		mys_statement_touched_tables();
+	if (IsA(pstmt->utilityStmt, CreateStmt) &&
+		((CreateStmt *) pstmt->utilityStmt)->relation->relpersistence == RELPERSISTENCE_TEMP)
+		mys_temp_table_gen_val++;
+	else if (IsA(pstmt->utilityStmt, CreateTableAsStmt) &&
+			 ((CreateTableAsStmt *) pstmt->utilityStmt)->into->rel->relpersistence == RELPERSISTENCE_TEMP)
+		mys_temp_table_gen_val++;
+	else if (IsA(pstmt->utilityStmt, ViewStmt) &&
+			 ((ViewStmt *) pstmt->utilityStmt)->view->relpersistence == RELPERSISTENCE_TEMP)
+		mys_temp_table_gen_val++;
+	else if (IsA(pstmt->utilityStmt, DropStmt) ||
+			 IsA(pstmt->utilityStmt, RenameStmt) ||
+			 IsA(pstmt->utilityStmt, DiscardStmt) ||
+			 (IsA(pstmt->utilityStmt, TransactionStmt) &&
+			  (((TransactionStmt *) pstmt->utilityStmt)->kind == TRANS_STMT_ROLLBACK ||
+			   ((TransactionStmt *) pstmt->utilityStmt)->kind == TRANS_STMT_ROLLBACK_TO)))
+		mys_temp_table_gen_val++;
 	if (generators != NIL && !IsAbortedTransactionBlockState())
 		drop_unused_generators(generators);
 }

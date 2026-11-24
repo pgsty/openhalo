@@ -37,36 +37,11 @@
 #include "utils/varbit.h"
 #include "utils/varlena.h"
 
-typedef struct
-{
-	bool		is_multibyte;
-	bool		is_multibyte_char_in_char;
-
-	char	   *str1;			/* haystack string */
-	char	   *str2;			/* needle string */
-	int			len1;			/* string lengths in bytes */
-	int			len2;
-
-	int			skiptablemask;
-	int			skiptable[256];
-
-	char	   *last_match;
-	char	   *refpoint;
-	int			refpos;
-} TextPositionState;
-
 static text *text_substring(Datum str, int32 start, int32 length, bool length_not_specified);
 static text *concat_internal(const char *sepstr, int argidx, FunctionCallInfo fcinfo, bool skip_nulls);
 static FmgrInfo *build_concat_foutcache(FunctionCallInfo fcinfo, int argidx);
-static int	text_position(text *t1, text *t2, Oid collid);
-static void text_position_setup(text *t1, text *t2, Oid collid, TextPositionState *state);
-static bool text_position_next(Oid collid, TextPositionState *state);
-static char *text_position_next_internal(Oid collid, char *start_ptr, TextPositionState *state);
-static int	text_position_get_match_pos(TextPositionState *state);
-static void check_collation_set_local(Oid collid);
 static void convert_to_digit_text_for_mysql(char **str, int str_len);
 static void convert_to_text_for_mysql(char **str, int str_len);
-static text *ascii_lower_copy(const text *src);
 static VarBit *mys_int64_to_varbit(int64 val);
 
 PG_FUNCTION_INFO_V1(elt);
@@ -294,19 +269,12 @@ PG_FUNCTION_INFO_V1(text_instr);
 Datum
 text_instr(PG_FUNCTION_ARGS)
 {
-	text	   *str;
-	text	   *search_str;
-	int32		res;
-
-	if (mys_is_mysql_session())
-		return mys_string_instr(fcinfo);
-
-	str = PG_GETARG_TEXT_PP(0);
-	search_str = PG_GETARG_TEXT_PP(1);
-	res = (int32) text_position(str, search_str, PG_GET_COLLATION());
-	PG_FREE_IF_COPY(str, 0);
-	PG_FREE_IF_COPY(search_str, 1);
-	PG_RETURN_INT32(res);
+	/*
+	 * Delegate unconditionally to mys_string_instr so parallel workers (where
+	 * MyProtocolExtension is NULL) and PostgreSQL sessions handle both
+	 * deterministic and nondeterministic MySQL collations identically.
+	 */
+	return mys_string_instr(fcinfo);
 }
 
 PG_FUNCTION_INFO_V1(convert_time_text_to_numeric_for_mysql);
@@ -346,59 +314,14 @@ PG_FUNCTION_INFO_V1(text_locate2);
 Datum
 text_locate2(PG_FUNCTION_ARGS)
 {
-	text	   *str;
-	text	   *search_str;
-	int32		res;
-
-	if (mys_is_mysql_session())
-		return mys_string_locate(fcinfo);
-
-	str = PG_GETARG_TEXT_PP(0);
-	search_str = PG_GETARG_TEXT_PP(1);
-	res = (int32) text_position(search_str, str, PG_GET_COLLATION());
-	PG_FREE_IF_COPY(str, 0);
-	PG_FREE_IF_COPY(search_str, 1);
-	PG_RETURN_INT32(res);
+	return mys_string_locate(fcinfo);
 }
 
 PG_FUNCTION_INFO_V1(text_locate3);
 Datum
 text_locate3(PG_FUNCTION_ARGS)
 {
-	Datum		arg1;
-	Datum		arg2;
-	text	   *targ1;
-	int64		pos64;
-	int32		iarg3;
-	text	   *slice;
-	int32		ret;
-
-	if (mys_is_mysql_session())
-		return mys_string_locate(fcinfo);
-
-	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
-		PG_RETURN_NULL();
-	if (PG_ARGISNULL(2))
-		PG_RETURN_INT32(0);
-
-	pos64 = PG_GETARG_INT64(2);
-	if (pos64 <= 0 || pos64 > PG_INT32_MAX)
-		PG_RETURN_INT32(0);
-
-	iarg3 = (int32) pos64;
-	arg1 = PG_GETARG_DATUM(0);
-	arg2 = PG_GETARG_DATUM(1);
-	targ1 = DatumGetTextPP(arg1);
-
-	slice = text_substring(arg2, iarg3, -1, true);
-	ret = (int32) text_position(slice, targ1, PG_GET_COLLATION());
-	pfree(slice);
-	if ((Pointer) targ1 != DatumGetPointer(arg1))
-		pfree(targ1);
-
-	if (ret > 0)
-		PG_RETURN_INT32(iarg3 - 1 + ret);
-	PG_RETURN_INT32(0);
+	return mys_string_locate(fcinfo);
 }
 
 PG_FUNCTION_INFO_V1(convertTextToDouble);
@@ -1177,252 +1100,6 @@ build_concat_foutcache(FunctionCallInfo fcinfo, int argidx)
 	return foutcache;
 }
 
-static text *
-ascii_lower_copy(const text *src)
-{
-	int			len = VARSIZE_ANY_EXHDR(src);
-	const char *s = VARDATA_ANY(src);
-	text	   *dst = (text *) palloc(VARHDRSZ + len);
-	char	   *d = VARDATA(dst);
-
-	SET_VARSIZE(dst, VARHDRSZ + len);
-	for (int i = 0; i < len; i++)
-	{
-		unsigned char c = (unsigned char) s[i];
-
-		d[i] = (c >= 'A' && c <= 'Z') ? (char) (c + ('a' - 'A')) : (char) c;
-	}
-	return dst;
-}
-
-static int
-text_position(text *t1, text *t2, Oid collid)
-{
-	TextPositionState state;
-	int			result;
-	text	   *s1 = t1;
-	text	   *s2 = t2;
-	bool		copied = false;
-
-	if (VARSIZE_ANY_EXHDR(t2) < 1)
-		return 1;
-	if (VARSIZE_ANY_EXHDR(t1) < VARSIZE_ANY_EXHDR(t2))
-		return 0;
-
-	if (collid == getCaseInsensitiveId())
-	{
-		s1 = ascii_lower_copy(t1);
-		s2 = ascii_lower_copy(t2);
-		copied = true;
-		collid = C_COLLATION_OID;
-	}
-
-	text_position_setup(s1, s2, collid, &state);
-	if (!text_position_next(collid, &state))
-		result = 0;
-	else
-		result = text_position_get_match_pos(&state);
-
-	if (copied)
-	{
-		pfree(s1);
-		pfree(s2);
-	}
-
-	return result;
-}
-
-static void
-text_position_setup(text *t1, text *t2, Oid collid, TextPositionState *state)
-{
-	int			len1 = VARSIZE_ANY_EXHDR(t1);
-	int			len2 = VARSIZE_ANY_EXHDR(t2);
-	pg_locale_t mylocale = NULL;
-
-	check_collation_set_local(collid);
-
-	if (!lc_collate_is_c(collid) && collid != DEFAULT_COLLATION_OID)
-		mylocale = pg_newlocale_from_collation(collid);
-
-	if (mylocale && !mylocale->deterministic)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("nondeterministic collations are not supported for substring searches")));
-
-	Assert(len1 > 0);
-	Assert(len2 > 0);
-
-	if (pg_database_encoding_max_length() == 1)
-	{
-		state->is_multibyte = false;
-		state->is_multibyte_char_in_char = false;
-	}
-	else if (GetDatabaseEncoding() == PG_UTF8)
-	{
-		state->is_multibyte = true;
-		state->is_multibyte_char_in_char = false;
-	}
-	else
-	{
-		state->is_multibyte = true;
-		state->is_multibyte_char_in_char = true;
-	}
-
-	state->str1 = VARDATA_ANY(t1);
-	state->str2 = VARDATA_ANY(t2);
-	state->len1 = len1;
-	state->len2 = len2;
-	state->last_match = NULL;
-	state->refpoint = state->str1;
-	state->refpos = 0;
-	state->skiptablemask = 255;
-
-	if (len1 >= len2 && len2 > 1)
-	{
-		int			searchlength = len1 - len2;
-		int			skiptablemask;
-		int			last;
-		int			i;
-		const char *str2 = state->str2;
-
-		if (searchlength < 16)
-			skiptablemask = 3;
-		else if (searchlength < 64)
-			skiptablemask = 7;
-		else if (searchlength < 128)
-			skiptablemask = 15;
-		else if (searchlength < 512)
-			skiptablemask = 31;
-		else if (searchlength < 2048)
-			skiptablemask = 63;
-		else if (searchlength < 4096)
-			skiptablemask = 127;
-		else
-			skiptablemask = 255;
-		state->skiptablemask = skiptablemask;
-
-		for (i = 0; i <= skiptablemask; i++)
-			state->skiptable[i] = len2;
-
-		last = len2 - 1;
-		for (i = 0; i < last; i++)
-			state->skiptable[(unsigned char) str2[i] & skiptablemask] = last - i;
-	}
-}
-
-static bool
-text_position_next(Oid collid, TextPositionState *state)
-{
-	int			needle_len = state->len2;
-	char	   *start_ptr;
-	char	   *matchptr;
-
-	if (needle_len <= 0)
-		return false;
-
-	if (state->last_match)
-		start_ptr = state->last_match + needle_len;
-	else
-		start_ptr = state->str1;
-
-retry:
-	matchptr = text_position_next_internal(collid, start_ptr, state);
-	if (!matchptr)
-		return false;
-
-	if (state->is_multibyte_char_in_char)
-	{
-		Assert(state->refpoint <= matchptr);
-
-		while (state->refpoint < matchptr)
-		{
-			state->refpoint += pg_mblen(state->refpoint);
-			state->refpos++;
-
-			if (state->refpoint > matchptr)
-			{
-				start_ptr = state->refpoint;
-				goto retry;
-			}
-		}
-	}
-
-	state->last_match = matchptr;
-	return true;
-}
-
-static char *
-text_position_next_internal(Oid collid, char *start_ptr, TextPositionState *state)
-{
-	int			haystack_len = state->len1;
-	int			needle_len = state->len2;
-	int			skiptablemask = state->skiptablemask;
-	const char *haystack = state->str1;
-	const char *needle = state->str2;
-	const char *haystack_end = &haystack[haystack_len];
-	const char *hptr;
-
-	Assert(start_ptr >= haystack && start_ptr <= haystack_end);
-
-	if (needle_len == 1)
-	{
-		char		nchar = *needle;
-
-		for (hptr = start_ptr; hptr < haystack_end; hptr++)
-		{
-			if (*hptr == nchar)
-				return (char *) hptr;
-		}
-	}
-	else
-	{
-		const char *needle_last = &needle[needle_len - 1];
-
-		hptr = start_ptr + needle_len - 1;
-		while (hptr < haystack_end)
-		{
-			const char *nptr = needle_last;
-			const char *p = hptr;
-
-			while (*nptr == *p)
-			{
-				if (nptr == needle)
-					return (char *) p;
-				nptr--, p--;
-			}
-
-			hptr += state->skiptable[(unsigned char) *hptr & skiptablemask];
-		}
-	}
-
-	return NULL;
-}
-
-static int
-text_position_get_match_pos(TextPositionState *state)
-{
-	if (!state->is_multibyte)
-		return state->last_match - state->str1 + 1;
-
-	while (state->refpoint < state->last_match)
-	{
-		state->refpoint += pg_mblen(state->refpoint);
-		state->refpos++;
-	}
-	Assert(state->refpoint == state->last_match);
-	return state->refpos + 1;
-}
-
-static void
-check_collation_set_local(Oid collid)
-{
-	if (!OidIsValid(collid))
-		ereport(ERROR,
-				(errcode(ERRCODE_INDETERMINATE_COLLATION),
-				 errmsg("could not determine which collation to use for string comparison"),
-				 errhint("Use the COLLATE clause to set the collation explicitly.")));
-}
-
 static void
 convert_to_digit_text_for_mysql(char **str, int str_len)
 {
@@ -1713,6 +1390,7 @@ substringIndex(PG_FUNCTION_ARGS)
 		res_len = strLen;
 		for (int i = 0; i <= strLen - sepLen; i++)
 		{
+			CHECK_FOR_INTERRUPTS();
 			if (memcmp(str + i, sep, sepLen) == 0)
 			{
 				index--;
@@ -1731,6 +1409,7 @@ substringIndex(PG_FUNCTION_ARGS)
 		res_len = strLen;
 		for (int i = strLen - sepLen; i >= 0; i--)
 		{
+			CHECK_FOR_INTERRUPTS();
 			if (memcmp(str + i, sep, sepLen) == 0)
 			{
 				index++;

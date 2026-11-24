@@ -64,7 +64,9 @@ extern void halo_mysql_lock_setup(void);
 extern void mys_sync_deadlock_timeout(void);
 extern bool mys_foreign_key_checks(void);
 extern void mys_sync_foreign_key_checks(void);
-extern bool mys_default_autocommit(void);
+extern void mys_finish_set_autocommit(bool enabled);
+extern void mys_finish_timezone_transaction(bool rollback);
+extern void mys_statement_failed(void);
 extern void mys_sync_session_state(void);
 extern void mys_start_implicit_transaction(bool ddl);
 extern const char *mys_transaction_start(int explicit_read_only, bool *snapshot, bool *read_only,
@@ -109,6 +111,7 @@ typedef enum MysTxnKind
 	MYS_TXN_NEUTRAL,			/* SET, SHOW, COMMIT AND CHAIN ... */
 	MYS_TXN_BEGIN,				/* BEGIN / START TRANSACTION */
 	MYS_TXN_END,				/* COMMIT / ROLLBACK */
+	MYS_TXN_CHAIN,				/* COMMIT / ROLLBACK AND CHAIN */
 	MYS_TXN_IMPLICIT_COMMIT,	/* DDL and friends */
 	MYS_TXN_SET_AUTOCOMMIT,		/* SET autocommit = ... */
 	MYS_TXN_SAVEPOINT			/* SAVEPOINT / RELEASE / ROLLBACK TO */
@@ -148,6 +151,23 @@ typedef enum MysUpsertRow
 	MYS_ROW_UNCHANGED
 } MysUpsertRow;
 
+/*
+ * A multi-assignment SET keeps its pending values across executor and
+ * PL/pgSQL expression contexts until the statement succeeds.
+ */
+typedef struct MysSetBatch
+{
+	MemoryContext context;
+	List	   *system_vars;
+	List	   *user_vars;
+	bool		has_global;
+} MysSetBatch;
+
+extern void mys_prepare_set_batch(MysSetBatch *batch);
+extern void mys_publish_set_batch(MysSetBatch *batch);
+extern void mys_reserve_user_vars(MysSetBatch *batch);
+extern void mys_publish_user_vars(MysSetBatch *batch);
+
 /* per-statement flags computed by mys_rewrite.c, consumed by mysql_proto.c */
 typedef struct MysStmtInfo
 {
@@ -167,6 +187,8 @@ typedef struct MysStmtInfo
 	bool		diagnostic;			/* SHOW WARNINGS / ERRORS preserves diagnostics */
 	List	   *update_cols;		/* columns assigned by UPDATE / ON DUPLICATE KEY */
 	List	   *rewrite_warnings;	/* diagnostics belonging to this statement */
+	MysSetBatch *set_batch;
+	struct MysStmtInfo *finish_set; /* user SET completed by this control statement */
 } MysStmtInfo;
 
 /* mysql_proto.c */
@@ -199,8 +221,10 @@ extern void mys_hexlit_columns_binary(Node *query);
 extern void mys_set_auto_increment(Oid relid, int64 next);
 extern void mys_sync_auto_increment(Oid relid);
 extern void mys_sequence_write(struct RelationData *sequence);
+extern void mys_check_read_only(const char *cmdname);
 struct Query;
 extern void mys_assign_bool_as_int(struct Query *query);
+extern uint64 mys_temp_table_gen(void);
 
 /* mys_rewrite.c: ENGINE= / ENCRYPTION= -> table access method, or NULL */
 struct DefElem;
@@ -300,6 +324,6 @@ extern void mysql_utility_init(void);
 
 /* mys_parser.c */
 extern List *mysql_raw_parser(const char *str);
-extern char *mys_normalize_query(const char *query, int len);
+extern char *mys_normalize_query(const char *query, int len, int encoding);
 
 #endif							/* HALO_MYSQL_H */
